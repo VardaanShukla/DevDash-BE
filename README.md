@@ -8,12 +8,50 @@ Built so far: repo tracking, the branch compare and its local API, and the optio
 Claude recorder, a project summary, and plain-English explanations of changed
 functions written by Claude Code on request.
 
+This repo is the backend. The dashboard you look at is the UI, in its own repo:
+[DevDash-FE](https://github.com/VardaanShukla/DevDash-FE).
+
 ## Install
 
+Needs Python 3.10 or newer and git.
+
 ```sh
+git clone https://github.com/VardaanShukla/DevDash-BE.git devdash-be
 cd devdash-be
 pipx install -e .          # or: python3 -m pip install -e .
 ```
+
+## Run it with the UI
+
+The backend and the UI run side by side: the API on port 8765, the page on port 5173.
+The UI's dev server forwards every `/api` call to the API, so the browser only ever talks
+to the page.
+
+1. Start the API and leave it running:
+
+   ```sh
+   devdash serve
+   ```
+
+2. In a second terminal, get the UI (needs Node 18 or newer) and start it:
+
+   ```sh
+   git clone https://github.com/VardaanShukla/DevDash-FE.git devdash-ui
+   cd devdash-ui
+   npm install
+   npm run dev
+   ```
+
+3. Open http://localhost:5173. The first visit asks you to pick a username and password,
+   then to add a project: the path of any git folder on your computer.
+
+To run a built copy instead of the dev server, use `npm run build` and then
+`npm run preview`, which serves the page on http://localhost:4173 and forwards `/api` the
+same way. The API only accepts the page from these two ports, so keep them as they are.
+
+Optional: install [Claude Code](https://claude.com/claude-code) and sign in for the
+plain-English explanations, and run `devdash connect claude <path>` to record Claude's
+changes (see below).
 
 ## Track a repo
 
