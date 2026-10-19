@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from devdash import compare, prompts, undo
+from devdash.capture import scan
 from devdash.store import connect
 
 # Flags that make a change worth a careful look, then ones that are only worth knowing.
@@ -37,6 +38,16 @@ SECRET = re.compile(
     r"|\b\w*(api[_-]?key|secret|passw(or)?d|token)\b\s*[:=]\s*['\"][^'\"\s]{8,}['\"]", re.I)
 TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)(/|$)|(^|/)test_[^/]*$|_test\.\w+$|\.(test|spec)\.\w+$")
 TEST_CASE = re.compile(r"^\s*(?:async\s+)?def\s+test_|^\s*(?:it|test)\s*\(")
+# Files of prose, and the parts of a line that are text rather than code.
+PROSE = re.compile(r"\.(md|mdx|markdown|txt|rst|adoc)$", re.I)
+_STRING = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`")
+_COMMENT = re.compile(r"(^|\s)(#|//|--)\s.*$|/\*.*?\*/|^\s*\*.*$")
+
+
+def _code_only(line: str) -> str:
+    return _COMMENT.sub("", _STRING.sub('""', line))
+
+
 CONFIG = re.compile(r"(^|/)(package\.json|requirements[^/]*\.txt|pyproject\.toml|Dockerfile|docker-compose[^/]*"
                     r"|\.env[^/]*|vite\.config\.\w+|tsconfig[^/]*\.json)$|(^|/)\.github/workflows/")
 
@@ -49,11 +60,13 @@ def digest(day: date | None = None) -> dict:
     day = day or datetime.now().astimezone().date()
     start = datetime.combine(day, time.min).astimezone()
     end = start + timedelta(days=1)
+    # Commits Claude made where no hook saw it, such as a cloud session that pushed.
+    scan.scan_all()
     conn = connect()
     rows = conn.execute(
         "SELECT c.id, c.repo_id, r.name AS repo_name, r.path AS repo_path, c.turn_id, c.commit_sha,"
-        " c.file_path, c.diff, c.source, c.created_at, t.prompt, t.branch, t.started_at,"
-        " m.message, m.branch AS commit_branch"
+        " c.file_path, c.diff, c.source, c.via, c.created_at, t.prompt, t.branch, t.started_at,"
+        " m.message, m.branch AS commit_branch, m.found_by"
         " FROM changes c JOIN repos r ON r.id = c.repo_id"
         " LEFT JOIN turns t ON t.id = c.turn_id LEFT JOIN commits m ON m.sha = c.commit_sha"
         " WHERE c.created_at >= ? AND c.created_at < ? ORDER BY c.created_at, c.id",
@@ -131,6 +144,9 @@ def _group(row) -> dict:
         # Without a recorded prompt, the commit message says what was asked.
         "prompt": prompt or (row["message"] or "").split("\n")[0] or None,
         "prompt_recorded": prompt is not None,
+        # prompt: recorded by the Claude Code hooks (or a prompt file); commit: an AI-co-authored
+        # commit made here; cloud: a Claude commit found on a branch, made where no hook ran.
+        "origin": "prompt" if row["turn_id"] else "cloud" if row["found_by"] == "scan" else "commit",
         "at": row["started_at"] or row["created_at"],
         "commit": None,
         "_commits": {},
@@ -152,6 +168,7 @@ def _add(group: dict, row, item: dict) -> None:
         names = {f["name"] for f in seen["functions"]}
         seen["functions"] += [f for f in item["functions"] if f["name"] not in names]
         seen["flags"] += [f for f in item["flags"] if f not in seen["flags"]]
+        seen["watched"] = seen["watched"] and item["watched"]
     else:
         group["_files"][item["path"]] = item
 
@@ -210,6 +227,9 @@ def _file(row) -> dict:
         "deletions": item["deletions"],
         "functions": item["functions"],
         "flags": flags,
+        # Changed while the prompt ran but not by Claude's Edit or Write: a shell command,
+        # or possibly an edit by hand at the same time.
+        "watched": row["via"] == "watch",
     }
 
 
@@ -219,7 +239,7 @@ def _name_hunks(hunks: list[dict], current: Path) -> None:
     if not hunks or all(h["context"] and compare._declared(h["context"]) for h in hunks):
         return
     try:
-        lines = current.read_text(errors="replace").split("\n") if current.is_file() else []
+        lines = current.read_text(encoding="utf-8", errors="replace").split("\n") if current.is_file() else []
     except OSError:
         lines = []
     for hunk in hunks:
@@ -252,8 +272,11 @@ def _flags(item: dict) -> list[dict]:
     flags = []
     # A test about payments isn't a payments change; removed tests are flagged below.
     for kind, label, path_rule, line_rule in [] if TEST_PATH.search(path) else RULES:
-        # New lines say more about the change than the ones it replaced.
-        hit = next(((m, text) for text in added + deleted if (m := line_rule.search(text))), None)
+        # New lines say more about the change than the ones it replaced. Sign-in and payment
+        # words count in code only: text that mentions payments (help, docs, comments) isn't
+        # payment code. SQL lives inside strings, so database lines are read whole.
+        code = (lambda t: "" if PROSE.search(path) else _code_only(t)) if kind in ("auth", "payments") else (lambda t: t)
+        hit = next(((m, text) for text in added + deleted if (m := line_rule.search(code(text)))), None)
         if path_rule.search(path):
             flags.append({"kind": kind, "label": label, "reason": f"the file is {path}",
                           "line": _shown(hit[1]) if hit else None})

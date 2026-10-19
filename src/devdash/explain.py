@@ -13,12 +13,14 @@ sign-in page shows, for when the browser can't hand it back by itself."""
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 from devdash.capture.record import INTERNAL_ENV
 from devdash.store import connect
@@ -43,26 +45,60 @@ class ExplainError(RuntimeError):
 
 
 def status() -> dict:
-    """Whether Claude Code is installed and signed in. A sign-in that has run out still
-    counts as signed in here; the first explanation finds out, with a 401."""
-    path = shutil.which("claude")
+    """Whether Claude Code is installed and signed in, and as whom. A sign-in that has run
+    out still counts as signed in here; the first explanation finds out, with a 401. When
+    it isn't installed, the official install commands for this computer come with it."""
+    path = _find_claude()
+    auth = _auth_status() if path else {}
+    signed_in = auth.get("loggedIn") if path else None
     return {
         "tool": "claude",
         "available": path is not None,
-        "signed_in": _auth_status().get("loggedIn") if path else None,
+        "signed_in": signed_in,
+        "account": (auth.get("email") or auth.get("orgName")) if signed_in else None,
         "model": MODEL,
         "detail": None if path else "Install Claude Code to get explanations.",
+        "install": [] if path else install_commands(),
     }
+
+
+def install_commands(system: str | None = None) -> list[dict]:
+    """Claude Code's official native installers (code.claude.com/docs/en/setup) for this
+    computer's system: one shell on macOS and Linux, PowerShell or Command Prompt on Windows."""
+    if (system or platform.system()) == "Windows":
+        return [
+            {"shell": "PowerShell", "command": "irm https://claude.ai/install.ps1 | iex"},
+            {"shell": "Command Prompt",
+             "command": "curl -fsSL https://claude.ai/install.cmd -o install.cmd && install.cmd && del install.cmd"},
+        ]
+    return [{"shell": "Terminal", "command": "curl -fsSL https://claude.ai/install.sh | bash"}]
+
+
+def _find_claude() -> str | None:
+    """Claude Code on the PATH, or where the native installer puts it: a fresh install's
+    folder may not be on the PATH that DevDash started with."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    name = "claude.exe" if platform.system() == "Windows" else "claude"
+    native = Path.home() / ".local" / "bin" / name
+    return str(native) if native.is_file() and os.access(native, os.X_OK) else None
 
 
 def _auth_status() -> dict:
     try:
-        result = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
-                                errors="replace", timeout=20, env=_env())
+        result = subprocess.run([_claude(), "auth", "status", "--json"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=20, env=_env())
         return json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         # An older Claude Code without `auth status`: find out on the first explanation.
         return {}
+
+
+def _claude() -> str:
+    # The full path: on Windows Claude Code is claude.cmd or claude.exe, and running a
+    # bare "claude" only finds a .exe.
+    return _find_claude() or "claude"
 
 
 def _env() -> dict:
@@ -161,15 +197,16 @@ FIELDS = {
 
 
 def _run(prompt: str) -> str:
-    if not shutil.which("claude"):
+    if not _find_claude():
         raise ExplainError("Claude Code isn't installed on this computer, so DevDash can't write explanations.")
     flags = ["--output-format", "json", "--model", MODEL, "--system-prompt", SYSTEM_PROMPT,
              "--tools", "", "--no-session-persistence"]
     with tempfile.TemporaryDirectory(prefix="devdash-explain-") as folder:
         for attempt in (flags, flags[:4]):
             try:
-                result = subprocess.run(["claude", "-p", *attempt], input=prompt, cwd=folder, env=_env(),
-                                        capture_output=True, text=True, errors="replace", timeout=TIMEOUT)
+                result = subprocess.run([_claude(), "-p", *attempt], input=prompt, cwd=folder, env=_env(),
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                        timeout=TIMEOUT)
             except subprocess.TimeoutExpired:
                 raise ExplainError("Claude took too long to answer. Try again.")
             # An older Claude Code without the newer flags: ask again without them.
@@ -207,13 +244,13 @@ URL = re.compile(r"https://\S+")
 def start_login() -> dict:
     """Starts `claude auth login`, which opens the sign-in page in the browser, and returns
     the page's address too, in case the browser didn't open."""
-    if not shutil.which("claude"):
+    if not _find_claude():
         raise ExplainError("Claude Code isn't installed on this computer.")
     with _login_lock:
         process = _login["process"]
         if process is None or process.poll() is not None:
-            process = subprocess.Popen(["claude", "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, errors="replace", env=_env(),
+            process = subprocess.Popen([_claude(), "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=_env(),
                                        cwd=tempfile.gettempdir())
             _login.update(process=process, url=None, output=[])
             threading.Thread(target=_read_login, args=(process,), daemon=True).start()

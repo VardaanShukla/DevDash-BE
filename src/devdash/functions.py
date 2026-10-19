@@ -116,7 +116,7 @@ def _read(repo: Path, rev: str | None, path: str) -> str | None:
         # Only files inside the project.
         if not file.is_relative_to(repo.resolve()) or not file.is_file():
             return None
-        return file.read_text(errors="replace")
+        return file.read_text(encoding="utf-8", errors="replace")
     try:
         return git.run(repo, "show", f"{rev}:{path}")
     except git.GitError:
@@ -397,7 +397,8 @@ def _uses(repo: Path, rev: str | None, name: str, own_path: str, unit: dict | No
     """Where else the function's name is used, so a new function shows what calls it."""
     if len(name) < 3:
         return []
-    args = ["grep", "-n", "-w", "-F", "-I", "--max-count=3", "-e", name]
+    # Three per file, counted here: git grep's --max-count needs git 2.38 or newer.
+    args = ["grep", "-n", "-w", "-F", "-I", "-e", name]
     if rev:
         args.append(rev)
     try:
@@ -405,6 +406,7 @@ def _uses(repo: Path, rev: str | None, name: str, own_path: str, unit: dict | No
     except git.GitError:
         return []
     found = []
+    per_file: dict[str, int] = {}
     for line in out.splitlines():
         if rev:
             line = line[len(rev) + 1:]
@@ -416,6 +418,9 @@ def _uses(repo: Path, rev: str | None, name: str, own_path: str, unit: dict | No
         if path == own_path and unit and unit["start"] <= number <= unit["end"]:
             continue
         if re.match(r"^\s*(import|from)\b", text):
+            continue
+        per_file[path] = per_file.get(path, 0) + 1
+        if per_file[path] > 3:
             continue
         found.append({"path": path, "line": number, "text": text.strip()[:160]})
         if len(found) >= MAX_USES:

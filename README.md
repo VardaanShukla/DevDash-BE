@@ -8,50 +8,53 @@ Built so far: repo tracking, the branch compare and its local API, and the optio
 Claude recorder, a project summary, and plain-English explanations of changed
 functions written by Claude Code on request.
 
-This repo is the backend. The dashboard you look at is the UI, in its own repo:
-[DevDash-FE](https://github.com/VardaanShukla/DevDash-FE).
+This repo is the backend, and it serves the dashboard page too. The page's source is in
+its own repo, [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes
+with this package.
 
-## Install
+## Install and run
 
-Needs Python 3.10 or newer and git.
+Needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io). Works the same on
+Linux, macOS and Windows. Node is not needed: the dashboard page comes built into the
+package.
 
 ```sh
-git clone https://github.com/VardaanShukla/DevDash-BE.git devdash-be
-cd devdash-be
-pipx install -e .          # or: python3 -m pip install -e .
+pipx install git+https://github.com/VardaanShukla/DevDash-BE.git
+devdash serve
 ```
 
-## Run it with the UI
+Then open http://127.0.0.1:8765. The first visit asks you to pick a username and password,
+then to add a project: the path of any git folder on your computer, typed or pasted any
+way (`C:\Users\me\App`, `"C:\Users\me\App"` from Windows' "Copy as path", `~/App`,
+`$HOME/App` or `%USERPROFILE%\App`).
 
-The backend and the UI run side by side: the API on port 8765, the page on port 5173.
-The UI's dev server forwards every `/api` call to the API, so the browser only ever talks
-to the page.
+From a clone instead, run `pipx install -e .` in it, then `devdash serve`.
 
-1. Start the API and leave it running:
+If the terminal says `devdash` isn't found after installing, run `pipx ensurepath` once and
+open a new terminal. `python -m devdash serve` also works from the environment it's
+installed in.
 
-   ```sh
-   devdash serve
-   ```
-
-2. In a second terminal, get the UI (needs Node 18 or newer) and start it:
-
-   ```sh
-   git clone https://github.com/VardaanShukla/DevDash-FE.git devdash-ui
-   cd devdash-ui
-   npm install
-   npm run dev
-   ```
-
-3. Open http://localhost:5173. The first visit asks you to pick a username and password,
-   then to add a project: the path of any git folder on your computer.
-
-To run a built copy instead of the dev server, use `npm run build` and then
-`npm run preview`, which serves the page on http://localhost:4173 and forwards `/api` the
-same way. The API only accepts the page from these two ports, so keep them as they are.
+Projects can live anywhere and can move. A project that is moved, renamed or cloned again
+somewhere else keeps its history: add the new folder (or just commit in it, if Claude is
+connected) and DevDash finds it is the same project, as long as the old folder is gone.
+Each `devdash serve` also points the git and Claude Code hooks at the Python that runs
+DevDash, so they keep working after a reinstall.
 
 Optional: install [Claude Code](https://claude.com/claude-code) and sign in for the
 plain-English explanations, and run `devdash connect claude <path>` to record Claude's
 changes (see below).
+
+### Working on the page
+
+The page's source is in its own repo, [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE).
+To work on it with live reload, keep `devdash serve` running and start the UI's dev server
+(`npm install` then `npm run dev` in DevDash-FE), which serves the page on
+http://localhost:5173 and forwards `/api` to the API. To ship a change, build it into this
+package and commit `src/devdash/web`:
+
+```sh
+python scripts/build_ui.py ../DevDash-FE
+```
 
 ## Track a repo
 
@@ -64,7 +67,7 @@ This only registers the repo. Nothing is installed: your own commits are already
 ## See what a branch changed
 
 ```sh
-devdash serve              # API on http://127.0.0.1:8765, interactive docs at /docs
+devdash serve              # page and API on http://127.0.0.1:8765, API docs at /docs
 ```
 
 `GET /api/repos/{id}/compare` returns what the checked-out branch changed since it left

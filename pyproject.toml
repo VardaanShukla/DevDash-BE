@@ -19,7 +19,7 @@ devdash = "devdash.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-devdash = ["store/*.sql"]
+devdash = ["store/*.sql", "web/*", "web/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

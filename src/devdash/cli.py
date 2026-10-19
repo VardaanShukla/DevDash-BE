@@ -74,16 +74,29 @@ def main(argv: list[str] | None = None) -> int:
         return _set_password()
 
     if args.command == "serve":
-        import uvicorn
-
-        from devdash.api.app import create_app
-
-        # Loopback only: the API serves the contents of your repos.
-        print(f"DevDash API on http://127.0.0.1:{args.port} (docs at /docs)")
-        uvicorn.run(create_app(), host="127.0.0.1", port=args.port, log_level="warning")
-        return 0
+        return _serve(args.port)
 
     return 1
+
+
+def _serve(port: int) -> int:
+    import uvicorn
+
+    from devdash.api.app import WEB, create_app
+    from devdash.capture import install
+
+    # Hooks name the Python that runs DevDash; this keeps them right after a reinstall.
+    for problem in install.refresh():
+        print(f"devdash: {problem}")
+    # Loopback only: the API serves the contents of your repos.
+    if (WEB / "index.html").is_file():
+        print(f"DevDash is running. Open http://127.0.0.1:{port} in your browser.")
+    else:
+        print(f"DevDash API on http://127.0.0.1:{port} (docs at /docs). The page isn't built into "
+              "this copy: run scripts/build_ui.py, or the UI's dev server.")
+    print("Leave this running; press Ctrl+C to stop.")
+    uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="warning")
+    return 0
 
 
 def _set_password() -> int:
