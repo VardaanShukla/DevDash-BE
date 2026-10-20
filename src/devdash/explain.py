@@ -13,13 +13,16 @@ sign-in page shows, for when the browser can't hand it back by itself."""
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 
+from devdash import preferences, providers
 from devdash.capture.record import INTERNAL_ENV
 from devdash.store import connect
 from devdash.store.db import now
@@ -43,26 +46,91 @@ class ExplainError(RuntimeError):
 
 
 def status() -> dict:
-    """Whether Claude Code is installed and signed in. A sign-in that has run out still
-    counts as signed in here; the first explanation finds out, with a 401."""
-    path = shutil.which("claude")
+    """Whether Claude Code is installed and signed in, and as whom. A sign-in that has run
+    out still counts as signed in here; the first explanation finds out, with a 401. When
+    it isn't installed, the official install commands for this computer come with it."""
+    path = _find_claude()
+    auth = _auth_status() if path else {}
+    signed_in = auth.get("loggedIn") if path else None
     return {
+        "provider": "claude",
+        "name": providers.NAMES["claude"],
         "tool": "claude",
         "available": path is not None,
-        "signed_in": _auth_status().get("loggedIn") if path else None,
+        "signed_in": signed_in,
+        "account": (auth.get("email") or auth.get("orgName")) if signed_in else None,
         "model": MODEL,
         "detail": None if path else "Install Claude Code to get explanations.",
+        "install": [] if path else install_commands(),
+        "login": "button",
+        "login_command": "claude auth login",
+        "models": CLAUDE_MODELS,
+        "default_model": MODEL,
     }
+
+
+# Claude's model aliases, cheapest first: Claude Code always runs the newest of each.
+CLAUDE_MODELS = [
+    {"id": "haiku", "label": "Haiku", "note": "Fastest and cheapest: fewest tokens. Plenty for explanations."},
+    {"id": "sonnet", "label": "Sonnet", "note": "Deeper explanations of tricky code; uses several times more."},
+    {"id": "opus", "label": "Opus", "note": "The most capable; uses the most tokens."},
+]
+
+
+def provider_status(provider: str) -> dict:
+    """An AI's state for the dashboard, with the model it will use: the one picked in
+    Settings, or its default."""
+    found = status() if provider == "claude" else providers.status(provider)
+    chosen = preferences.get()["ai"]["models"].get(provider)
+    return {**found, "model": chosen or found.get("default_model") or ""}
+
+
+def active_status() -> dict:
+    """The AI picked in Settings to write explanations."""
+    return provider_status(preferences.ai_choice()[0])
+
+
+def all_status() -> list[dict]:
+    return [provider_status(provider) for provider in providers.IDS]
+
+
+def install_commands(system: str | None = None) -> list[dict]:
+    """Claude Code's official native installers (code.claude.com/docs/en/setup) for this
+    computer's system: one shell on macOS and Linux, PowerShell or Command Prompt on Windows."""
+    if (system or platform.system()) == "Windows":
+        return [
+            {"shell": "PowerShell", "command": "irm https://claude.ai/install.ps1 | iex"},
+            {"shell": "Command Prompt",
+             "command": "curl -fsSL https://claude.ai/install.cmd -o install.cmd && install.cmd && del install.cmd"},
+        ]
+    return [{"shell": "Terminal", "command": "curl -fsSL https://claude.ai/install.sh | bash"}]
+
+
+def _find_claude() -> str | None:
+    """Claude Code on the PATH, or where the native installer puts it: a fresh install's
+    folder may not be on the PATH that DevDash started with."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    name = "claude.exe" if platform.system() == "Windows" else "claude"
+    native = Path.home() / ".local" / "bin" / name
+    return str(native) if native.is_file() and os.access(native, os.X_OK) else None
 
 
 def _auth_status() -> dict:
     try:
-        result = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
-                                errors="replace", timeout=20, env=_env())
+        result = subprocess.run([_claude(), "auth", "status", "--json"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=20, env=_env())
         return json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         # An older Claude Code without `auth status`: find out on the first explanation.
         return {}
+
+
+def _claude() -> str:
+    # The full path: on Windows Claude Code is claude.cmd or claude.exe, and running a
+    # bare "claude" only finds a .exe.
+    return _find_claude() or "claude"
 
 
 def _env() -> dict:
@@ -161,15 +229,28 @@ FIELDS = {
 
 
 def _run(prompt: str) -> str:
-    if not shutil.which("claude"):
+    """The answer from the AI picked in Settings, with the model picked for it."""
+    provider, model = preferences.ai_choice()
+    if provider == "claude":
+        return _ask_claude(model or MODEL, prompt)
+    try:
+        return providers.ask(provider, model, SYSTEM_PROMPT, prompt)
+    except providers.ProviderError as error:
+        raise ExplainError(f"{error} (Settings → AI picks another.)" if not error.signed_out else str(error),
+                           signed_out=error.signed_out)
+
+
+def _ask_claude(model: str, prompt: str) -> str:
+    if not _find_claude():
         raise ExplainError("Claude Code isn't installed on this computer, so DevDash can't write explanations.")
-    flags = ["--output-format", "json", "--model", MODEL, "--system-prompt", SYSTEM_PROMPT,
+    flags = ["--output-format", "json", "--model", model, "--system-prompt", SYSTEM_PROMPT,
              "--tools", "", "--no-session-persistence"]
     with tempfile.TemporaryDirectory(prefix="devdash-explain-") as folder:
         for attempt in (flags, flags[:4]):
             try:
-                result = subprocess.run(["claude", "-p", *attempt], input=prompt, cwd=folder, env=_env(),
-                                        capture_output=True, text=True, errors="replace", timeout=TIMEOUT)
+                result = subprocess.run([_claude(), "-p", *attempt], input=prompt, cwd=folder, env=_env(),
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                        timeout=TIMEOUT)
             except subprocess.TimeoutExpired:
                 raise ExplainError("Claude took too long to answer. Try again.")
             # An older Claude Code without the newer flags: ask again without them.
@@ -204,18 +285,27 @@ _login_lock = threading.Lock()
 URL = re.compile(r"https://\S+")
 
 
-def start_login() -> dict:
-    """Starts `claude auth login`, which opens the sign-in page in the browser, and returns
-    the page's address too, in case the browser didn't open."""
-    if not shutil.which("claude"):
-        raise ExplainError("Claude Code isn't installed on this computer.")
+def start_login(provider: str = "claude") -> dict:
+    """Starts the AI's own sign-in (`claude auth login`, `codex login`), which opens its
+    sign-in page in the browser, and returns the page's address too, in case the browser
+    didn't open. AIs that sign in only from a terminal (Antigravity) say so instead."""
+    if provider == "claude":
+        if not _find_claude():
+            raise ExplainError("Claude Code isn't installed on this computer.")
+        command = [_claude(), "auth", "login"]
+    else:
+        command = providers.login_command(provider)
+        if command is None:
+            raise ExplainError(f"{providers.NAMES.get(provider, provider)} signs in from a terminal, or isn't installed yet.")
     with _login_lock:
         process = _login["process"]
-        if process is None or process.poll() is not None:
-            process = subprocess.Popen(["claude", "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, errors="replace", env=_env(),
+        if process is not None and process.poll() is None and _login.get("provider") != provider:
+            process.terminate()  # signing in to another AI instead
+        if process is None or process.poll() is not None or _login.get("provider") != provider:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=_env(),
                                        cwd=tempfile.gettempdir())
-            _login.update(process=process, url=None, output=[])
+            _login.update(process=process, url=None, output=[], provider=provider)
             threading.Thread(target=_read_login, args=(process,), daemon=True).start()
     deadline = time.monotonic() + 15
     while _login["url"] is None and process.poll() is None and time.monotonic() < deadline:

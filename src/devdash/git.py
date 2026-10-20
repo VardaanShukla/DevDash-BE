@@ -1,4 +1,5 @@
-"""Thin wrappers around the git command line."""
+"""Thin wrappers around the git command line. Output is read as UTF-8, which is what git
+writes, rather than the system's code page (cp1252 on most Windows machines)."""
 
 import os
 import subprocess
@@ -11,7 +12,7 @@ class GitError(RuntimeError):
 
 def run(cwd: Path | str, *args: str, ok: tuple[int, ...] = (0,)) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, errors="replace"
+        ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if result.returncode not in ok:
         raise GitError(result.stderr.strip() or f"git {' '.join(args)} failed")
@@ -31,6 +32,16 @@ def branch(repo: Path) -> str | None:
         return run(repo, "symbolic-ref", "--short", "-q", "HEAD").strip() or None
     except GitError:
         return None
+
+
+def root_commit(repo: Path) -> str | None:
+    """The project's first commit, the same in every clone and wherever the folder is.
+    None before the first commit. With several roots (merged histories), the smallest."""
+    try:
+        roots = run(repo, "rev-list", "--max-parents=0", "HEAD").split()
+    except GitError:
+        return None
+    return min(roots) if roots else None
 
 
 def hooks_dir(repo: Path) -> Path:
@@ -67,7 +78,7 @@ def fetch(repo: Path, timeout: float = 30) -> str | None:
     try:
         result = subprocess.run(
             ["git", "fetch", "--all", "--prune", "--quiet", "--no-write-fetch-head"],
-            cwd=repo, capture_output=True, text=True, errors="replace", env=env, timeout=timeout,
+            cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:

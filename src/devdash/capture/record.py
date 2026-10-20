@@ -7,12 +7,15 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import traceback
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
 from devdash import git, paths
+from devdash.capture import install
 from devdash.store import connect, now
 
 # Set on Claude Code runs that DevDash starts itself (summaries), so they are not recorded.
@@ -20,6 +23,10 @@ INTERNAL_ENV = "DEVDASH_INTERNAL"
 
 EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 MAX_FILE_BYTES = 1_000_000
+# A project with more files than this already changed when a prompt starts isn't watched
+# for that prompt, to keep the prompt hook quick; Edit and Write are still recorded.
+MAX_WATCHED_FILES = 2000
+WATCH_HOURS = timedelta(hours=3)
 IGNORED = [
     "*.lock", "package-lock.json", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map",
     "node_modules/*", "*/node_modules/*", "dist/*", "build/*", "*/__pycache__/*", "__pycache__/*",
@@ -42,7 +49,7 @@ def run_hook(event: str, stdin=sys.stdin) -> int:
     if os.environ.get(INTERNAL_ENV):
         return 0
     try:
-        raw = stdin.read() if event != "post-commit" else ""
+        raw = _read_stdin(stdin) if event != "post-commit" else ""
         payload = json.loads(raw) if raw.strip() else {}
         conn = connect()
         try:
@@ -51,9 +58,16 @@ def run_hook(event: str, stdin=sys.stdin) -> int:
             conn.close()
         _log_call(event, payload)
     except Exception:
-        with paths.error_log().open("a") as log:
+        with paths.error_log().open("a", encoding="utf-8") as log:
             log.write(f"{now()} {event}\n{traceback.format_exc()}\n")
     return 0
+
+
+def _read_stdin(stdin) -> str:
+    # Claude Code sends UTF-8. Read the bytes where there are any, since sys.stdin on
+    # Windows decodes with the system code page and would garble non-English prompts.
+    buffer = getattr(stdin, "buffer", None)
+    return buffer.read().decode("utf-8", "replace") if buffer is not None else stdin.read()
 
 
 def _log_call(event: str, payload: dict) -> None:
@@ -63,7 +77,7 @@ def _log_call(event: str, payload: dict) -> None:
         log.replace(log.with_suffix(".log.1"))
     tool_input = payload.get("tool_input") or {}
     target = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
-    with log.open("a") as out:
+    with log.open("a", encoding="utf-8") as out:
         out.write(f"{now()} {event} session={str(payload.get('session_id', '-'))[:8]} "
                   f"tool={payload.get('tool_name', '-')} file={target or '-'}\n")
 
@@ -73,6 +87,7 @@ def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path) -> No
     if not repos:
         return
     cwd = cwd.resolve()
+    repos = _follow_moves(conn, repos, event, payload, cwd)
     with conn:
         if event == "post-commit":
             root = git.toplevel(cwd)
@@ -86,7 +101,7 @@ def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path) -> No
         elif event == "stop":
             turn = _open_turn(conn, payload.get("session_id"))
             if turn is not None:
-                _finish_turn(conn, turn)
+                _finish_turn(conn, turn, watch=True)
         else:
             raise ValueError(f"unknown event {event!r}")
 
@@ -97,8 +112,40 @@ def _prompt(conn, repos, payload, cwd: Path) -> None:
     # A turn left open means its Stop never fired (crash, interrupt); close it first.
     stale = _open_turn(conn, session_id)
     if stale is not None:
-        _finish_turn(conn, stale)
-    _new_turn(conn, _repo_for(repos, cwd), session_id, payload.get("prompt") or UNKNOWN_PROMPT)
+        # Without its Stop there's no telling when it ended, so only its Edit and Write count.
+        _finish_turn(conn, stale, watch=False)
+    turn = _new_turn(conn, _repo_for(repos, cwd), session_id, payload.get("prompt") or UNKNOWN_PROMPT)
+    _start_watch(conn, turn["id"], repos, cwd)
+
+
+def _start_watch(conn, turn_id: int, repos, cwd: Path) -> None:
+    """Notes, for each connected project the session works in, the commit it's on and the
+    files that already differ from it, with their contents. At Stop, every file that
+    differs since counts as the prompt's, whichever tool changed it."""
+    for repo in repos:
+        root = Path(repo["path"])
+        # The session's own project, or the projects inside the folder it started in.
+        if not (cwd == root or cwd.is_relative_to(root) or root.is_relative_to(cwd)) or not root.is_dir():
+            continue
+        try:
+            head = git.run(root, "rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)).strip() or None
+            status = git.run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
+        except git.GitError:
+            continue
+        dirty = [entry[3:] for entry in status.split("\x00") if len(entry) > 3]
+        dirty = [path for path in dirty if not _ignored(path)]
+        if len(dirty) > MAX_WATCHED_FILES:
+            continue  # too much already changed to note cheaply; Edit and Write still count
+        conn.execute("INSERT INTO turn_repos (turn_id, repo_id, head) VALUES (?, ?, ?)", (turn_id, repo["id"], head))
+        for path in dirty:
+            absolute = root / path
+            before = _read_text(absolute) if absolute.is_file() else None
+            seen = -1 if before is None and absolute.exists() else 0
+            conn.execute(
+                "INSERT OR IGNORE INTO turn_files (turn_id, repo_id, file_path, before_content, seen)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (turn_id, repo["id"], path, before, seen),
+            )
 
 
 def _before_edit(conn, repos, payload, cwd: Path) -> None:
@@ -132,22 +179,28 @@ def _before_edit(conn, repos, payload, cwd: Path) -> None:
         before = _read_text(absolute)
         if before is None:
             return  # binary or too large
-    # Only the first edit in a turn keeps its snapshot.
+    # Only the first snapshot in a turn is kept: the one from the prompt's start, or the
+    # first edit. A file noted then but too large to keep gets this edit's copy.
     conn.execute(
-        "INSERT OR IGNORE INTO turn_files (turn_id, repo_id, file_path, before_content)"
-        " VALUES (?, ?, ?, ?)",
+        "INSERT INTO turn_files (turn_id, repo_id, file_path, before_content, seen) VALUES (?, ?, ?, ?, 1)"
+        " ON CONFLICT (turn_id, repo_id, file_path) DO UPDATE SET seen = 1,"
+        " before_content = CASE WHEN seen = -1 THEN excluded.before_content ELSE before_content END",
         (turn["id"], repo["id"], relative, before),
     )
 
 
-def _finish_turn(conn, turn) -> None:
-    files = conn.execute(
-        "SELECT f.repo_id, r.path, f.file_path, f.before_content"
+def _finish_turn(conn, turn, watch: bool) -> None:
+    files = [dict(row) for row in conn.execute(
+        "SELECT f.repo_id, r.path, f.file_path, f.before_content, f.seen"
         " FROM turn_files f JOIN repos r ON r.id = f.repo_id WHERE f.turn_id = ?",
         (turn["id"],),
-    ).fetchall()
+    )]
+    if watch:
+        files += _changed_since_start(conn, turn["id"], {(f["repo_id"], f["file_path"]) for f in files})
     recorded = 0
     for row in files:
+        if row["seen"] == -1:
+            continue  # too large or not text when the prompt started
         current_path = Path(row["path"]) / row["file_path"]
         after = None
         if current_path.exists():
@@ -157,12 +210,15 @@ def _finish_turn(conn, turn) -> None:
         diff = unified_diff(row["file_path"], row["before_content"], after)
         if diff:
             conn.execute(
-                "INSERT INTO changes (repo_id, turn_id, file_path, diff, source, created_at)"
-                " VALUES (?, ?, ?, ?, 'ai', ?)",
-                (row["repo_id"], turn["id"], row["file_path"], diff, now()),
+                "INSERT INTO changes (repo_id, turn_id, file_path, diff, source, via, created_at)"
+                " VALUES (?, ?, ?, ?, 'ai', ?, ?)",
+                (row["repo_id"], turn["id"], row["file_path"], diff, "edit" if row["seen"] == 1 else "watch", now()),
             )
             recorded += 1
+    if recorded:
+        _link_commits_made_during(conn, turn["id"])
     conn.execute("DELETE FROM turn_files WHERE turn_id = ?", (turn["id"],))
+    conn.execute("DELETE FROM turn_repos WHERE turn_id = ?", (turn["id"],))
     session = conn.execute(
         "SELECT s.id, s.repo_id FROM sessions s JOIN turns t ON t.session_id = s.id WHERE t.id = ?",
         (turn["id"],),
@@ -178,6 +234,82 @@ def _finish_turn(conn, turn) -> None:
     conn.execute("UPDATE turns SET ended_at = ? WHERE id = ?", (now(), turn["id"]))
 
 
+def _link_commits_made_during(conn, turn_id: int) -> None:
+    """A file the prompt changed and that was committed before it stopped belongs to the
+    newest such commit, unless it changed again since. The post-commit hook left these
+    files to the prompt (see _commit), so each is counted once."""
+    for row in conn.execute(
+        "SELECT w.repo_id, w.head, r.path FROM turn_repos w JOIN repos r ON r.id = w.repo_id WHERE w.turn_id = ?",
+        (turn_id,),
+    ).fetchall():
+        root = Path(row["path"])
+        try:
+            log = git.run(root, "log", "--format=%x00%H", "--name-only", "--no-renames",
+                          f"{row['head']}..HEAD" if row["head"] else "HEAD")
+            status = git.run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
+        except git.GitError:
+            continue
+        newest: dict[str, str] = {}
+        for block in log.split("\x00")[1:]:
+            sha, _, names = block.partition("\n")
+            for name in names.split("\n"):
+                if name.strip():
+                    newest.setdefault(name.strip(), sha.strip())
+        dirty = {entry[3:] for entry in status.split("\x00") if len(entry) > 3}
+        for path, sha in newest.items():
+            if path in dirty or not conn.execute("SELECT 1 FROM commits WHERE sha = ?", (sha,)).fetchone():
+                continue
+            conn.execute(
+                "UPDATE changes SET commit_sha = ? WHERE turn_id = ? AND repo_id = ? AND file_path = ? AND commit_sha IS NULL",
+                (sha, turn_id, row["repo_id"], path),
+            )
+
+
+def _changed_since_start(conn, turn_id: int, known: set) -> list[dict]:
+    """Files that differ from how they were when the prompt started and that no snapshot
+    covers: they were the same as the commit then, so that commit has their before copy."""
+    found = []
+    for row in conn.execute(
+        "SELECT w.repo_id, w.head, r.path FROM turn_repos w JOIN repos r ON r.id = w.repo_id WHERE w.turn_id = ?",
+        (turn_id,),
+    ).fetchall():
+        root = Path(row["path"])
+        if not root.is_dir():
+            continue
+        try:
+            # Against the starting commit, not HEAD, so a commit made during the prompt still counts.
+            tracked = (git.run(root, "diff", "--name-only", "-z", "--no-renames", row["head"], "--") if row["head"]
+                       else git.run(root, "ls-files", "-z"))
+            untracked = git.run(root, "ls-files", "--others", "--exclude-standard", "-z")
+        except git.GitError:
+            continue
+        paths = dict.fromkeys(p for p in (tracked + untracked).split("\x00") if p)
+        for path in paths:
+            if (row["repo_id"], path) in known or _ignored(path):
+                continue
+            exists, before = _at_commit(root, row["head"], path)
+            if exists and before is None:
+                continue  # too large or not text in the commit
+            found.append({"repo_id": row["repo_id"], "path": row["path"], "file_path": path,
+                          "before_content": before, "seen": 0})
+    return found
+
+
+def _at_commit(root: Path, head: str | None, path: str) -> tuple[bool, str | None]:
+    """Whether the file was in the commit, and its text when it's text and not too large."""
+    if head is None:
+        return False, None
+    result = subprocess.run(["git", "cat-file", "blob", f"{head}:{path}"], cwd=root, capture_output=True)
+    if result.returncode != 0:
+        return False, None
+    if len(result.stdout) > MAX_FILE_BYTES:
+        return True, None
+    try:
+        return True, result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return True, None
+
+
 def _commit(conn, repo) -> None:
     root = Path(repo["path"])
     info = git.commit_info(root)
@@ -190,6 +322,15 @@ def _commit(conn, repo) -> None:
     )
     prompt_turn = _take_prompt_file(conn, repo)
     source = "ai" if prompt_turn or AI_TRAILER.search(info["message"]) else "human"
+    # A Claude prompt is running and watching this project: its Stop records these files
+    # and links them to this commit (see _link_commits_made_during), so they aren't added here.
+    # A prompt open for hours lost its Stop, and is no reason to leave a commit unrecorded.
+    recent = (datetime.now(timezone.utc) - WATCH_HOURS).isoformat(timespec="seconds")
+    watched = conn.execute(
+        "SELECT 1 FROM turn_repos w JOIN turns t ON t.id = w.turn_id"
+        " WHERE w.repo_id = ? AND t.ended_at IS NULL AND t.started_at >= ?",
+        (repo["id"], recent),
+    ).fetchone() is not None
     for file_path in git.commit_files(root, sha):
         linked = conn.execute(
             "UPDATE changes SET commit_sha = ?"
@@ -198,7 +339,7 @@ def _commit(conn, repo) -> None:
             " AND (turn_id IS NULL OR turn_id NOT IN (SELECT turn_id FROM undone WHERE turn_id IS NOT NULL))",
             (sha, repo["id"], file_path),
         ).rowcount
-        if linked or _ignored(file_path):
+        if linked or watched or _ignored(file_path):
             continue
         diff = git.commit_file_diff(root, sha, file_path)
         if diff:
@@ -255,11 +396,31 @@ def _open_turn(conn, session_id: str | None):
 
 def _new_turn(conn, repo, session_id: str, prompt: str):
     branch = git.branch(Path(repo["path"])) if repo else None
+    # The session row can be gone by now: closing a stale turn that recorded nothing, or
+    # removing a project, deletes sessions left without turns. Bring it back.
+    _ensure_session(conn, repo, session_id)
     cursor = conn.execute(
         "INSERT INTO turns (session_id, branch, prompt, started_at) VALUES (?, ?, ?, ?)",
         (session_id, branch, prompt, now()),
     )
     return {"id": cursor.lastrowid, "branch": branch}
+
+
+def _follow_moves(conn, repos, event: str, payload: dict, cwd: Path):
+    """Picks up a connected repo whose folder was moved or renamed, when a hook fires in
+    its new place. Only looks when a connected repo's folder is missing, so the usual
+    case costs nothing."""
+    if all(Path(r["path"]).is_dir() for r in repos):
+        return repos
+    tool_input = payload.get("tool_input") or {}
+    target = tool_input.get("file_path") or tool_input.get("notebook_path")
+    where = (cwd / target).resolve().parent if event == "pre-tool-use" and target else cwd
+    if _repo_for(repos, where) is not None:
+        return repos
+    root = git.toplevel(where) if where.is_dir() else None
+    if root is None or install.find_moved(conn, root) is None:
+        return repos
+    return conn.execute("SELECT id, path FROM repos WHERE claude = 1").fetchall()
 
 
 def _repo_for(repos, path: Path):

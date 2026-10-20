@@ -357,12 +357,12 @@ def _declared(text: str) -> list[str]:
 
 def _git_diff(repo: Path, *revisions: str) -> str:
     attributes = paths.home() / "diff.gitattributes"
-    if not attributes.exists() or attributes.read_text() != ATTRIBUTES:
-        attributes.write_text(ATTRIBUTES)
+    if not attributes.exists() or attributes.read_text(encoding="utf-8") != ATTRIBUTES:
+        attributes.write_text(ATTRIBUTES, encoding="utf-8", newline="\n")
     return git.run(
         repo,
         "-c", "core.quotePath=false",
-        "-c", f"core.attributesFile={attributes}",
+        "-c", f"core.attributesFile={attributes.as_posix()}",
         "-c", f"diff.devdash-js.xfuncname={JS_FUNCNAME}",
         "diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U3", *revisions, "--",
         ok=(0, 1),
@@ -387,7 +387,7 @@ def _git_diff_no_index(repo: Path, name: str) -> str:
     attributes = paths.home() / "diff.gitattributes"
     return git.run(
         repo,
-        "-c", f"core.attributesFile={attributes}",
+        "-c", f"core.attributesFile={attributes.as_posix()}",
         "-c", f"diff.devdash-js.xfuncname={JS_FUNCNAME}",
         "diff", "--no-color", "--no-ext-diff", "--no-index", "-U3", "--", "/dev/null", name,
         ok=(0, 1),

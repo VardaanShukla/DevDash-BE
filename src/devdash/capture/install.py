@@ -28,15 +28,78 @@ class InitError(RuntimeError):
 
 
 def init(path: Path) -> Path:
+    """Tracks the repo at path. A project DevDash already knows from another folder (it was
+    moved, renamed or cloned again, and the old folder is gone) keeps its history and its
+    Claude setting instead of starting over."""
     root = _root(path)
+    first = git.root_commit(root)
     conn = connect()
     with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO repos (path, name, added_at) VALUES (?, ?, ?)",
-            (str(root), root.name, now()),
-        )
+        if conn.execute("SELECT 1 FROM repos WHERE path = ?", (str(root),)).fetchone():
+            conn.execute("UPDATE repos SET root_commit = COALESCE(root_commit, ?) WHERE path = ?",
+                         (first, str(root)))
+            moved = None
+        else:
+            moved = _moved(conn, root, first)
+            if moved is None:
+                conn.execute(
+                    "INSERT INTO repos (path, name, added_at, root_commit) VALUES (?, ?, ?, ?)",
+                    (str(root), root.name, now(), first),
+                )
     conn.close()
+    if moved is not None and moved["claude"]:
+        install_git_hook(root)
     return root
+
+
+def find_moved(conn, root: Path):
+    """The tracked repo that now lives at root, if it was moved there; its path is updated.
+    For hooks firing in a folder DevDash doesn't know yet."""
+    with conn:
+        return _moved(conn, root, git.root_commit(root))
+
+
+def _moved(conn, root: Path, first: str | None):
+    # Only repos whose folder is gone, so two clones side by side stay two projects.
+    gone = [row for row in conn.execute("SELECT id, path, name, claude, root_commit FROM repos")
+            if git.toplevel(Path(row["path"])) != Path(row["path"])]
+    matches = [row for row in gone if first and row["root_commit"] == first]
+    if not matches:
+        # Tracked before first commits were stored: the same folder name will do.
+        matches = [row for row in gone if row["root_commit"] is None
+                   and row["name"].casefold() == root.name.casefold()]
+    if len(matches) != 1:
+        return None
+    [row] = matches
+    conn.execute("UPDATE repos SET path = ?, name = ?, root_commit = COALESCE(?, root_commit) WHERE id = ?",
+                 (str(root), root.name, first, row["id"]))
+    return row
+
+
+def refresh() -> list[str]:
+    """Brings every tracked repo's setup up to date with this install: hooks name the
+    Python that runs DevDash, which changes when it's reinstalled or moved. Returns
+    what couldn't be fixed, one line each."""
+    conn = connect()
+    rows = conn.execute("SELECT path, claude FROM repos").fetchall()
+    conn.close()
+    problems = []
+    for row in rows:
+        root = Path(row["path"])
+        if git.toplevel(root) is None:
+            continue
+        init(root)  # stores the first commit for repos tracked before it was
+        if row["claude"]:
+            try:
+                install_git_hook(root)
+            except (InitError, OSError, git.GitError) as error:
+                problems.append(str(error))
+    if any(row["claude"] for row in rows):
+        try:
+            install_claude_hooks()
+        except (OSError, json.JSONDecodeError) as error:
+            problems.append(f"Claude Code hooks: {error}")
+    return problems
 
 
 def connect_claude(path: Path) -> Path:
@@ -84,6 +147,7 @@ def remove(repo_id: int) -> bool:
         conn.execute("DELETE FROM changes WHERE repo_id = ?", (repo_id,))
         conn.execute("DELETE FROM commits WHERE repo_id = ?", (repo_id,))
         conn.execute("DELETE FROM turn_files WHERE repo_id = ?", (repo_id,))
+        conn.execute("DELETE FROM turn_repos WHERE repo_id = ?", (repo_id,))
         # A session may have touched other repos too, so it is detached, not deleted;
         # turns left with nothing recorded go, then sessions left with no turns.
         conn.execute("UPDATE sessions SET repo_id = NULL WHERE repo_id = ?", (repo_id,))
@@ -104,6 +168,15 @@ def remove(repo_id: int) -> bool:
     return True
 
 
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _write(path: Path, text: str) -> None:
+    # UTF-8 with \n endings on every system: sh can't run a hook with \r\n endings.
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
 def _root(path: Path) -> Path:
     root = git.toplevel(path)
     if root is None:
@@ -113,8 +186,9 @@ def _root(path: Path) -> Path:
 
 def record_command(event: str) -> str:
     # The absolute interpreter path keeps hooks working when devdash is not on PATH;
-    # -I stops a folder named devdash in the repo from shadowing the package.
-    return f"{shlex.quote(sys.executable)} -I {RECORD} {event}"
+    # -I stops a folder named devdash in the repo from shadowing the package. Forward
+    # slashes, since on Windows these run in Git's sh, where a backslash escapes.
+    return f"{shlex.quote(Path(sys.executable).as_posix())} -I {RECORD} {event}"
 
 
 def claude_settings_path() -> Path:
@@ -126,7 +200,8 @@ def install_claude_hooks() -> Path:
     # or the parent folder of several). `devdash record` exits at once unless an edited
     # file is inside a tracked repo.
     settings_path = claude_settings_path()
-    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    text = _read(settings_path) if settings_path.exists() else ""
+    settings = json.loads(text) if text.strip() else {}
     hooks = settings.setdefault("hooks", {})
     for claude_event, (event, matcher) in CLAUDE_EVENTS.items():
         groups = [g for g in hooks.get(claude_event, []) if not _is_ours(g)]
@@ -134,8 +209,10 @@ def install_claude_hooks() -> Path:
         if matcher:
             group = {"matcher": matcher, **group}
         hooks[claude_event] = [*groups, group]
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    new = json.dumps(settings, indent=2) + "\n"
+    if new != text:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _write(settings_path, new)
     return settings_path
 
 
@@ -143,9 +220,9 @@ def remove_claude_hooks() -> None:
     settings_path = claude_settings_path()
     if not settings_path.exists():
         return
-    settings = json.loads(settings_path.read_text())
+    settings = json.loads(_read(settings_path))
     _drop_our_hooks(settings)
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    _write(settings_path, json.dumps(settings, indent=2) + "\n")
 
 
 def _drop_our_hooks(settings: dict) -> None:
@@ -163,10 +240,10 @@ def _remove_repo_claude_hooks(root: Path) -> None:
     settings_path = root / ".claude" / "settings.local.json"
     if not settings_path.exists():
         return
-    settings = json.loads(settings_path.read_text())
+    settings = json.loads(_read(settings_path))
     _drop_our_hooks(settings)
     if settings:
-        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+        _write(settings_path, json.dumps(settings, indent=2) + "\n")
     else:
         settings_path.unlink()
 
@@ -176,9 +253,9 @@ def install_git_hook(root: Path) -> Path:
     ours = f"{MARKER}\n{record_command('post-commit')} || true\n"
     if not hook.exists():
         hook.parent.mkdir(parents=True, exist_ok=True)
-        hook.write_text("#!/bin/sh\n" + ours)
+        _write(hook, "#!/bin/sh\n" + ours)
     else:
-        text = hook.read_text()
+        text = _read(hook)
         first = text.splitlines()[0] if text else ""
         if not first.startswith("#!") or not any(sh in first for sh in ("sh", "bash", "zsh")):
             raise InitError(
@@ -192,36 +269,36 @@ def install_git_hook(root: Path) -> Path:
             lines[at : at + 2] = [ours]
         else:
             lines.append(("" if text.endswith("\n") else "\n") + ours)
-        hook.write_text("".join(lines))
+        _write(hook, "".join(lines))
     os.chmod(hook, 0o755)
     return hook
 
 
 def remove_git_hook(root: Path) -> None:
     hook = git.hooks_dir(root) / "post-commit"
-    if not hook.exists() or MARKER not in hook.read_text():
+    if not hook.exists() or MARKER not in _read(hook):
         return
-    lines = hook.read_text().splitlines(keepends=True)
+    lines = _read(hook).splitlines(keepends=True)
     at = next(i for i, line in enumerate(lines) if line.startswith(MARKER))
     del lines[at : at + 2]
     if "".join(lines).strip() in ("", "#!/bin/sh"):
         hook.unlink()  # only ours was in it
     else:
-        hook.write_text("".join(lines))
+        _write(hook, "".join(lines))
 
 
 def _exclude_from_git(root: Path, pattern: str) -> None:
     # .git/info/exclude ignores the path on this machine without editing .gitignore.
     exclude = (root / git.run(root, "rev-parse", "--git-path", "info/exclude").strip()).resolve()
-    text = exclude.read_text() if exclude.exists() else ""
+    text = _read(exclude) if exclude.exists() else ""
     if pattern not in text.splitlines():
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + pattern + "\n")
+        _write(exclude, text + ("" if not text or text.endswith("\n") else "\n") + pattern + "\n")
 
 
 def git_hook_installed(root: Path) -> bool:
     hook = git.hooks_dir(root) / "post-commit"
-    return hook.exists() and MARKER in hook.read_text()
+    return hook.exists() and MARKER in _read(hook)
 
 
 def claude_hooks_installed() -> bool:
@@ -229,7 +306,7 @@ def claude_hooks_installed() -> bool:
     if not settings_path.exists():
         return False
     try:
-        hooks = json.loads(settings_path.read_text()).get("hooks", {})
+        hooks = json.loads(_read(settings_path)).get("hooks", {})
     except (json.JSONDecodeError, AttributeError):
         return False
     return all(any(_is_ours(g) for g in hooks.get(event, [])) for event in CLAUDE_EVENTS)
@@ -243,17 +320,17 @@ def setup_steps(root: Path, claude: bool) -> list[dict]:
          "detail": "DevDash reads your branches and commits straight from git. Nothing is added to the project.",
          "command": f"devdash init {shlex.quote(str(root))}", "done": True},
         {"id": "serve", "title": "Start DevDash",
-         "detail": "Run the backend, then the UI, each in its own terminal.",
-         "command": "devdash serve\ncd devdash-ui && npm run dev", "done": None},
+         "detail": "Run this in a terminal and leave it running, then open http://127.0.0.1:8765.",
+         "command": "devdash serve", "done": None},
     ]
     if not claude:
         steps.append({"id": "ai", "title": "Optional: record your AI tool",
-                      "detail": "Pick Claude to also record each request Claude worked on, next to the change it made.",
+                      "detail": "Pick your AI coding tool to also record each request it worked on, next to the change it made.",
                       "command": f"devdash connect claude {shlex.quote(str(root))}", "done": False})
         return steps
     steps += [
         {"id": "git-hook", "title": "Git hook installed",
-         "detail": "Links each commit to the Claude request behind it. Added to any hook you already have.",
+         "detail": "Links each commit to the AI request behind it. Added to any hook you already have.",
          "command": None, "done": git_hook_installed(root)},
         {"id": "claude-hooks", "title": "Claude Code hooks installed",
          "detail": f"Records Claude Code edits as they happen. Lives in {claude_settings_path()}.",

@@ -40,6 +40,10 @@ def undo(change_key: str) -> str:
     kind, ref, repo_id, root, diffs = _change(change_key)
     if change_key in undone():
         raise UndoError("That change is already undone.")
+    if kind == "commit" and not _on_head(root, ref):
+        # A cloud session's commit on a branch that isn't checked out: its lines aren't in these files.
+        raise UndoError("That commit isn't on the branch checked out in this folder, so there's nothing here to "
+                        "undo. Check out its branch first, or revert it there.")
     # Later diffs of a file build on earlier ones, so they come off first.
     _apply(root, list(reversed(diffs)), reverse=True)
     at = now()
@@ -91,16 +95,22 @@ def _change(change_key: str):
     return kind, ref, repo_id, root, [row["diff"] for row in rows]
 
 
+def _on_head(root: Path, sha: str) -> bool:
+    return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=root,
+                          capture_output=True).returncode == 0
+
+
 def _apply(root: Path, diffs: list[str], reverse: bool) -> None:
     with tempfile.TemporaryDirectory() as folder:
         names = []
         for number, diff in enumerate(diffs):
             name = Path(folder) / f"{number:04}.patch"
-            name.write_text(diff if diff.endswith("\n") else diff + "\n")
+            # Bytes, so Windows doesn't turn the patch's line endings into \r\n.
+            name.write_bytes((diff if diff.endswith("\n") else diff + "\n").encode("utf-8"))
             names.append(str(name))
         flags = ["-R"] if reverse else []
         check = subprocess.run(["git", "apply", "--check", *flags, *names], cwd=root,
-                               capture_output=True, text=True, errors="replace")
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
         if check.returncode != 0:
             raise UndoError(_why(check.stderr, reverse))
         git.run(root, "apply", *flags, *names)

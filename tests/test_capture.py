@@ -140,10 +140,13 @@ def test_turn_diff_excludes_manual_edits(repo):
     assert turn["prompt"] == "make hello louder"
     assert turn["branch"] == "main"
     assert turn["ended_at"] is not None
-    changes = conn.execute("SELECT * FROM changes WHERE turn_id IS NOT NULL").fetchall()
-    assert [(c["file_path"], c["source"]) for c in changes] == [("app.py", "ai")]
+    changes = conn.execute("SELECT * FROM changes WHERE turn_id IS NOT NULL ORDER BY file_path").fetchall()
+    # An edit made during the prompt counts too, marked as not seen through Edit or Write.
+    assert [(c["file_path"], c["source"], c["via"]) for c in changes] == [("app.py", "ai", "edit"),
+                                                                          ("notes.md", "ai", "watch")]
     diff = changes[0]["diff"]
     assert "-    return 'hi'\n+    return 'HI'\n" in diff
+    # Made before the prompt started, so not part of it.
     assert "+# my own uncommitted tweak" not in diff
 
 
@@ -297,3 +300,96 @@ def test_disconnect_removes_hooks_but_keeps_history(repo, tmp_path):
     assert "hooks" not in json.loads(claude_settings_path().read_text())
     assert not (other / ".git" / "hooks" / "post-commit").exists()
     assert connect().execute("SELECT prompt FROM turns").fetchone()["prompt"] == "keep me"
+
+
+def test_a_prompt_still_records_when_its_session_was_deleted_meanwhile(repo):
+    # Removing a project detaches its sessions; closing their stale turn then deletes the
+    # session, and the next prompt in it must bring the session back, not fail.
+    import io
+    import json
+
+    from devdash.capture.install import connect_claude, remove
+    from devdash.capture.record import run_hook
+    from devdash.paths import error_log
+    from devdash.store import connect
+
+    other = repo.parent / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    connect_claude(repo)
+    connect_claude(other)
+
+    def send(event, **payload):
+        body = {"session_id": "s1", "cwd": str(repo), "hook_event_name": event, **payload}
+        run_hook(event, io.StringIO(json.dumps(body)))
+
+    send("user-prompt-submit", prompt="first")
+    [row] = connect().execute("SELECT id FROM repos WHERE path = ?", (str(repo),)).fetchall()
+    remove(row["id"])
+    send("user-prompt-submit", prompt="second", cwd=str(other))
+    assert not error_log().exists() or "IntegrityError" not in error_log().read_text()
+    prompts = [r["prompt"] for r in connect().execute("SELECT prompt FROM turns")]
+    assert prompts == ["second"]
+
+
+def turn_changes():
+    rows = connect().execute("SELECT file_path, via, diff, commit_sha FROM changes WHERE turn_id IS NOT NULL"
+                             " ORDER BY file_path").fetchall()
+    return {r["file_path"]: r for r in rows}
+
+
+def test_files_changed_by_a_shell_command_count_for_the_prompt(repo):
+    connect_claude(repo)
+    (repo / "old.py").write_text("x = 1\n")
+    git(repo, "add", "old.py")
+    git(repo, "commit", "-q", "-m", "old")
+    (repo / "draft.md").write_text("mine\n")  # untracked before the prompt: not Claude's
+    (repo / "app.py").write_text("def hello():\n    return 'hi'\n# mine\n")  # already edited by hand
+
+    send("user-prompt-submit", repo, prompt="tidy up")
+    # Claude works through Bash: no Edit or Write hook fires.
+    (repo / "app.py").write_text("def hello():\n    return 'HI'\n# mine\n")
+    (repo / "new.py").write_text("y = 2\n")
+    (repo / "old.py").unlink()
+    (repo / "pkg.lock").write_text("ignored\n")
+    send("stop", repo)
+
+    changes = turn_changes()
+    assert set(changes) == {"app.py", "new.py", "old.py"}
+    assert all(c["via"] == "watch" for c in changes.values())
+    # The before copy is the file as the prompt found it, hand edits included.
+    assert "-    return 'hi'\n+    return 'HI'\n" in changes["app.py"]["diff"]
+    assert "+# mine" not in changes["app.py"]["diff"]
+    assert changes["new.py"]["diff"].startswith("--- /dev/null")
+    assert "+++ /dev/null" in changes["old.py"]["diff"]
+
+
+def test_a_commit_made_during_the_prompt_is_counted_once(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="add bye and commit")
+    (repo / "bye.py").write_text("def bye():\n    return 'bye'\n")
+    git(repo, "add", "bye.py")
+    git(repo, "commit", "-q", "-m", "Add bye")  # the post-commit hook runs mid-prompt
+    send("stop", repo)
+
+    conn = connect()
+    rows = conn.execute("SELECT file_path, turn_id, source, commit_sha FROM changes").fetchall()
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    assert [(r["file_path"], r["turn_id"] is not None, r["commit_sha"]) for r in rows] == [("bye.py", True, sha)]
+
+
+def test_large_files_and_files_from_another_project_are_left_out(repo, tmp_path):
+    from devdash.capture.record import MAX_FILE_BYTES
+
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    connect_claude(repo)
+    connect_claude(other)
+    (repo / "big.txt").write_text("a\n" * MAX_FILE_BYTES)  # too large to keep as a before copy
+    send("user-prompt-submit", repo, prompt="go")
+    (repo / "big.txt").write_text("b\n")
+    (other / "theirs.py").write_text("z = 3\n")  # a session elsewhere; this one started in repo
+    (repo / "app.py").write_text("def hello():\n    return 'yo'\n")
+    send("stop", repo)
+    assert set(turn_changes()) == {"app.py"}

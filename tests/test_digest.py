@@ -158,3 +158,99 @@ def test_undoing_a_committed_change_leaves_the_undo_uncommitted(repo):
     [listed] = api.get("/api/repos").json()
     assert api.request("DELETE", f"/api/repos/{listed['id']}", json={}).status_code == 204
     assert api.get("/api/digest").json()["changes"] == []
+
+
+CLAUDE = "\n\nCo-Authored-By: Claude <noreply@anthropic.com>"
+
+
+def pushed_from_the_cloud(repo, tmp_path, branch, files, message):
+    """A cloud session's work: committed in another clone and pushed, then fetched here."""
+    remote = tmp_path / "remote.git"
+    if not remote.exists():
+        git(tmp_path, "init", "-q", "--bare", str(remote))
+        git(repo, "remote", "add", "origin", str(remote))
+        git(repo, "push", "-q", "origin", "main")
+    cloud = tmp_path / f"cloud-{branch}"
+    git(tmp_path, "clone", "-q", str(remote), str(cloud))
+    git(cloud, "config", "user.email", "claude@example.com")
+    git(cloud, "config", "user.name", "Claude")
+    git(cloud, "checkout", "-q", "-b", branch)
+    for path, content in files.items():
+        (cloud / path).write_text(content)
+    git(cloud, "add", ".")
+    git(cloud, "commit", "-q", "-m", message)
+    git(cloud, "push", "-q", "origin", branch)
+    git(repo, "fetch", "-q", "origin")
+    return git(cloud, "rev-parse", "HEAD").strip()
+
+
+def test_a_cloud_sessions_pushed_commit_shows_as_its_own_change(repo, tmp_path):
+    from devdash.capture.install import init
+    init(repo)  # not connected to Claude: no hooks at all
+    sha = pushed_from_the_cloud(repo, tmp_path, "claude/tree", {"tree.py": "def grow():\n    return 1\n"},
+                                "Grow the tree" + CLAUDE)
+    api = client()
+    [change] = api.get("/api/digest").json()["changes"]
+    assert change["origin"] == "cloud" and change["prompt"] == "Grow the tree"
+    assert change["prompt_recorded"] is False and change["branch"] == "claude/tree"
+    assert change["commit"]["sha"] == sha
+    assert [(f["path"], f["status"]) for f in change["files"]] == [("tree.py", "added")]
+    # Looking again doesn't count it twice.
+    assert len(api.get("/api/digest").json()["changes"]) == 1
+    # Not on the checked-out branch, so undo explains instead of failing on the files.
+    refused = api.post("/api/digest/undo", json={"change": change["id"]})
+    assert refused.status_code == 409 and "isn't on the branch" in refused.json()["detail"]
+
+
+def test_commits_without_a_claude_trailer_or_copies_are_not_counted(repo, tmp_path):
+    from devdash.capture.install import init
+    init(repo)
+    pushed_from_the_cloud(repo, tmp_path, "mine", {"a.py": "x = 1\n"}, "My own work")
+    pushed_from_the_cloud(repo, tmp_path, "claude", {"b.py": "y = 2\n"}, "Claude's work" + CLAUDE)
+    # The same commit rebased onto another branch keeps its author time and message.
+    git(repo, "checkout", "-q", "-b", "copy")
+    git(repo, "cherry-pick", "origin/claude")
+    changes = client().get("/api/digest").json()["changes"]
+    assert [c["prompt"] for c in changes] == ["Claude's work"]
+
+
+def test_a_hook_recorded_commit_is_not_counted_again(repo):
+    connect_claude(repo)
+    claude_edits(repo, "Shout", {"app.py": "def hello():\n    return 'HI'\n"})
+    git(repo, "commit", "-q", "-am", "Shout" + CLAUDE)
+    [change] = client().get("/api/digest").json()["changes"]
+    assert change["origin"] == "prompt" and change["prompt"] == "Shout"
+    assert change["commit"]["message"] == "Shout"
+
+
+def test_a_commit_the_post_commit_hook_missed_links_to_its_prompt(repo):
+    connect_claude(repo)
+    claude_edits(repo, "Shout", {"app.py": "def hello():\n    return 'HI'\n"})
+    # Committed with hooks skipped, so only the scan sees the commit.
+    git(repo, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-am", "Shout" + CLAUDE)
+    [change] = client().get("/api/digest").json()["changes"]
+    assert change["origin"] == "prompt" and change["commit"]["message"] == "Shout"
+
+
+def test_files_changed_without_edit_or_write_are_marked(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="Shout and add notes")
+    send("pre-tool-use", repo, tool_name="Edit", tool_input={"file_path": str(repo / "app.py")})
+    (repo / "app.py").write_text("def hello():\n    return 'HI'\n")
+    (repo / "notes.md").write_text("written by a shell command\n")
+    send("stop", repo)
+    [change] = client().get("/api/digest").json()["changes"]
+    assert {f["path"]: f["watched"] for f in change["files"]} == {"app.py": False, "notes.md": True}
+
+
+def test_words_in_text_and_comments_are_not_payment_or_sign_in_code(repo):
+    connect_claude(repo)
+    claude_edits(repo, "Explain the digest", {
+        "help.ts": 'const GUIDE = "Changes touching sign-in, payments or the database come first.";\n'
+                   "// remember the login page\n",
+        "README.md": "Payments and passwords are flagged.\n",
+        "billing.ts": "const total = stripe.charge(amount);\n",
+    })
+    [change] = client().get("/api/digest").json()["changes"]
+    flags = {f["path"]: [flag["kind"] for flag in f["flags"]] for f in change["files"]}
+    assert flags == {"billing.ts": ["payments"], "help.ts": [], "README.md": []}

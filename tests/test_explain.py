@@ -139,8 +139,11 @@ def test_explaining_a_function_asks_claude_once(repo, tmp_path, monkeypatch):
         "summary": "Says hello.", "change": "Now uses the name.", "improves": ["Friendlier"],
         "tradeoffs": ["Shouts"], "check": None, "extra": "dropped",
     })
-    assert client().get("/api/ai").json() | {"detail": None} == {
-        "tool": "claude", "available": True, "signed_in": True, "model": "haiku", "detail": None}
+    status = client().get("/api/ai").json()
+    assert {k: status[k] for k in ("provider", "tool", "available", "signed_in", "account", "model", "install")} == {
+        "provider": "claude", "tool": "claude", "available": True, "signed_in": True, "account": None,
+        "model": "haiku", "install": []}
+    assert [m["id"] for m in status["models"]] == ["haiku", "sonnet", "opus"]
 
     request = {"path": "app.py", "name": "hello"}
     first = client().post(f"/api/repos/{repo_id}/explain/function", json=request)
@@ -193,4 +196,33 @@ def test_signing_in_from_the_dashboard(repo, tmp_path, monkeypatch):
     finished = client().post("/api/ai/sign-in/code", json={"code": " abc#123 "}).json()
     assert finished["state"] == "signed_in"
     assert "code abc#123" in calls.read_text().splitlines()
+
+
+def test_without_claude_the_status_gives_the_official_installers(tmp_path, monkeypatch):
+    from devdash import explain
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    status = client().get("/api/ai").json()
+    assert status["available"] is False and status["signed_in"] is None
+    expected = explain.install_commands()
+    assert [c["command"] for c in status["install"]] == [c["command"] for c in expected]
+    assert explain.install_commands("Linux") == [{"shell": "Terminal", "command": "curl -fsSL https://claude.ai/install.sh | bash"}]
+    assert [c["shell"] for c in explain.install_commands("Windows")] == ["PowerShell", "Command Prompt"]
+    assert explain.install_commands("Windows")[0]["command"] == "irm https://claude.ai/install.ps1 | iex"
+
+
+def test_a_fresh_native_install_is_found_off_the_path_and_names_the_account(tmp_path, monkeypatch):
+    # The native installer puts claude in ~/.local/bin, which the PATH DevDash started with
+    # may not have yet.
+    native = tmp_path / "home" / ".local" / "bin"
+    native.mkdir(parents=True)
+    (native / "claude").write_text(
+        "#!/bin/sh\necho '{\"loggedIn\": true, \"email\": \"me@example.com\", \"orgName\": \"Mine\"}'\n")
+    (native / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    status = client().get("/api/ai").json()
+    assert status["available"] is True and status["signed_in"] is True
+    assert status["account"] == "me@example.com" and status["install"] == []
 

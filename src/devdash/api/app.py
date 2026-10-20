@@ -2,6 +2,7 @@
 The response models below are the contract; FastAPI publishes them at /openapi.json."""
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from devdash import agenda as agenda_module
@@ -19,6 +21,7 @@ from devdash import digest as digest_module
 from devdash import explain as explain_module
 from devdash import flow as flow_module
 from devdash import functions as functions_module
+from devdash import preferences as preferences_module
 from devdash import git
 from devdash import home as home_module
 from devdash import projectmap
@@ -28,12 +31,17 @@ from devdash import undo as undo_module
 from devdash.capture import install
 from devdash.store import connect
 
-# The UI from Vite's dev server (5173) and its preview of a build (4173).
+# The built UI, served by the API itself so `devdash serve` is all it takes. Missing in a
+# checkout where it hasn't been built (scripts/build_ui.py builds it).
+WEB = Path(__file__).resolve().parent.parent / "web"
+# The UI from Vite's dev server (5173) and its preview of a build (4173), when working on it.
 DEV_ORIGINS = [f"http://{host}:{port}" for port in (5173, 4173) for host in ("localhost", "127.0.0.1")]
 LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 # Answered without signing in: whether a password is set, signing in, and setting the
-# first password (that one checks for itself).
+# first password (that one checks for itself). The page's own files are open too: they
+# hold no data, and the page asks for the sign-in.
 OPEN_PATHS = {"/api/auth", "/api/auth/login", "/api/auth/password"}
+PRIVATE_PAGES = {"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
 
 
 class Repo(BaseModel):
@@ -295,12 +303,45 @@ class ExplainFunctionRequest(BaseModel):
     uncommitted: bool = False
 
 
+class InstallCommand(BaseModel):
+    shell: str  # where to run it: Terminal, PowerShell or Command Prompt
+    command: str
+
+
+class AiModel(BaseModel):
+    id: str
+    label: str
+    note: str = ""  # what it's good for, or its size
+
+
 class AiStatus(BaseModel):
+    provider: str = "claude"  # claude, codex, ollama or antigravity
+    name: str = "Claude"
     tool: str
-    available: bool
-    signed_in: bool | None  # None when Claude Code couldn't say
-    model: str
-    detail: str | None
+    available: bool  # installed and ready to answer (Ollama: running, with a model)
+    signed_in: bool | None  # None when the tool couldn't say
+    account: str | None = None  # the signed-in account's email (or organization)
+    model: str  # the model explanations use: the one picked in Settings, or the default
+    detail: str | None  # when not available, what to do: "Install …", "Start Ollama", "Download a model"
+    install: list[InstallCommand] = []  # the official commands for that, for this computer
+    login: Literal["button", "terminal", "none"] | None = None  # how it signs in
+    login_command: str | None = None  # the command that signs in (for "terminal": run it yourself)
+    models: list[AiModel] = []  # cheapest first; may be empty when the tool can't list them
+    default_model: str | None = None
+
+
+class ExplainerChoice(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"]
+    models: dict[str, str]  # the model picked for each AI; missing: its default
+
+
+class ExplainerChoiceChange(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"] | None = None
+    models: dict[str, str] | None = None  # only the AIs to change; "" goes back to the default
+
+
+class SignInStart(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"] = "claude"
 
 
 class SignIn(BaseModel):
@@ -420,6 +461,7 @@ class DigestFile(BaseModel):
     deletions: int
     functions: list[DigestFunction]
     flags: list[DigestFlag]
+    watched: bool  # changed during the prompt, not by Claude's Edit or Write: maybe by hand
 
 
 class DigestCommit(BaseModel):
@@ -439,6 +481,7 @@ class DigestChange(BaseModel):
     branch: str | None
     prompt: str | None
     prompt_recorded: bool  # False: an AI-co-authored commit; prompt is its message
+    origin: Literal["prompt", "commit", "cloud"]  # cloud: a Claude commit found on a branch, no hook saw it made
     at: str
     commit: DigestCommit | None  # None while any of it isn't committed
     files: list[DigestFile]
@@ -485,6 +528,21 @@ class Digest(BaseModel):
 class AuthStatus(BaseModel):
     password_set: bool
     signed_in: bool
+    username: str | None = None  # only for a signed-in browser
+
+
+class Preferences(BaseModel):
+    theme: Literal["dark", "light"]
+    uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
+    shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
+    ai: ExplainerChoice  # which AI writes explanations, and with which model
+
+
+class PreferenceChange(BaseModel):
+    theme: Literal["dark", "light"] | None = None
+    uncommitted: bool | None = None
+    shortcuts: dict[str, str] | None = None  # only the actions to change; "" turns one off
+    ai: ExplainerChoiceChange | None = None
 
 
 class Login(BaseModel):
@@ -561,17 +619,21 @@ def create_app() -> FastAPI:
             if not request.headers.get("content-type", "").startswith("application/json"):
                 return JSONResponse({"detail": "send JSON"}, status_code=415)
         # With a password set, everything else needs a signed-in browser.
-        if (request.url.path not in OPEN_PATHS and request.method != "OPTIONS" and auth.password_set()
+        path = request.url.path
+        private = path == "/api" or path.startswith("/api/") or path in PRIVATE_PAGES
+        if (private and path not in OPEN_PATHS and request.method != "OPTIONS" and auth.password_set()
                 and not auth.signed_in(request.cookies.get(auth.COOKIE))):
             return JSONResponse({"detail": "sign in to DevDash"}, status_code=401)
         return await call_next(request)
 
-    @app.get("/api/auth", response_model=AuthStatus)
+    @app.get("/api/auth", response_model=AuthStatus, response_model_exclude_none=True)
     def auth_status(request: Request):
-        """Whether a password is set, and whether this browser is signed in."""
-        return AuthStatus(password_set=auth.password_set(), signed_in=auth.signed_in(request.cookies.get(auth.COOKIE)))
+        """Whether a password is set, and whether this browser is signed in (and as whom)."""
+        signed_in = auth.signed_in(request.cookies.get(auth.COOKIE))
+        return AuthStatus(password_set=auth.password_set(), signed_in=signed_in,
+                          username=auth.username() if signed_in else None)
 
-    @app.post("/api/auth/login", response_model=AuthStatus)
+    @app.post("/api/auth/login", response_model=AuthStatus, response_model_exclude_none=True)
     def log_in(body: Login, response: Response):
         try:
             token = auth.log_in(body.username, body.password)
@@ -582,13 +644,13 @@ def create_app() -> FastAPI:
         _set_login(response, token)
         return AuthStatus(password_set=True, signed_in=True)
 
-    @app.post("/api/auth/logout", response_model=AuthStatus)
+    @app.post("/api/auth/logout", response_model=AuthStatus, response_model_exclude_none=True)
     def log_out(request: Request, response: Response):
         auth.log_out(request.cookies.get(auth.COOKIE))
         response.delete_cookie(auth.COOKIE, path="/")
         return AuthStatus(password_set=auth.password_set(), signed_in=False)
 
-    @app.put("/api/auth/password", response_model=AuthStatus)
+    @app.put("/api/auth/password", response_model=AuthStatus, response_model_exclude_none=True)
     def set_password(body: NewPassword, request: Request, response: Response):
         """Sets the first username and password, or changes them from a signed-in browser with
         the current password. Signs this browser in, and every other one out."""
@@ -610,7 +672,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/repos", response_model=Repo, status_code=201)
     def add_repo(body: NewRepo):
-        path = Path(body.path.strip()).expanduser()
+        path = _folder(body.path)
         if not path.is_dir():
             raise HTTPException(400, f"No folder at {path}")
         root = _install(install.connect_claude if body.ai == "claude" else install.init, path)
@@ -736,14 +798,20 @@ def create_app() -> FastAPI:
 
     @app.get("/api/ai", response_model=AiStatus)
     def ai_status():
-        """Whether Claude Code is installed here, to write explanations."""
-        return explain_module.status()
+        """The AI picked in Settings to write explanations (Claude unless changed): whether it's
+        installed and signed in, how to set it up, and the model it uses."""
+        return explain_module.active_status()
+
+    @app.get("/api/ai/providers", response_model=list[AiStatus])
+    def ai_providers():
+        """Every AI that can write explanations, each with its state and models."""
+        return explain_module.all_status()
 
     @app.post("/api/ai/sign-in", response_model=SignIn)
-    def sign_in():
-        """Starts signing in to Claude Code: the sign-in page opens in the browser."""
+    def sign_in(body: SignInStart | None = None):
+        """Starts signing in to an AI (Claude unless named): its sign-in page opens in the browser."""
         try:
-            return explain_module.start_login()
+            return explain_module.start_login((body or SignInStart()).provider)
         except explain_module.ExplainError as error:
             raise HTTPException(400, str(error))
 
@@ -821,6 +889,23 @@ def create_app() -> FastAPI:
             raise HTTPException(409, str(error))
         return Undone(change=body.change, undone_at=None)
 
+    @app.get("/api/preferences", response_model=Preferences)
+    def get_preferences():
+        """The dashboard's settings: theme, uncommitted work from the start, shortcut keys."""
+        return preferences_module.get()
+
+    @app.put("/api/preferences", response_model=Preferences)
+    def change_preferences(body: PreferenceChange):
+        """Changes only the settings given; shortcuts merge one action at a time."""
+        try:
+            return preferences_module.update(body.model_dump(exclude_none=True))
+        except preferences_module.PreferenceError as error:
+            raise HTTPException(400, str(error))
+
+    @app.post("/api/preferences/reset-shortcuts", response_model=Preferences)
+    def reset_shortcuts():
+        return preferences_module.reset_shortcuts()
+
     @app.get("/api/todos", response_model=list[Todo])
     def list_todos():
         """Open to-dos oldest first, then the most recently finished."""
@@ -868,7 +953,22 @@ def create_app() -> FastAPI:
         """Forgets the calendar's address."""
         agenda_module.disconnect()
 
+    if (WEB / "index.html").is_file():
+        # Last, so every /api route above comes first.
+        app.mount("/", StaticFiles(directory=WEB, html=True), name="ui")
+
     return app
+
+
+def _folder(typed: str) -> Path:
+    """A folder as people paste it: in quotes (Windows' "Copy as path"), with ~ or an
+    environment variable such as %USERPROFILE% or $HOME, with either kind of slash, or
+    relative to the home folder."""
+    text = typed.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    path = Path(os.path.expandvars(text)).expanduser()
+    return path if path.is_absolute() else Path.home() / path
 
 
 def _set_login(response: Response, token: str) -> None:
