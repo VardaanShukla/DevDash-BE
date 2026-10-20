@@ -12,14 +12,17 @@ def main(argv: list[str] | None = None) -> int:
     init_cmd = commands.add_parser("init", help="track a git repo (its own history needs no hooks)")
     init_cmd.add_argument("path", nargs="?", default=".")
 
-    for name, text in (("connect", "start recording Claude's changes in a repo"),
-                       ("disconnect", "stop recording Claude's changes in a repo")):
+    # The AI tools DevDash records (install.TOOLS), written out so `record` starts fast.
+    tools = ["claude", "codex", "antigravity"]
+    for name, text in (("connect", "start recording an AI tool's changes in a repo"),
+                       ("disconnect", "stop recording AI changes in a repo")):
         cmd = commands.add_parser(name, help=text)
-        cmd.add_argument("tool", choices=["claude"])
+        cmd.add_argument("tool", choices=tools)
         cmd.add_argument("path", nargs="?", default=".")
 
     record_cmd = commands.add_parser("record", help="called by hooks; reads the event from stdin")
     record_cmd.add_argument("event", choices=["user-prompt-submit", "pre-tool-use", "stop", "post-commit"])
+    record_cmd.add_argument("--tool", choices=tools, default="claude", help="the AI tool whose hook this is")
 
     turns_cmd = commands.add_parser("turns", help="list recent turns")
     turns_cmd.add_argument("--limit", type=int, default=10)
@@ -37,28 +40,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "record":
         from devdash.capture.record import run_hook
 
-        return run_hook(args.event)
+        return run_hook(args.event, tool=args.tool)
 
     if args.command in ("init", "connect", "disconnect"):
         from devdash.capture import install
 
-        action = {"init": install.init, "connect": install.connect_claude,
-                  "disconnect": install.disconnect_claude}[args.command]
+        path = Path(args.path)
         try:
-            root = action(Path(args.path))
+            if args.command == "connect":
+                root = install.connect_tool(path, args.tool)
+            else:
+                root = {"init": install.init, "disconnect": install.disconnect}[args.command](path)
         except install.InitError as error:
             print(f"devdash: {error}")
             return 1
         if args.command == "init":
             print(f"Tracking {root}")
-            print("To also record Claude's changes here: devdash connect claude")
+            print("To also record your AI tool's changes here: devdash connect claude (or codex, or antigravity)")
         elif args.command == "connect":
-            print(f"Recording Claude's changes in {root}")
-            print(f"Installed: git post-commit hook, Claude Code hooks in {install.claude_settings_path()}")
-            print("Restart any open Claude Code session to pick up the hooks.")
-            print("For Claude app chats, add the text from `devdash instructions` to your project instructions.")
+            name = install.TOOL_NAMES[args.tool]
+            print(f"Recording {name}'s changes in {root}")
+            print(f"Installed: git post-commit hook, {name} hooks in {install.tool_hooks_path(args.tool)}")
+            if args.tool == "claude":
+                print("Restart any open Claude Code session to pick up the hooks.")
+                print("For Claude app chats, add the text from `devdash instructions` to your project instructions.")
+            elif args.tool == "codex":
+                print("Open Codex, type /hooks and trust DevDash's hooks; restart any Codex session already open.")
+            else:
+                print("Restart agy or the Antigravity app if it's open, so it loads the hooks.")
         else:
-            print(f"Stopped recording Claude's changes in {root}. Recorded history is kept.")
+            print(f"Stopped recording AI changes in {root}. Recorded history is kept.")
         return 0
 
     if args.command == "instructions":

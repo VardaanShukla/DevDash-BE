@@ -8,6 +8,8 @@ def devdash_home(tmp_path, monkeypatch):
     home = tmp_path / "devdash-home"
     monkeypatch.setenv("DEVDASH_HOME", str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("DEVDASH_ANTIGRAVITY_CONFIG", str(tmp_path / "antigravity-config"))
     monkeypatch.delenv("DEVDASH_INTERNAL", raising=False)
     return home
 

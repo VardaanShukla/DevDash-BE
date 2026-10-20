@@ -63,8 +63,8 @@ if [ "$1" = "exec" ]; then
 fi
 exit 1
 """)
-    cache = tmp_path / "home" / ".codex"
-    cache.mkdir(parents=True)
+    cache = tmp_path / "codex-home"  # CODEX_HOME, which conftest points here
+    cache.mkdir(parents=True, exist_ok=True)
     (cache / "models_cache.json").write_text(json.dumps({"models": [
         {"slug": "gpt-big", "display_name": "Big", "priority": 1, "description": "The biggest. Uses a lot."},
         {"slug": "gpt-small-mini", "display_name": "Small", "priority": 2, "description": "Small and quick."},

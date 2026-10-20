@@ -10,7 +10,7 @@ MIGRATIONS = [
     files("devdash.store").joinpath(name).read_text()
     for name in ("schema.sql", "migration_002.sql", "migration_003.sql", "migration_004.sql",
                  "migration_005.sql", "migration_006.sql", "migration_007.sql", "migration_008.sql",
-                 "migration_009.sql", "migration_010.sql", "migration_011.sql")
+                 "migration_009.sql", "migration_010.sql", "migration_011.sql", "migration_012.sql")
 ]
 
 
