@@ -325,12 +325,12 @@ def setup_steps(root: Path, claude: bool) -> list[dict]:
     ]
     if not claude:
         steps.append({"id": "ai", "title": "Optional: record your AI tool",
-                      "detail": "Pick Claude to also record each request Claude worked on, next to the change it made.",
+                      "detail": "Pick your AI coding tool to also record each request it worked on, next to the change it made.",
                       "command": f"devdash connect claude {shlex.quote(str(root))}", "done": False})
         return steps
     steps += [
         {"id": "git-hook", "title": "Git hook installed",
-         "detail": "Links each commit to the Claude request behind it. Added to any hook you already have.",
+         "detail": "Links each commit to the AI request behind it. Added to any hook you already have.",
          "command": None, "done": git_hook_installed(root)},
         {"id": "claude-hooks", "title": "Claude Code hooks installed",
          "detail": f"Records Claude Code edits as they happen. Lives in {claude_settings_path()}.",

@@ -139,9 +139,11 @@ def test_explaining_a_function_asks_claude_once(repo, tmp_path, monkeypatch):
         "summary": "Says hello.", "change": "Now uses the name.", "improves": ["Friendlier"],
         "tradeoffs": ["Shouts"], "check": None, "extra": "dropped",
     })
-    assert client().get("/api/ai").json() | {"detail": None} == {
-        "tool": "claude", "available": True, "signed_in": True, "account": None, "model": "haiku", "detail": None,
-        "install": []}
+    status = client().get("/api/ai").json()
+    assert {k: status[k] for k in ("provider", "tool", "available", "signed_in", "account", "model", "install")} == {
+        "provider": "claude", "tool": "claude", "available": True, "signed_in": True, "account": None,
+        "model": "haiku", "install": []}
+    assert [m["id"] for m in status["models"]] == ["haiku", "sonnet", "opus"]
 
     request = {"path": "app.py", "name": "hello"}
     first = client().post(f"/api/repos/{repo_id}/explain/function", json=request)

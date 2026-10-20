@@ -308,14 +308,40 @@ class InstallCommand(BaseModel):
     command: str
 
 
+class AiModel(BaseModel):
+    id: str
+    label: str
+    note: str = ""  # what it's good for, or its size
+
+
 class AiStatus(BaseModel):
+    provider: str = "claude"  # claude, codex, ollama or antigravity
+    name: str = "Claude"
     tool: str
-    available: bool
-    signed_in: bool | None  # None when Claude Code couldn't say
+    available: bool  # installed and ready to answer (Ollama: running, with a model)
+    signed_in: bool | None  # None when the tool couldn't say
     account: str | None = None  # the signed-in account's email (or organization)
-    model: str
-    detail: str | None
-    install: list[InstallCommand] = []  # the official installers for this computer, when it isn't installed
+    model: str  # the model explanations use: the one picked in Settings, or the default
+    detail: str | None  # when not available, what to do: "Install …", "Start Ollama", "Download a model"
+    install: list[InstallCommand] = []  # the official commands for that, for this computer
+    login: Literal["button", "terminal", "none"] | None = None  # how it signs in
+    login_command: str | None = None  # the command that signs in (for "terminal": run it yourself)
+    models: list[AiModel] = []  # cheapest first; may be empty when the tool can't list them
+    default_model: str | None = None
+
+
+class ExplainerChoice(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"]
+    models: dict[str, str]  # the model picked for each AI; missing: its default
+
+
+class ExplainerChoiceChange(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"] | None = None
+    models: dict[str, str] | None = None  # only the AIs to change; "" goes back to the default
+
+
+class SignInStart(BaseModel):
+    provider: Literal["claude", "codex", "ollama", "antigravity"] = "claude"
 
 
 class SignIn(BaseModel):
@@ -509,12 +535,14 @@ class Preferences(BaseModel):
     theme: Literal["dark", "light"]
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
+    ai: ExplainerChoice  # which AI writes explanations, and with which model
 
 
 class PreferenceChange(BaseModel):
     theme: Literal["dark", "light"] | None = None
     uncommitted: bool | None = None
     shortcuts: dict[str, str] | None = None  # only the actions to change; "" turns one off
+    ai: ExplainerChoiceChange | None = None
 
 
 class Login(BaseModel):
@@ -770,14 +798,20 @@ def create_app() -> FastAPI:
 
     @app.get("/api/ai", response_model=AiStatus)
     def ai_status():
-        """Whether Claude Code is installed here, to write explanations."""
-        return explain_module.status()
+        """The AI picked in Settings to write explanations (Claude unless changed): whether it's
+        installed and signed in, how to set it up, and the model it uses."""
+        return explain_module.active_status()
+
+    @app.get("/api/ai/providers", response_model=list[AiStatus])
+    def ai_providers():
+        """Every AI that can write explanations, each with its state and models."""
+        return explain_module.all_status()
 
     @app.post("/api/ai/sign-in", response_model=SignIn)
-    def sign_in():
-        """Starts signing in to Claude Code: the sign-in page opens in the browser."""
+    def sign_in(body: SignInStart | None = None):
+        """Starts signing in to an AI (Claude unless named): its sign-in page opens in the browser."""
         try:
-            return explain_module.start_login()
+            return explain_module.start_login((body or SignInStart()).provider)
         except explain_module.ExplainError as error:
             raise HTTPException(400, str(error))
 

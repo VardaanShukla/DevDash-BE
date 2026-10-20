@@ -38,6 +38,9 @@ DEFAULTS = {
     "shortcuts": DEFAULT_SHORTCUTS,
 }
 MAX_KEY = 20
+# The AIs that can write explanations (see providers.py), and the longest model name taken.
+AI_PROVIDERS = ("claude", "codex", "ollama", "antigravity")
+MAX_MODEL = 100
 
 
 class PreferenceError(ValueError):
@@ -58,8 +61,11 @@ def get() -> dict:
     for action in ACTIONS:
         key = DEFAULT_SHORTCUTS.get(action, "")
         defaults[action] = "" if key in taken else key
+    ai = saved.get("ai") or {}
     return {"theme": saved.get("theme", DEFAULTS["theme"]), "uncommitted": saved.get("uncommitted"),
-            "shortcuts": {**defaults, **chosen}}
+            "shortcuts": {**defaults, **chosen},
+            "ai": {"provider": ai.get("provider") if ai.get("provider") in AI_PROVIDERS else "claude",
+                   "models": {k: v for k, v in (ai.get("models") or {}).items() if k in AI_PROVIDERS and isinstance(v, str)}}}
 
 
 def update(changes: dict) -> dict:
@@ -77,6 +83,8 @@ def update(changes: dict) -> dict:
             current["uncommitted"] = value
         elif name == "shortcuts":
             current["shortcuts"] = _shortcuts({**current["shortcuts"], **_checked(value)})
+        elif name == "ai":
+            current["ai"] = _ai({**current["ai"], **value} if isinstance(value, dict) else value, current["ai"])
         else:
             raise PreferenceError(f"no setting called {name!r}")
     _save(current)
@@ -112,11 +120,33 @@ def _shortcuts(shortcuts: dict) -> dict:
     return shortcuts
 
 
+def _ai(value, current: dict) -> dict:
+    """Which AI writes explanations, and the model picked for each; models merge one AI at a
+    time, and an empty model means that AI's default."""
+    if not isinstance(value, dict):
+        raise PreferenceError("ai is {provider, models}")
+    provider = value.get("provider", current["provider"])
+    if provider not in AI_PROVIDERS:
+        raise PreferenceError(f"the AI is one of {', '.join(AI_PROVIDERS)}")
+    models = value.get("models", {})
+    if not isinstance(models, dict) or any(k not in AI_PROVIDERS or not isinstance(v, str) or len(v) > MAX_MODEL
+                                           for k, v in models.items()):
+        raise PreferenceError(f"models maps an AI to a model name of at most {MAX_MODEL} characters")
+    merged = {**current["models"], **{k: v.strip() for k, v in models.items()}}
+    return {"provider": provider, "models": {k: v for k, v in merged.items() if v}}
+
+
+def ai_choice() -> tuple[str, str | None]:
+    """The AI that writes explanations and the model picked for it (None: its default)."""
+    ai = get()["ai"]
+    return ai["provider"], ai["models"].get(ai["provider"]) or None
+
+
 def _save(preferences: dict) -> None:
     # Only the keys the person changed are stored, so a later version's defaults reach the rest.
     chosen = {action: key for action, key in preferences["shortcuts"].items() if DEFAULT_SHORTCUTS.get(action, "") != key}
     stored = {"theme": preferences["theme"], "uncommitted": preferences["uncommitted"], "shortcuts": chosen,
-              "shortcuts_version": SHORTCUTS_VERSION}
+              "shortcuts_version": SHORTCUTS_VERSION, "ai": preferences["ai"]}
     conn = connect()
     with conn:
         conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?, ?)", (SETTING, json.dumps(stored)))

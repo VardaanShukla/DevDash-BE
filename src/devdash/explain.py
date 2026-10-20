@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 
+from devdash import preferences, providers
 from devdash.capture.record import INTERNAL_ENV
 from devdash.store import connect
 from devdash.store.db import now
@@ -52,6 +53,8 @@ def status() -> dict:
     auth = _auth_status() if path else {}
     signed_in = auth.get("loggedIn") if path else None
     return {
+        "provider": "claude",
+        "name": providers.NAMES["claude"],
         "tool": "claude",
         "available": path is not None,
         "signed_in": signed_in,
@@ -59,7 +62,36 @@ def status() -> dict:
         "model": MODEL,
         "detail": None if path else "Install Claude Code to get explanations.",
         "install": [] if path else install_commands(),
+        "login": "button",
+        "login_command": "claude auth login",
+        "models": CLAUDE_MODELS,
+        "default_model": MODEL,
     }
+
+
+# Claude's model aliases, cheapest first: Claude Code always runs the newest of each.
+CLAUDE_MODELS = [
+    {"id": "haiku", "label": "Haiku", "note": "Fastest and cheapest: fewest tokens. Plenty for explanations."},
+    {"id": "sonnet", "label": "Sonnet", "note": "Deeper explanations of tricky code; uses several times more."},
+    {"id": "opus", "label": "Opus", "note": "The most capable; uses the most tokens."},
+]
+
+
+def provider_status(provider: str) -> dict:
+    """An AI's state for the dashboard, with the model it will use: the one picked in
+    Settings, or its default."""
+    found = status() if provider == "claude" else providers.status(provider)
+    chosen = preferences.get()["ai"]["models"].get(provider)
+    return {**found, "model": chosen or found.get("default_model") or ""}
+
+
+def active_status() -> dict:
+    """The AI picked in Settings to write explanations."""
+    return provider_status(preferences.ai_choice()[0])
+
+
+def all_status() -> list[dict]:
+    return [provider_status(provider) for provider in providers.IDS]
 
 
 def install_commands(system: str | None = None) -> list[dict]:
@@ -197,9 +229,21 @@ FIELDS = {
 
 
 def _run(prompt: str) -> str:
+    """The answer from the AI picked in Settings, with the model picked for it."""
+    provider, model = preferences.ai_choice()
+    if provider == "claude":
+        return _ask_claude(model or MODEL, prompt)
+    try:
+        return providers.ask(provider, model, SYSTEM_PROMPT, prompt)
+    except providers.ProviderError as error:
+        raise ExplainError(f"{error} (Settings → AI picks another.)" if not error.signed_out else str(error),
+                           signed_out=error.signed_out)
+
+
+def _ask_claude(model: str, prompt: str) -> str:
     if not _find_claude():
         raise ExplainError("Claude Code isn't installed on this computer, so DevDash can't write explanations.")
-    flags = ["--output-format", "json", "--model", MODEL, "--system-prompt", SYSTEM_PROMPT,
+    flags = ["--output-format", "json", "--model", model, "--system-prompt", SYSTEM_PROMPT,
              "--tools", "", "--no-session-persistence"]
     with tempfile.TemporaryDirectory(prefix="devdash-explain-") as folder:
         for attempt in (flags, flags[:4]):
@@ -241,18 +285,27 @@ _login_lock = threading.Lock()
 URL = re.compile(r"https://\S+")
 
 
-def start_login() -> dict:
-    """Starts `claude auth login`, which opens the sign-in page in the browser, and returns
-    the page's address too, in case the browser didn't open."""
-    if not _find_claude():
-        raise ExplainError("Claude Code isn't installed on this computer.")
+def start_login(provider: str = "claude") -> dict:
+    """Starts the AI's own sign-in (`claude auth login`, `codex login`), which opens its
+    sign-in page in the browser, and returns the page's address too, in case the browser
+    didn't open. AIs that sign in only from a terminal (Antigravity) say so instead."""
+    if provider == "claude":
+        if not _find_claude():
+            raise ExplainError("Claude Code isn't installed on this computer.")
+        command = [_claude(), "auth", "login"]
+    else:
+        command = providers.login_command(provider)
+        if command is None:
+            raise ExplainError(f"{providers.NAMES.get(provider, provider)} signs in from a terminal, or isn't installed yet.")
     with _login_lock:
         process = _login["process"]
-        if process is None or process.poll() is not None:
-            process = subprocess.Popen([_claude(), "auth", "login"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        if process is not None and process.poll() is None and _login.get("provider") != provider:
+            process.terminate()  # signing in to another AI instead
+        if process is None or process.poll() is not None or _login.get("provider") != provider:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=_env(),
                                        cwd=tempfile.gettempdir())
-            _login.update(process=process, url=None, output=[])
+            _login.update(process=process, url=None, output=[], provider=provider)
             threading.Thread(target=_read_login, args=(process,), daemon=True).start()
     deadline = time.monotonic() + 15
     while _login["url"] is None and process.poll() is None and time.monotonic() < deadline:
