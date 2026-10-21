@@ -353,6 +353,13 @@ Nothing starts DevDash by itself: it runs only while `devdash serve` does.
    Remove-Item -Recurse -Force "$env:USERPROFILE\.devdash"
    ```
 
+   Windows (Command Prompt):
+
+   ```bat
+   tar -czf "%USERPROFILE%\devdash-backup.tar.gz" -C "%USERPROFILE%" .devdash
+   rmdir /s /q "%USERPROFILE%\.devdash"
+   ```
+
 If you uninstalled before step 1, the hooks are left calling a DevDash that isn't there. Git
 commits still work (the hook ends in `|| true`), but Claude Code reports a failing hook. Take
 them out by hand: delete DevDash's two lines from each project's `.git/hooks/post-commit`,
