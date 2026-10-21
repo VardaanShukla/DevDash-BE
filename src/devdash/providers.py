@@ -62,7 +62,9 @@ def login_command(provider: str) -> list[str] | None:
     """The command that signs in from the dashboard (it opens the browser), when there is one."""
     if provider == "codex":
         path = _find_codex()
-        return [path, "login"] if path else None
+        if not path:
+            return None
+        return [path, "login"]
     return None
 
 
@@ -102,7 +104,9 @@ def _find_codex() -> str | None:
     for editor in (".vscode", ".vscode-insiders", ".cursor", ".windsurf"):
         bundled += glob.glob(str(home / editor / "extensions" / "openai.chatgpt-*" / "bin" / "*" / exe))
     bundled.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return _first(home / ".local" / "bin" / exe, home / ".codex" / "bin" / exe, *bundled)
+    npm = (Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "npm" / "codex.cmd" if _windows()
+           else home / ".npm-global" / "bin" / "codex")
+    return _first(home / ".local" / "bin" / exe, home / ".codex" / "bin" / exe, npm, *bundled)
 
 
 def _codex_status() -> dict:
@@ -131,7 +135,7 @@ def _codex_status() -> dict:
 def _codex_models() -> list[dict]:
     """The models Codex lists for this account, from its own cache, cheapest first."""
     try:
-        cache = json.loads((Path.home() / ".codex" / "models_cache.json").read_text(encoding="utf-8"))
+        cache = json.loads((Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "models_cache.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return CODEX_FALLBACK
     models = []

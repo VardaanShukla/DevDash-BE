@@ -1,6 +1,7 @@
-"""Turns hook events into rows. Runs inside Claude Code and git hooks, so it must
-be fast, print nothing (Claude Code adds a prompt hook's stdout to the chat) and
-never fail the hook."""
+"""Turns hook events into rows. Runs inside Claude Code, Codex, Antigravity and git
+hooks, so it must be fast, print nothing (Claude Code and Codex add a prompt hook's
+stdout to the chat; Antigravity gets the one JSON answer it requires) and never fail
+the hook."""
 
 import difflib
 import json
@@ -21,7 +22,15 @@ from devdash.store import connect, now
 # Set on Claude Code runs that DevDash starts itself (summaries), so they are not recorded.
 INTERNAL_ENV = "DEVDASH_INTERNAL"
 
-EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
+# Claude Code's file-editing tools, and Codex's (it edits files by patch).
+EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
+# The files a Codex patch adds, changes, deletes or moves to.
+PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.MULTILINE)
+# What Antigravity needs on stdout from each hook DevDash adds, whatever happened: it
+# reads hook output as JSON, and a Stop answer of anything but "continue" lets it stop.
+ANTIGRAVITY_ANSWER = {"user-prompt-submit": "{}", "stop": '{"decision": "stop"}'}
+# Lines of an Antigravity transcript read back from its end to find the request.
+TRANSCRIPT_TAIL_BYTES = 2_000_000
 MAX_FILE_BYTES = 1_000_000
 # A project with more files than this already changed when a prompt starts isn't watched
 # for that prompt, to keep the prompt hook quick; Edit and Write are still recorded.
@@ -45,22 +54,70 @@ AI_TRAILER = re.compile(
 )
 
 
-def run_hook(event: str, stdin=sys.stdin) -> int:
-    if os.environ.get(INTERNAL_ENV):
-        return 0
+def run_hook(event: str, stdin=sys.stdin, tool: str = "claude", stdout=sys.stdout) -> int:
+    """`tool` is the AI tool whose hook this is; each sends its own shape of payload."""
     try:
-        raw = _read_stdin(stdin) if event != "post-commit" else ""
-        payload = json.loads(raw) if raw.strip() else {}
-        conn = connect()
+        if os.environ.get(INTERNAL_ENV):
+            return 0
         try:
-            handle(conn, event, payload, cwd=Path(payload.get("cwd") or os.getcwd()))
-        finally:
-            conn.close()
-        _log_call(event, payload)
-    except Exception:
-        with paths.error_log().open("a", encoding="utf-8") as log:
-            log.write(f"{now()} {event}\n{traceback.format_exc()}\n")
-    return 0
+            raw = _read_stdin(stdin) if event != "post-commit" else ""
+            payload = _normalize(tool, json.loads(raw) if raw.strip() else {})
+            conn = connect()
+            try:
+                handle(conn, event, payload, cwd=Path(payload.get("cwd") or os.getcwd()), tool=tool)
+            finally:
+                conn.close()
+            _log_call(event, payload)
+        except Exception as error:
+            with paths.error_log().open("a", encoding="utf-8") as log:
+                log.write(f"{now()} {event}\n{traceback.format_exc()}\n")
+            try:
+                # In the call log too, so the two read in order: what was called, what failed.
+                with paths.hook_log().open("a", encoding="utf-8") as log:
+                    log.write(f"{now()} {event} tool={tool} ERROR {type(error).__name__}: {str(error)[:200]}\n")
+            except OSError:
+                pass
+        return 0
+    finally:
+        if tool == "antigravity" and event in ANTIGRAVITY_ANSWER:
+            stdout.write(ANTIGRAVITY_ANSWER[event] + "\n")
+            stdout.flush()
+
+
+def health(days: int = 7) -> dict:
+    """How recording has gone lately, from the hook logs: when each hook was last called and
+    the errors, so a prompt that's missing can be told apart from one that failed."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    errors, last_error = 0, None
+    log = paths.error_log()
+    if log.exists():
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        for at, line in enumerate(lines):
+            stamp = line.split(" ", 1)[0]
+            if re.match(r"\d{4}-\d\d-\d\dT", stamp) and stamp >= since:
+                errors += 1
+                # The exception's own line ends its traceback.
+                detail = next((l for l in lines[at + 1:] if l and not l.startswith((" ", "Traceback"))), "")
+                last_error = {"at": stamp, "event": line.split(" ", 1)[-1], "detail": detail[:300]}
+    last_call: dict[str, str] = {}
+    calls = paths.hook_log()
+    if calls.exists():
+        for line in calls.read_text(encoding="utf-8", errors="replace").splitlines()[-2000:]:
+            parts = line.split(" ")
+            if len(parts) > 1 and "ERROR" not in parts:
+                last_call[parts[1]] = parts[0]
+    return {"errors": errors, "days": days, "last_error": last_error, "last_call": last_call,
+            "error_log": str(log), "hook_log": str(calls)}
+
+
+def _normalize(tool: str, payload: dict) -> dict:
+    """Antigravity's payload in Claude Code's terms: the conversation is the session and
+    its first workspace the folder it works in. Claude Code's and Codex's already match."""
+    if tool != "antigravity":
+        return payload
+    workspaces = [w for w in payload.get("workspacePaths") or [] if isinstance(w, str)]
+    return {**payload, "session_id": payload.get("conversationId"), "cwd": workspaces[0] if workspaces else None,
+            "workspaces": workspaces}
 
 
 def _read_stdin(stdin) -> str:
@@ -76,13 +133,13 @@ def _log_call(event: str, payload: dict) -> None:
     if log.exists() and log.stat().st_size > HOOK_LOG_MAX_BYTES:
         log.replace(log.with_suffix(".log.1"))
     tool_input = payload.get("tool_input") or {}
-    target = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    target = ",".join(_edit_targets(payload))
     with log.open("a", encoding="utf-8") as out:
         out.write(f"{now()} {event} session={str(payload.get('session_id', '-'))[:8]} "
                   f"tool={payload.get('tool_name', '-')} file={target or '-'}\n")
 
 
-def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path) -> None:
+def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path, tool: str = "claude") -> None:
     repos = conn.execute("SELECT id, path FROM repos WHERE claude = 1").fetchall()
     if not repos:
         return
@@ -95,9 +152,12 @@ def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path) -> No
             if repo is not None:
                 _commit(conn, repo)
         elif event == "user-prompt-submit":
-            _prompt(conn, repos, payload, cwd)
+            if tool == "antigravity":
+                _antigravity_invocation(conn, repos, payload, cwd)
+            else:
+                _prompt(conn, repos, payload, cwd, tool)
         elif event == "pre-tool-use":
-            _before_edit(conn, repos, payload, cwd)
+            _before_edit(conn, repos, payload, cwd, tool)
         elif event == "stop":
             turn = _open_turn(conn, payload.get("session_id"))
             if turn is not None:
@@ -106,26 +166,107 @@ def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path) -> No
             raise ValueError(f"unknown event {event!r}")
 
 
-def _prompt(conn, repos, payload, cwd: Path) -> None:
+def _prompt(conn, repos, payload, cwd: Path, tool: str = "claude", prompt: str | None = None) -> None:
     session_id = payload["session_id"]
-    _ensure_session(conn, _repo_for(repos, cwd), session_id)
+    _ensure_session(conn, _repo_for(repos, cwd), session_id, tool)
     # A turn left open means its Stop never fired (crash, interrupt); close it first.
     stale = _open_turn(conn, session_id)
     if stale is not None:
         # Without its Stop there's no telling when it ended, so only its Edit and Write count.
         _finish_turn(conn, stale, watch=False)
-    turn = _new_turn(conn, _repo_for(repos, cwd), session_id, payload.get("prompt") or UNKNOWN_PROMPT)
-    _start_watch(conn, turn["id"], repos, cwd)
+    turn = _new_turn(conn, _repo_for(repos, cwd), session_id, prompt or payload.get("prompt") or UNKNOWN_PROMPT, tool)
+    folders = [Path(w).resolve() for w in payload.get("workspaces") or []] or [cwd]
+    _start_watch(conn, turn["id"], repos, folders)
 
 
-def _start_watch(conn, turn_id: int, repos, cwd: Path) -> None:
+def _antigravity_invocation(conn, repos, payload, cwd: Path) -> None:
+    """Antigravity calls this before every model call. The first of a request (none open
+    for the conversation yet, or its very first call) starts the turn."""
+    if not payload.get("session_id"):
+        return
+    first = payload.get("invocationNum") in (0, "0")
+    if _open_turn(conn, payload["session_id"]) is not None and not first:
+        return
+    _prompt(conn, repos, payload, cwd, "antigravity", prompt=_antigravity_prompt(payload.get("transcriptPath")))
+
+
+def _antigravity_prompt(transcript: str | None) -> str | None:
+    """The newest request the user typed, from Antigravity's transcript (JSON lines). Its
+    hooks don't pass the prompt, and the transcript's layout isn't documented, so any
+    entry marked as the user's counts, with its text wherever it's kept."""
+    if not transcript:
+        return None
+    path = Path(transcript)
+    try:
+        with path.open("rb") as file:
+            size = file.seek(0, os.SEEK_END)
+            file.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            lines = file.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = _user_text(entry) if isinstance(entry, dict) else None
+        if text:
+            return text
+    return None
+
+
+_USER_KEYS = ("userInput", "user_input", "userMessage", "user_message")
+_TEXT_KEYS = ("userResponse", "user_response", "text", "content", "message", "prompt", "parts", "items")
+
+
+def _user_text(entry: dict) -> str | None:
+    for key in _USER_KEYS:
+        if key in entry:
+            return _text(entry[key])
+    kind = " ".join(str(entry.get(k, "")) for k in ("type", "role", "source", "author", "stepType")).lower()
+    if re.search(r"\buser\b|user_input|userinput|user_message", kind):
+        for key in _TEXT_KEYS:
+            if key in entry:
+                text = _text(entry[key])
+                if text:
+                    return text
+        for value in entry.values():
+            if isinstance(value, dict):
+                text = _user_text({**value, "type": "user"})
+                if text:
+                    return text
+    for value in entry.values():
+        if isinstance(value, dict):
+            text = _user_text(value)
+            if text:
+                return text
+    return None
+
+
+def _text(value) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):
+        found = [t for t in (_text(v) for v in value) if t]
+        return "\n".join(found) or None
+    if isinstance(value, dict):
+        for key in _TEXT_KEYS:
+            if key in value:
+                text = _text(value[key])
+                if text:
+                    return text
+    return None
+
+
+def _start_watch(conn, turn_id: int, repos, folders: list[Path]) -> None:
     """Notes, for each connected project the session works in, the commit it's on and the
     files that already differ from it, with their contents. At Stop, every file that
     differs since counts as the prompt's, whichever tool changed it."""
     for repo in repos:
         root = Path(repo["path"])
         # The session's own project, or the projects inside the folder it started in.
-        if not (cwd == root or cwd.is_relative_to(root) or root.is_relative_to(cwd)) or not root.is_dir():
+        if not any(cwd == root or cwd.is_relative_to(root) or root.is_relative_to(cwd) for cwd in folders) \
+                or not root.is_dir():
             continue
         try:
             head = git.run(root, "rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)).strip() or None
@@ -148,13 +289,24 @@ def _start_watch(conn, turn_id: int, repos, cwd: Path) -> None:
             )
 
 
-def _before_edit(conn, repos, payload, cwd: Path) -> None:
+def _edit_targets(payload: dict) -> list[str]:
+    """The files an edit tool is about to write: Claude Code names one, a Codex patch any number."""
+    tool_input = payload.get("tool_input") or {}
+    if payload.get("tool_name") == "apply_patch":
+        patch = tool_input.get("command") or tool_input.get("patch") or tool_input.get("input") or ""
+        return PATCH_FILE.findall(patch) if isinstance(patch, str) else []
+    target = tool_input.get("file_path") or tool_input.get("notebook_path")
+    return [target] if target else []
+
+
+def _before_edit(conn, repos, payload, cwd: Path, tool: str = "claude") -> None:
     if payload.get("tool_name") not in EDIT_TOOLS:
         return
-    tool_input = payload.get("tool_input") or {}
-    target = tool_input.get("file_path") or tool_input.get("notebook_path")
-    if not target:
-        return
+    for target in _edit_targets(payload):
+        _snapshot(conn, repos, payload, cwd, target, tool)
+
+
+def _snapshot(conn, repos, payload, cwd: Path, target: str, tool: str) -> None:
     # The file decides the repo, not the session's folder: a session started in the
     # parent of several repos still edits files inside each of them.
     absolute = (cwd / target).resolve()
@@ -166,13 +318,18 @@ def _before_edit(conn, repos, payload, cwd: Path) -> None:
         return
 
     session_id = payload["session_id"]
-    _ensure_session(conn, _repo_for(repos, cwd), session_id)
+    _ensure_session(conn, _repo_for(repos, cwd), session_id, tool)
     turn = _open_turn(conn, session_id)
     if turn is None:
         # Hooks were installed mid-session, so the prompt was missed.
-        turn = _new_turn(conn, repo, session_id, UNKNOWN_PROMPT)
+        turn = _new_turn(conn, repo, session_id, UNKNOWN_PROMPT, tool)
     elif turn["branch"] is None:
         conn.execute("UPDATE turns SET branch = ? WHERE id = ?", (git.branch(Path(repo["path"])), turn["id"]))
+    # A session started outside the project (another folder, an editor, the desktop app)
+    # wasn't watching it: from its first edit there, the rest of what changes in it counts too.
+    if not conn.execute("SELECT 1 FROM turn_repos WHERE turn_id = ? AND repo_id = ?", (turn["id"], repo["id"])).fetchone():
+        root = Path(repo["path"])
+        _start_watch(conn, turn["id"], [repo], [root])
 
     before = None
     if absolute.exists():
@@ -378,10 +535,14 @@ def unified_diff(file_path: str, before: str | None, after: str | None) -> str:
     return "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
 
 
-def _ensure_session(conn, repo, session_id: str) -> None:
+# sessions.tool for each AI tool's hooks.
+SESSION_TOOL = {"claude": "claude-code", "codex": "codex", "antigravity": "antigravity"}
+
+
+def _ensure_session(conn, repo, session_id: str, tool: str = "claude") -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO sessions (id, repo_id, started_at) VALUES (?, ?, ?)",
-        (session_id, repo["id"] if repo else None, now()),
+        "INSERT OR IGNORE INTO sessions (id, repo_id, tool, started_at) VALUES (?, ?, ?, ?)",
+        (session_id, repo["id"] if repo else None, SESSION_TOOL.get(tool, tool), now()),
     )
 
 
@@ -394,11 +555,11 @@ def _open_turn(conn, session_id: str | None):
     ).fetchone()
 
 
-def _new_turn(conn, repo, session_id: str, prompt: str):
+def _new_turn(conn, repo, session_id: str, prompt: str, tool: str = "claude"):
     branch = git.branch(Path(repo["path"])) if repo else None
     # The session row can be gone by now: closing a stale turn that recorded nothing, or
     # removing a project, deletes sessions left without turns. Bring it back.
-    _ensure_session(conn, repo, session_id)
+    _ensure_session(conn, repo, session_id, tool)
     cursor = conn.execute(
         "INSERT INTO turns (session_id, branch, prompt, started_at) VALUES (?, ?, ?, ?)",
         (session_id, branch, prompt, now()),
@@ -412,9 +573,8 @@ def _follow_moves(conn, repos, event: str, payload: dict, cwd: Path):
     case costs nothing."""
     if all(Path(r["path"]).is_dir() for r in repos):
         return repos
-    tool_input = payload.get("tool_input") or {}
-    target = tool_input.get("file_path") or tool_input.get("notebook_path")
-    where = (cwd / target).resolve().parent if event == "pre-tool-use" and target else cwd
+    targets = _edit_targets(payload)
+    where = (cwd / targets[0]).resolve().parent if event == "pre-tool-use" and targets else cwd
     if _repo_for(repos, where) is not None:
         return repos
     root = git.toplevel(where) if where.is_dir() else None

@@ -63,7 +63,19 @@ JS_EXTENSIONS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".sve
                  "/index.ts", "/index.tsx", "/index.js", "/index.jsx"]
 
 
+# A project with no commit yet is read from its folder: the files git would add.
+WORKTREE = "(not committed yet)"
+
+
+def readable(repo: Path, revision: str) -> str:
+    """The revision to read: as asked, or the working tree while HEAD has no commit yet."""
+    if revision == "HEAD" and not git.run(repo, "rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)).strip():
+        return WORKTREE
+    return revision
+
+
 def project_map(repo: Path, revision: str) -> dict:
+    revision = readable(repo, revision)
     files = _files(repo, revision)
     paths = [path for path, _, _ in files]
     areas = _areas(paths)
@@ -111,7 +123,10 @@ def project_map(repo: Path, revision: str) -> dict:
 
 
 def _files(repo: Path, revision: str) -> list[tuple[str, str, int]]:
-    """(path, blob sha, size) for each file in the revision, skipping build output."""
+    """(path, blob sha, size) for each file in the revision, skipping build output. From the
+    working tree, the sha is the path itself (see _read_blobs)."""
+    if revision == WORKTREE:
+        return _worktree_files(repo)
     out = git.run(repo, "ls-tree", "-r", "-l", "-z", revision)
     result = []
     for record in out.split("\x00"):
@@ -194,7 +209,8 @@ def _imports(repo: Path, files: list[tuple[str, str, int]]) -> tuple[list[tuple[
     if not code:
         return [], complete
 
-    contents = _read_blobs(repo, [sha for _, sha in code])
+    # From the working tree each "sha" is the file's path.
+    contents = _read_blobs(repo, [sha for _, sha in code], worktree=all(sha == path for path, sha in code))
     python_roots = _python_roots(known)
     links: set[tuple[str, str]] = set()
     for (path, _), text in zip(code, contents):
@@ -206,7 +222,22 @@ def _imports(repo: Path, files: list[tuple[str, str, int]]) -> tuple[list[tuple[
     return sorted(links), complete
 
 
-def _read_blobs(repo: Path, shas: list[str]) -> list[str]:
+def _worktree_files(repo: Path) -> list[tuple[str, str, int]]:
+    out = git.run(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    result = []
+    for path in sorted(set(out.split("\x00"))):
+        folders = path.split("/")[:-1]
+        file = repo / path
+        if not path or SKIP_DIRS.intersection(folders) or any(f.endswith(".egg-info") for f in folders) \
+                or not file.is_file():
+            continue
+        result.append((path, path, file.stat().st_size))
+    return result
+
+
+def _read_blobs(repo: Path, shas: list[str], worktree: bool = False) -> list[str]:
+    if worktree:
+        return [(repo / path).read_text(encoding="utf-8", errors="replace") for path in shas]
     result = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, input=("\n".join(shas) + "\n").encode(),
                             capture_output=True, check=True)
     data, texts, at = result.stdout, [], 0

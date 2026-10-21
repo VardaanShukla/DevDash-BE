@@ -1,6 +1,6 @@
 """`devdash init` registers a repo; its own git history needs no hooks.
-`devdash connect claude` opts that repo into Claude tracking: a git post-commit hook
-and the user-level Claude Code hooks. `devdash disconnect claude` undoes it."""
+`devdash connect claude` (or codex, or antigravity) opts that repo into recording that AI
+tool: a git post-commit hook and the tool's user-level hooks. `devdash disconnect` undoes it."""
 
 import json
 import os
@@ -21,6 +21,22 @@ CLAUDE_EVENTS = {
     "PreToolUse": ("pre-tool-use", "Edit|MultiEdit|Write|NotebookEdit"),
     "Stop": ("stop", None),
 }
+# The AI tools whose requests can be recorded. A project records one of them; `repos.claude`
+# says it records at all, `repos.ai` which one.
+TOOLS = ("claude", "codex", "antigravity")
+TOOL_NAMES = {"claude": "Claude Code", "codex": "ChatGPT Codex", "antigravity": "Antigravity"}
+# Codex's hooks mirror Claude Code's; its file edits go through apply_patch.
+CODEX_EVENTS = {
+    "UserPromptSubmit": ("user-prompt-submit", None),
+    "PreToolUse": ("pre-tool-use", "apply_patch"),
+    "Stop": ("stop", None),
+}
+# Antigravity has no hook that carries the prompt: the first model call of a request starts
+# it (the prompt comes from its transcript) and Stop ends it. Its PreToolUse hooks must say
+# whether a tool may run, so DevDash stays out of them; the files a request changed are
+# found by comparing the project at its start and end, as for edits Claude makes by shell.
+ANTIGRAVITY_EVENTS = {"PreInvocation": "user-prompt-submit", "Stop": "stop"}
+ANTIGRAVITY_HOOK = "devdash"  # the name of DevDash's entry in Antigravity's hooks.json
 
 
 class InitError(RuntimeError):
@@ -94,44 +110,70 @@ def refresh() -> list[str]:
                 install_git_hook(root)
             except (InitError, OSError, git.GitError) as error:
                 problems.append(str(error))
-    if any(row["claude"] for row in rows):
+    for tool in tools_in_use():
         try:
-            install_claude_hooks()
-        except (OSError, json.JSONDecodeError) as error:
-            problems.append(f"Claude Code hooks: {error}")
+            install_tool_hooks(tool)
+        except (InitError, OSError) as error:
+            problems.append(f"{TOOL_NAMES[tool]} hooks: {error}")
     return problems
 
 
-def connect_claude(path: Path) -> Path:
+def tools_in_use() -> list[str]:
+    """The AI tools some project records, in TOOLS order."""
+    conn = connect()
+    used = {row[0] or "claude" for row in conn.execute("SELECT ai FROM repos WHERE claude = 1")}
+    conn.close()
+    return [tool for tool in TOOLS if tool in used]
+
+
+def connect_tool(path: Path, tool: str) -> Path:
+    """Records the AI tool's requests in the repo at path, in place of any other tool."""
+    if tool not in TOOLS:
+        raise InitError(f"DevDash can't record {tool}; it can record {', '.join(TOOLS)}")
     root = init(path)
     install_git_hook(root)
-    install_claude_hooks()
-    _remove_repo_claude_hooks(root)
+    install_tool_hooks(tool)
+    if tool == "claude":
+        _remove_repo_claude_hooks(root)
     _exclude_from_git(root, "/.devdash/")
     conn = connect()
     with conn:
-        conn.execute("UPDATE repos SET claude = 1 WHERE path = ?", (str(root),))
+        conn.execute("UPDATE repos SET claude = 1, ai = ? WHERE path = ?", (tool, str(root)))
     conn.close()
+    _remove_unused_hooks()  # the tool this repo recorded before, if no other repo uses it
     return root
 
 
-def disconnect_claude(path: Path) -> Path:
-    """Stops Claude tracking for a repo. Recorded history is kept."""
+def connect_claude(path: Path) -> Path:
+    return connect_tool(path, "claude")
+
+
+def disconnect(path: Path) -> Path:
+    """Stops recording AI changes in a repo. Recorded history is kept."""
     root = _root(path)
     remove_git_hook(root)
     conn = connect()
     with conn:
-        conn.execute("UPDATE repos SET claude = 0 WHERE path = ?", (str(root),))
-        still_connected = conn.execute("SELECT 1 FROM repos WHERE claude = 1").fetchone()
+        conn.execute("UPDATE repos SET claude = 0, ai = NULL WHERE path = ?", (str(root),))
     conn.close()
-    if not still_connected:
-        remove_claude_hooks()
+    _remove_unused_hooks()
     return root
+
+
+disconnect_claude = disconnect
+
+
+def _remove_unused_hooks() -> None:
+    """Takes out the hooks of every tool no project records any more."""
+    used = tools_in_use()
+    for tool in TOOLS:
+        if tool not in used:
+            remove_tool_hooks(tool)
 
 
 def remove(repo_id: int) -> bool:
     """Stops tracking a repo and forgets what DevDash recorded about it. The repo's own
-    files and git history are untouched; DevDash's git hook comes out if Claude was
+    files and git history are untouched; DevDash's git hook comes out if an AI tool was
     connected. Works even when the folder has moved or been deleted."""
     conn = connect()
     row = conn.execute("SELECT path, claude FROM repos WHERE id = ?", (repo_id,)).fetchone()
@@ -140,7 +182,7 @@ def remove(repo_id: int) -> bool:
         return False
     path = Path(row["path"])
     if row["claude"] and git.toplevel(path) is not None:
-        disconnect_claude(path)
+        disconnect(path)
     conn = connect()
     with conn:
         conn.execute("DELETE FROM undone WHERE repo_id = ?", (repo_id,))
@@ -161,10 +203,9 @@ def remove(repo_id: int) -> bool:
             "DELETE FROM sessions WHERE repo_id IS NULL AND id NOT IN (SELECT session_id FROM turns)"
         )
         conn.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
-        still_connected = conn.execute("SELECT 1 FROM repos WHERE claude = 1").fetchone()
     conn.close()
-    if row["claude"] and not still_connected:
-        remove_claude_hooks()
+    if row["claude"]:
+        _remove_unused_hooks()
     return True
 
 
@@ -180,49 +221,247 @@ def _write(path: Path, text: str) -> None:
 def _root(path: Path) -> Path:
     root = git.toplevel(path)
     if root is None:
+        found = find_repos(path) if path.is_dir() else []
+        if found:
+            names = ", ".join(str(p) for p in found[:6]) + (" …" if len(found) > 6 else "")
+            raise InitError(f"{path} isn't a git project itself, but these inside it are: {names}. Add one of them.")
         raise InitError(f"{path} is not inside a git repository")
     return root
 
 
-def record_command(event: str) -> str:
+# Folders never searched for projects: dependencies, build output, caches.
+SKIP_SEARCH = {"node_modules", ".venv", "venv", "env", ".tox", "__pycache__", "dist", "build", "target",
+               ".next", ".cache", "site-packages", ".git", "vendor", "Library", "AppData"}
+SEARCH_DEPTH = 3
+MAX_FOUND = 50
+WORKSPACES = "workspaces"
+
+
+def find_repos(folder: Path, depth: int = SEARCH_DEPTH) -> list[Path]:
+    """Git projects in folder and up to `depth` folders down; not inside each other."""
+    found: list[Path] = []
+
+    def walk(current: Path, left: int) -> None:
+        if len(found) >= MAX_FOUND:
+            return
+        if (current / ".git").exists():
+            found.append(current.resolve())
+            return
+        if left == 0:
+            return
+        try:
+            children = sorted(p for p in current.iterdir() if p.is_dir() and not p.is_symlink())
+        except OSError:
+            return
+        for child in children:
+            if child.name not in SKIP_SEARCH and not child.name.startswith("."):
+                walk(child, left - 1)
+
+    walk(folder, depth)
+    return found
+
+
+def workspaces() -> list[str]:
+    """Folders `devdash init` was pointed at that hold projects, to offer when adding one."""
+    conn = connect()
+    row = conn.execute("SELECT value FROM settings WHERE name = ?", (WORKSPACES,)).fetchone()
+    conn.close()
+    return json.loads(row["value"]) if row else []
+
+
+def add_workspace(folder: Path) -> list[Path]:
+    """Remembers a folder of projects, without adding any or changing anything in them.
+    Returns the projects in it."""
+    folder = folder.resolve()
+    found = find_repos(folder)
+    known = workspaces()
+    if str(folder) not in known:
+        conn = connect()
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?, ?)",
+                         (WORKSPACES, json.dumps([*known, str(folder)])))
+        conn.close()
+    return found
+
+
+def candidates() -> list[dict]:
+    """Projects in the remembered folders that aren't added yet."""
+    conn = connect()
+    # normcase: on Windows C:\Users\Me and c:\users\me are the same folder.
+    added = {os.path.normcase(row["path"]) for row in conn.execute("SELECT path FROM repos")}
+    conn.close()
+    result, seen = [], set()
+    for folder in workspaces():
+        if not Path(folder).is_dir():
+            continue
+        for repo in find_repos(Path(folder)):
+            key = os.path.normcase(str(repo))
+            if key not in added and key not in seen:
+                seen.add(key)
+                result.append({"path": str(repo), "name": repo.name, "folder": folder})
+    return result
+
+
+def record_command(event: str, tool: str = "claude") -> str:
+    # Hooks of tools other than Claude Code name theirs, since their payloads differ.
+    named = f" --tool {tool}" if tool != "claude" else ""
     # The absolute interpreter path keeps hooks working when devdash is not on PATH;
     # -I stops a folder named devdash in the repo from shadowing the package. Forward
     # slashes, since on Windows these run in Git's sh, where a backslash escapes.
-    return f"{shlex.quote(Path(sys.executable).as_posix())} -I {RECORD} {event}"
+    return f"{_quote(Path(sys.executable).as_posix())} -I {RECORD} {event}{named}"
+
+
+def _quote(path: str) -> str:
+    """A path for a hook command. On Windows the same command may run in Git's sh or in
+    cmd (Antigravity), which share only double quotes; a user name with a space puts one
+    in the path to pipx's Python."""
+    if os.name != "nt":
+        return shlex.quote(path)
+    return f'"{path}"' if any(c in path for c in " &()^%!'") else path
 
 
 def claude_settings_path() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
 
 
+def codex_hooks_path() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "hooks.json"
+
+
+def antigravity_hooks_path() -> Path:
+    # Antigravity's global hooks, shared by its CLI (agy), app and IDE.
+    return Path(os.environ.get("DEVDASH_ANTIGRAVITY_CONFIG", Path.home() / ".gemini" / "config")) / "hooks.json"
+
+
+def tool_hooks_path(tool: str) -> Path:
+    return {"claude": claude_settings_path, "codex": codex_hooks_path, "antigravity": antigravity_hooks_path}[tool]()
+
+
+def install_tool_hooks(tool: str) -> Path:
+    return {"claude": install_claude_hooks, "codex": install_codex_hooks,
+            "antigravity": install_antigravity_hooks}[tool]()
+
+
+def remove_tool_hooks(tool: str) -> None:
+    {"claude": remove_claude_hooks, "codex": remove_codex_hooks, "antigravity": remove_antigravity_hooks}[tool]()
+
+
+def tool_hooks_installed(tool: str) -> bool:
+    return {"claude": claude_hooks_installed, "codex": codex_hooks_installed,
+            "antigravity": antigravity_hooks_installed}[tool]()
+
+
+def _load(path: Path) -> tuple[str, dict]:
+    text = _read(path) if path.exists() else ""
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        raise InitError(f"{path} isn't valid JSON, so DevDash can't add its hooks")
+    if not isinstance(data, dict):
+        raise InitError(f"{path} isn't a JSON object, so DevDash can't add its hooks")
+    return text, data
+
+
+def _save(path: Path, text: str, data: dict) -> None:
+    new = json.dumps(data, indent=2) + "\n"
+    if new != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write(path, new)
+
+
+def _install_event_hooks(path: Path, events: dict, tool: str) -> Path:
+    # Claude Code's settings.json and Codex's hooks.json share one layout:
+    # {"hooks": {event: [{"matcher": ..., "hooks": [{"type": "command", ...}]}]}}.
+    text, settings = _load(path)
+    hooks = settings.setdefault("hooks", {})
+    for tool_event, (event, matcher) in events.items():
+        groups = [g for g in hooks.get(tool_event, []) if not _is_ours(g)]
+        group = {"hooks": [{"type": "command", "command": record_command(event, tool)}]}
+        if matcher:
+            group = {"matcher": matcher, **group}
+        hooks[tool_event] = [*groups, group]
+    _save(path, text, settings)
+    return path
+
+
+def _event_hooks_installed(path: Path, events: dict) -> bool:
+    if not path.exists():
+        return False
+    try:
+        hooks = json.loads(_read(path)).get("hooks", {})
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return all(any(_is_ours(g) for g in hooks.get(event, [])) for event in events)
+
+
 def install_claude_hooks() -> Path:
     # User-level hooks fire in every Claude Code session, wherever it starts (a repo,
     # or the parent folder of several). `devdash record` exits at once unless an edited
     # file is inside a tracked repo.
-    settings_path = claude_settings_path()
-    text = _read(settings_path) if settings_path.exists() else ""
-    settings = json.loads(text) if text.strip() else {}
-    hooks = settings.setdefault("hooks", {})
-    for claude_event, (event, matcher) in CLAUDE_EVENTS.items():
-        groups = [g for g in hooks.get(claude_event, []) if not _is_ours(g)]
-        group = {"hooks": [{"type": "command", "command": record_command(event)}]}
-        if matcher:
-            group = {"matcher": matcher, **group}
-        hooks[claude_event] = [*groups, group]
-    new = json.dumps(settings, indent=2) + "\n"
-    if new != text:
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        _write(settings_path, new)
-    return settings_path
+    return _install_event_hooks(claude_settings_path(), CLAUDE_EVENTS, "claude")
 
 
 def remove_claude_hooks() -> None:
     settings_path = claude_settings_path()
     if not settings_path.exists():
         return
-    settings = json.loads(_read(settings_path))
+    try:
+        text, settings = _load(settings_path)
+    except InitError:
+        return  # not ours to fix, and nothing of ours can be found in it
     _drop_our_hooks(settings)
-    _write(settings_path, json.dumps(settings, indent=2) + "\n")
+    _save(settings_path, text, settings)
+
+
+def install_codex_hooks() -> Path:
+    # User-level, so they fire in every Codex session (CLI, IDE extension or app). Codex
+    # runs them only once the user has reviewed them in /hooks.
+    return _install_event_hooks(codex_hooks_path(), CODEX_EVENTS, "codex")
+
+
+def remove_codex_hooks() -> None:
+    path = codex_hooks_path()
+    if not path.exists():
+        return
+    try:
+        text, settings = _load(path)
+    except InitError:
+        return
+    _drop_our_hooks(settings)
+    if settings:
+        _save(path, text, settings)
+    else:
+        path.unlink()  # only ours was in it
+
+
+def install_antigravity_hooks() -> Path:
+    # Antigravity's hooks.json maps a name to its events; DevDash's entry is its own name.
+    path = antigravity_hooks_path()
+    text, config = _load(path)
+    # Antigravity wants JSON back from every hook, so `echo {}` answers for DevDash when it
+    # can't be reached (its container stopped, say); it reads the same in sh and cmd.
+    config[ANTIGRAVITY_HOOK] = {
+        event: [{"type": "command", "command": f"{record_command(ours, 'antigravity')} || echo {{}}", "timeout": 30}]
+        for event, ours in ANTIGRAVITY_EVENTS.items()
+    }
+    _save(path, text, config)
+    return path
+
+
+def remove_antigravity_hooks() -> None:
+    path = antigravity_hooks_path()
+    if not path.exists():
+        return
+    try:
+        text, config = _load(path)
+    except InitError:
+        return
+    if config.pop(ANTIGRAVITY_HOOK, None) is None:
+        return
+    if config:
+        _save(path, text, config)
+    else:
+        path.unlink()
 
 
 def _drop_our_hooks(settings: dict) -> None:
@@ -302,19 +541,28 @@ def git_hook_installed(root: Path) -> bool:
 
 
 def claude_hooks_installed() -> bool:
-    settings_path = claude_settings_path()
-    if not settings_path.exists():
+    return _event_hooks_installed(claude_settings_path(), CLAUDE_EVENTS)
+
+
+def codex_hooks_installed() -> bool:
+    return _event_hooks_installed(codex_hooks_path(), CODEX_EVENTS)
+
+
+def antigravity_hooks_installed() -> bool:
+    path = antigravity_hooks_path()
+    if not path.exists():
         return False
     try:
-        hooks = json.loads(_read(settings_path)).get("hooks", {})
+        ours = json.loads(_read(path)).get(ANTIGRAVITY_HOOK) or {}
+        return all(any(_is_ours({"hooks": [h]}) for h in ours.get(event, [])) for event in ANTIGRAVITY_EVENTS)
     except (json.JSONDecodeError, AttributeError):
         return False
-    return all(any(_is_ours(g) for g in hooks.get(event, [])) for event in CLAUDE_EVENTS)
 
 
-def setup_steps(root: Path, claude: bool) -> list[dict]:
-    """What it takes to use DevDash in a repo, each step with whether it is done.
-    `done` is None where DevDash can't check (something the user does elsewhere)."""
+def setup_steps(root: Path, ai: str | None) -> list[dict]:
+    """What it takes to use DevDash in a repo that records `ai` (None: no AI tool), each
+    step with whether it is done. `done` is None where DevDash can't check (something
+    the user does elsewhere)."""
     steps = [
         {"id": "track", "title": "Track the project",
          "detail": "DevDash reads your branches and commits straight from git. Nothing is added to the project.",
@@ -323,15 +571,34 @@ def setup_steps(root: Path, claude: bool) -> list[dict]:
          "detail": "Run this in a terminal and leave it running, then open http://127.0.0.1:8765.",
          "command": "devdash serve", "done": None},
     ]
-    if not claude:
+    if not ai:
         steps.append({"id": "ai", "title": "Optional: record your AI tool",
                       "detail": "Pick your AI coding tool to also record each request it worked on, next to the change it made.",
                       "command": f"devdash connect claude {shlex.quote(str(root))}", "done": False})
         return steps
-    steps += [
-        {"id": "git-hook", "title": "Git hook installed",
-         "detail": "Links each commit to the AI request behind it. Added to any hook you already have.",
-         "command": None, "done": git_hook_installed(root)},
+    steps.append({"id": "git-hook", "title": "Git hook installed",
+                  "detail": "Links each commit to the AI request behind it. Added to any hook you already have.",
+                  "command": None, "done": git_hook_installed(root)})
+    if ai == "codex":
+        return steps + [
+            {"id": "codex-hooks", "title": "Codex hooks installed",
+             "detail": f"Records each request to Codex and the files it changed. Lives in {codex_hooks_path()}.",
+             "command": None, "done": codex_hooks_installed()},
+            {"id": "codex-review", "title": "Trust DevDash's hooks in Codex",
+             "detail": "Codex runs a new hook only after you review it: open Codex, type /hooks and trust "
+                       "DevDash's three hooks. Restart Codex sessions that were already open.",
+             "command": "/hooks", "done": None},
+        ]
+    if ai == "antigravity":
+        return steps + [
+            {"id": "antigravity-hooks", "title": "Antigravity hooks installed",
+             "detail": f"Records each request to Antigravity and the files it changed. Lives in {antigravity_hooks_path()}.",
+             "command": None, "done": antigravity_hooks_installed()},
+            {"id": "restart", "title": "Restart Antigravity",
+             "detail": "Antigravity loads hooks when it starts, so restart agy or the Antigravity app if it's open.",
+             "command": None, "done": None},
+        ]
+    return steps + [
         {"id": "claude-hooks", "title": "Claude Code hooks installed",
          "detail": f"Records Claude Code edits as they happen. Lives in {claude_settings_path()}.",
          "command": None, "done": claude_hooks_installed()},
@@ -343,12 +610,15 @@ def setup_steps(root: Path, claude: bool) -> list[dict]:
                    "so Claude notes each request before it commits.",
          "command": INSTRUCTIONS.rstrip(), "done": None},
     ]
-    return steps
 
 
 AI_TOOLS = [
     {"id": "claude", "name": "Claude", "available": True,
      "description": "Records each request to Claude Code or a Claude app chat, with the change it made."},
+    {"id": "codex", "name": "ChatGPT Codex", "available": True,
+     "description": "Records each request to Codex (CLI, IDE extension or app), with the change it made."},
+    {"id": "antigravity", "name": "Gemini Antigravity", "available": True,
+     "description": "Records each request to Antigravity (agy, the app or the IDE), with the change it made."},
     {"id": "copilot", "name": "GitHub Copilot", "available": False,
      "description": "Coming later. Copilot commits are already marked as AI from their co-author line."},
     {"id": "cursor", "name": "Cursor", "available": False,
@@ -369,4 +639,6 @@ When you change files here:
 
 
 def _is_ours(group: dict) -> bool:
-    return any(RECORD in h.get("command", "") for h in group.get("hooks", []))
+    # `python -I -m devdash record …`, or an older form calling `devdash record` some other
+    # way, which is replaced by this one.
+    return any("devdash record" in h.get("command", "") for h in group.get("hooks", []))

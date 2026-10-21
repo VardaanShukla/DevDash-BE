@@ -52,6 +52,10 @@ CONFIG = re.compile(r"(^|/)(package\.json|requirements[^/]*\.txt|pyproject\.toml
                     r"|\.env[^/]*|vite\.config\.\w+|tsconfig[^/]*\.json)$|(^|/)\.github/workflows/")
 
 
+# The AI tool behind a recorded prompt, by sessions.tool ('git': a Claude app chat's prompt file).
+TOOL_NAMES = {"claude-code": "Claude", "git": "Claude", "codex": "Codex", "antigravity": "Antigravity"}
+
+
 class DigestError(ValueError):
     pass
 
@@ -66,9 +70,10 @@ def digest(day: date | None = None) -> dict:
     rows = conn.execute(
         "SELECT c.id, c.repo_id, r.name AS repo_name, r.path AS repo_path, c.turn_id, c.commit_sha,"
         " c.file_path, c.diff, c.source, c.via, c.created_at, t.prompt, t.branch, t.started_at,"
-        " m.message, m.branch AS commit_branch, m.found_by"
+        " m.message, m.branch AS commit_branch, m.found_by, s.tool"
         " FROM changes c JOIN repos r ON r.id = c.repo_id"
         " LEFT JOIN turns t ON t.id = c.turn_id LEFT JOIN commits m ON m.sha = c.commit_sha"
+        " LEFT JOIN sessions s ON s.id = t.session_id"
         " WHERE c.created_at >= ? AND c.created_at < ? ORDER BY c.created_at, c.id",
         (_utc(start), _utc(end)),
     ).fetchall()
@@ -147,6 +152,7 @@ def _group(row) -> dict:
         # prompt: recorded by the Claude Code hooks (or a prompt file); commit: an AI-co-authored
         # commit made here; cloud: a Claude commit found on a branch, made where no hook ran.
         "origin": "prompt" if row["turn_id"] else "cloud" if row["found_by"] == "scan" else "commit",
+        "tool": TOOL_NAMES.get(row["tool"]) if row["turn_id"] else None,
         "at": row["started_at"] or row["created_at"],
         "commit": None,
         "_commits": {},

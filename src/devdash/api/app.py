@@ -50,17 +50,38 @@ class Repo(BaseModel):
     path: str
     exists: bool
     branch: str | None
-    claude: bool
-    ai: Literal["claude"] | None
+    claude: bool  # records an AI tool's changes (the one in `ai`)
+    ai: Literal["claude", "codex", "antigravity"] | None
+
+
+class HookError(BaseModel):
+    at: str
+    event: str
+    detail: str
+
+
+class RecordingHealth(BaseModel):
+    errors: int  # hook calls that failed in the last `days` days
+    days: int
+    last_error: HookError | None
+    last_call: dict[str, str]  # event -> when a hook last called it
+    error_log: str
+    hook_log: str
+
+
+class Candidate(BaseModel):
+    path: str
+    name: str
+    folder: str  # the remembered folder it was found in
 
 
 class NewRepo(BaseModel):
     path: str
-    ai: Literal["claude"] | None = None
+    ai: Literal["claude", "codex", "antigravity"] | None = None
 
 
 class AiChoice(BaseModel):
-    ai: Literal["claude"] | None
+    ai: Literal["claude", "codex", "antigravity"] | None
 
 
 class AiTool(BaseModel):
@@ -482,6 +503,7 @@ class DigestChange(BaseModel):
     prompt: str | None
     prompt_recorded: bool  # False: an AI-co-authored commit; prompt is its message
     origin: Literal["prompt", "commit", "cloud"]  # cloud: a Claude commit found on a branch, no hook saw it made
+    tool: str | None = None  # the AI tool the prompt went to: Claude, Codex or Antigravity
     at: str
     commit: DigestCommit | None  # None while any of it isn't committed
     files: list[DigestFile]
@@ -666,7 +688,7 @@ def create_app() -> FastAPI:
     @app.get("/api/repos", response_model=list[Repo])
     def list_repos():
         conn = connect()
-        rows = conn.execute("SELECT id, name, path, claude FROM repos ORDER BY name").fetchall()
+        rows = conn.execute("SELECT id, name, path, claude, ai FROM repos ORDER BY name").fetchall()
         conn.close()
         return [_repo(row) for row in rows]
 
@@ -675,8 +697,20 @@ def create_app() -> FastAPI:
         path = _folder(body.path)
         if not path.is_dir():
             raise HTTPException(400, f"No folder at {path}")
-        root = _install(install.connect_claude if body.ai == "claude" else install.init, path)
+        root = _install((lambda p: install.connect_tool(p, body.ai)) if body.ai else install.init, path)
         return _repo(_row_for(root))
+
+    @app.get("/api/recording/health", response_model=RecordingHealth)
+    def recording_health():
+        """Whether the hooks have been called lately, and how many failed, with the logs' paths."""
+        from devdash.capture import record
+
+        return record.health()
+
+    @app.get("/api/repos/candidates", response_model=list[Candidate])
+    def repo_candidates():
+        """Projects in the folders `devdash init` remembered, not added yet, to pick from."""
+        return install.candidates()
 
     @app.delete("/api/repos/{repo_id}", status_code=204)
     def remove_repo(repo_id: int):
@@ -688,13 +722,13 @@ def create_app() -> FastAPI:
     @app.put("/api/repos/{repo_id}/ai", response_model=Repo)
     def set_ai(repo_id: int, body: AiChoice):
         path = _repo_path(repo_id)
-        _install(install.connect_claude if body.ai == "claude" else install.disconnect_claude, path)
+        _install((lambda p: install.connect_tool(p, body.ai)) if body.ai else install.disconnect, path)
         return _repo(_row_for(path))
 
     @app.get("/api/repos/{repo_id}/setup", response_model=Setup)
     def setup(repo_id: int):
         path = _repo_path(repo_id)
-        return Setup(steps=install.setup_steps(path, bool(_row_for(path)["claude"])))
+        return Setup(steps=install.setup_steps(path, _ai(_row_for(path))))
 
     @app.get("/api/ai-tools", response_model=list[AiTool])
     def ai_tools():
@@ -1030,20 +1064,27 @@ def _project_context(facts: dict) -> dict:
         "history": {"commits": history["commits"], "people": len(history["people"]),
                     "first_commit": history["first"], "last_commit": history["last"],
                     "commits_per_week_last_12": history["weeks"]},
+        "recent_commit_messages": facts.get("recent_commits", []),
+        # Only when there's no readme or package description: the opening lines of the code.
+        "code_samples": facts.get("samples", []),
     }
 
 
 def _repo(row) -> Repo:
     path = Path(row["path"])
     exists = git.toplevel(path) is not None
-    claude = bool(row["claude"])
     return Repo(id=row["id"], name=row["name"], path=row["path"], exists=exists,
-                branch=git.branch(path) if exists else None, claude=claude, ai="claude" if claude else None)
+                branch=git.branch(path) if exists else None, claude=bool(row["claude"]), ai=_ai(row))
+
+
+def _ai(row) -> str | None:
+    """The AI tool the project records, if any."""
+    return (row["ai"] or "claude") if row["claude"] else None
 
 
 def _row_for(root: Path):
     conn = connect()
-    row = conn.execute("SELECT id, name, path, claude FROM repos WHERE path = ?", (str(root),)).fetchone()
+    row = conn.execute("SELECT id, name, path, claude, ai FROM repos WHERE path = ?", (str(root),)).fetchone()
     conn.close()
     return row
 
@@ -1053,8 +1094,8 @@ def _install(action, path: Path | None):
         return action(path)
     except install.InitError as error:
         raise HTTPException(400, str(error))
-    except json.JSONDecodeError:
-        raise HTTPException(400, f"{install.claude_settings_path()} isn't valid JSON, so DevDash can't add its hooks")
+    except json.JSONDecodeError:  # kept for callers outside install's own checks
+        raise HTTPException(400, "A settings file isn't valid JSON, so DevDash can't add its hooks")
 
 
 def _repo_path(repo_id: int) -> Path:

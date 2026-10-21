@@ -32,7 +32,7 @@ def client():
 def test_add_project_then_turn_claude_on_and_off(repo):
     api = client()
     tools = api.get("/api/ai-tools").json()
-    assert [tool["id"] for tool in tools if tool["available"]] == ["claude"]
+    assert [tool["id"] for tool in tools if tool["available"]] == ["claude", "codex", "antigravity"]
 
     added = api.post("/api/repos", json={"path": str(repo)})
     assert added.status_code == 201 and added.json()["ai"] is None

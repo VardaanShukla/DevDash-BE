@@ -226,3 +226,46 @@ def test_a_fresh_native_install_is_found_off_the_path_and_names_the_account(tmp_
     assert status["available"] is True and status["signed_in"] is True
     assert status["account"] == "me@example.com" and status["install"] == []
 
+
+
+def test_a_project_with_no_readme_or_commit_still_gets_a_summary_and_a_description(tmp_path, monkeypatch):
+    project = tmp_path / "bare"
+    (project / "ledger").mkdir(parents=True)
+    git(project, "init", "-q")
+    (project / "ledger" / "cash_ledger.py").write_text("def balance(entries):\n    return sum(entries)\n")
+    (project / "main.py").write_text("from ledger.cash_ledger import balance\nprint(balance([1, 2]))\n")
+    init(project)
+    [listed] = client().get("/api/repos").json()
+    summary = client().get(f"/api/repos/{listed['id']}/summary")
+    assert summary.status_code == 200
+    facts = summary.json()
+    assert facts["readme"] is None and facts["files"] == 2 and facts["entry_points"] == ["main.py"]
+    assert facts["history"]["commits"] == 0
+    assert client().get(f"/api/repos/{listed['id']}/map").status_code == 200
+
+    calls = fake_claude(tmp_path, monkeypatch, {"overview": "", "how_it_works": [], "parts": [], "state": ""})
+    empty = client().post(f"/api/repos/{listed['id']}/explain/project", json={})
+    # An answer without its description is an error, not an empty box kept for ever.
+    assert empty.status_code == 502 and "left out the description" in empty.json()["detail"]
+    assert client().get(f"/api/repos/{listed['id']}/summary").json()["explanation"] is None
+
+    fake_claude(tmp_path, monkeypatch, {"overview": ["A ledger.", "It adds up cash."], "how_it_works": [],
+                                        "parts": [], "state": "New."})
+    made = client().post(f"/api/repos/{listed['id']}/explain/project", json={}).json()
+    assert made["overview"] == "A ledger. It adds up cash."
+    # With no readme to go on, the AI is shown how the code starts.
+    from devdash import summary as summary_module
+    samples = summary_module.summary(project, "HEAD")["samples"]
+    assert samples[0]["file"] == "main.py" and "print(balance([1, 2]))" in samples[0]["start"]
+
+
+def test_an_empty_description_kept_by_an_older_version_is_asked_again(repo):
+    from devdash import explain
+
+    subject = {"name": "x"}
+    conn = __import__("devdash.store", fromlist=["connect"]).connect()
+    with conn:
+        conn.execute("INSERT INTO explanations (key, kind, result, created_at) VALUES (?, 'project', ?, 'now')",
+                     (explain.key("project", subject), json.dumps({"overview": "", "how_it_works": [], "parts": [], "state": ""})))
+    conn.close()
+    assert explain.cached("project", subject) is None

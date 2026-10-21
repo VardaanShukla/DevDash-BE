@@ -14,35 +14,114 @@ with this package.
 
 ## Install and run
 
-Needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io). Works the same on
-Linux, macOS and Windows. Node is not needed: the dashboard page comes built into the
-package.
+DevDash needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io) (which installs
+Python apps in their own space). Node is not needed: the dashboard page comes built in.
 
-```sh
-pipx install git+https://github.com/VardaanShukla/DevDash-BE.git
-devdash serve
-```
+### Windows
 
-Then open http://127.0.0.1:8765. The first visit asks you to pick a username and password,
-then to add a project: the path of any git folder on your computer, typed or pasted any
-way (`C:\Users\me\App`, `"C:\Users\me\App"` from Windows' "Copy as path", `~/App`,
-`$HOME/App` or `%USERPROFILE%\App`).
+1. **Check what you have.** In Command Prompt or PowerShell:
 
-From a clone instead, run `pipx install -e .` in it, then `devdash serve`.
+   ```bat
+   py --version
+   git --version
+   ```
 
-If the terminal says `devdash` isn't found after installing, run `pipx ensurepath` once and
-open a new terminal. `python -m devdash serve` also works from the environment it's
-installed in.
+   If `py` isn't found or says older than 3.10, install [Python](https://www.python.org/downloads/)
+   (tick "Add python.exe to PATH"). If `git` isn't found, install
+   [Git for Windows](https://git-scm.com/download/win): DevDash's git hook runs in its `sh`.
+2. **Install pipx** and put its folder on your PATH:
+
+   ```bat
+   py -m pip install --user pipx
+   py -m pipx ensurepath
+   ```
+
+3. **Install DevDash**, from GitHub or from a folder you cloned it into:
+
+   ```bat
+   py -m pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git
+   py -m pipx install --force C:\path\to\DevDash-BE
+   ```
+
+4. **Close every terminal and open a new one** (so it sees the new PATH), then start it:
+
+   ```bat
+   devdash serve
+   ```
+
+5. Open http://127.0.0.1:8765 in your browser on the same computer.
+
+### Linux
+
+1. **Check what you have:** `python3 --version` (3.10 or newer) and `git --version`.
+   Install what's missing with your package manager, e.g. `sudo apt install python3 python3-venv git pipx`.
+2. **Install pipx**, if your package manager didn't: `python3 -m pip install --user pipx`, then
+   `python3 -m pipx ensurepath`.
+3. **Install DevDash:**
+
+   ```sh
+   pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git
+   # or from a clone:
+   pipx install --force /path/to/DevDash-BE
+   ```
+
+4. **Open a new terminal** and run `devdash serve`.
+5. Open http://127.0.0.1:8765.
+
+### macOS
+
+1. **Check what you have:** `python3 --version` and `git --version`. Missing ones come from
+   [python.org](https://www.python.org/downloads/) or `brew install python git`; running
+   `git --version` the first time also offers Apple's command line tools, which include git.
+2. **Install pipx:** `brew install pipx` (or `python3 -m pip install --user pipx`), then `pipx ensurepath`.
+3. **Install DevDash:** `pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git`
+   (or `pipx install --force /path/to/DevDash-BE` from a clone).
+4. **Open a new terminal** and run `devdash serve`.
+5. Open http://127.0.0.1:8765.
+
+### First run
+
+The first visit asks you to pick a username and password, then to add a project: the path of
+any git folder on your computer, typed or pasted any way (`C:\Users\me\App`, `"C:\Users\me\App"`
+from Windows' "Copy as path", `~/App`, `$HOME/App` or `%USERPROFILE%\App`). A project with no
+readme, or nothing committed yet, works too. To pick from a list instead, point DevDash at
+the folder that holds your projects once: `devdash init ~/Projects` remembers it, adds nothing
+and changes nothing in them, and Add project then lists the projects inside.
+
+Optional: install [Claude Code](https://claude.com/claude-code) (or Codex, Ollama or
+Antigravity) and sign in for the plain-English explanations, and pick your AI coding tool when
+adding a project to record each request it worked on (see below).
+
+### Update to the latest version
+
+Run the same install command again: `pipx install --force <GitHub URL or folder>`
+(Windows: `py -m pipx install --force …`). Then stop `devdash serve` (Ctrl+C) and start it
+again: it points the hooks at the new install by itself.
+
+### If something goes wrong
+
+- **`devdash` isn't found.** Open a new terminal first. Still not found: run `pipx ensurepath`
+  (Windows: `py -m pipx ensurepath`) and open another one. Or run it by its full path:
+  `%USERPROFILE%\.local\bin\devdash.exe serve` in Command Prompt,
+  `& "$env:USERPROFILE\.local\bin\devdash.exe" serve` in PowerShell, or
+  `~/.local/bin/devdash serve` on Linux and macOS. `python -m devdash serve` also works from
+  the environment it's installed in.
+- **You'd rather use a virtual environment** (venv or conda) than pipx: activate it, run
+  `pip install -e .` in the DevDash-BE folder, then `devdash serve`. The command then works
+  only while that environment is active, and the hooks DevDash adds call that environment's
+  Python.
+- **Hooks point at a deleted environment.** If you delete that environment (or move the
+  install) without uninstalling DevDash first, git commits still work, but Claude Code reports
+  a failing hook. Install DevDash again and start `devdash serve` once: it points every hook at
+  the new install. Or remove them as in "Uninstall DevDash safely".
+- **A prompt is missing from AI changes.** Settings → Recording shows when each hook last ran
+  and any hook errors, with the log files' paths. Only tools that run DevDash's hooks are
+  recorded: Claude Code (in a terminal, an editor extension or the desktop app's Code tab),
+  Codex and Antigravity. Claude's Cowork mode and plain chats don't run them.
 
 Projects can live anywhere and can move. A project that is moved, renamed or cloned again
-somewhere else keeps its history: add the new folder (or just commit in it, if Claude is
+somewhere else keeps its history: add the new folder (or just commit in it, if an AI tool is
 connected) and DevDash finds it is the same project, as long as the old folder is gone.
-Each `devdash serve` also points the git and Claude Code hooks at the Python that runs
-DevDash, so they keep working after a reinstall.
-
-Optional: install [Claude Code](https://claude.com/claude-code) and sign in for the
-plain-English explanations, and run `devdash connect claude <path>` to record Claude's
-changes (see below).
 
 ### Working on the page
 
@@ -218,6 +297,75 @@ Every hook call is logged (tool and file, never the prompt) to `~/.devdash/hooks
    didn't touch are recorded as human changes.
 
 Lockfiles, `node_modules`, build output and files over 1 MB are skipped.
+
+## Uninstall DevDash safely
+
+DevDash never changes your project files or their git history. What it adds, and takes out
+again when a project stops recording:
+
+- In each project that records an AI tool: two lines at the end of `.git/hooks/post-commit`
+  (a `# devdash: records commits` line and the command under it). Anything else in that
+  hook is yours and stays; the file is deleted only if DevDash made it. Also a
+  `/.devdash/` line in `.git/info/exclude`, so a Claude app chat's notes there stay out of
+  git. That line is harmless and stays.
+- For the AI tool a project records, while any project records it:
+  - Claude Code: three entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
+    `PreToolUse` and `Stop`, each running `… -m devdash record …`. Your other settings and
+    hooks stay.
+  - Codex: the same three in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
+  - Antigravity: a `devdash` entry in `~/.gemini/config/hooks.json`.
+- Its own data in `~/.devdash` (`%USERPROFILE%\.devdash` on Windows): the projects list,
+  what was recorded, settings and the dashboard password.
+
+Nothing starts DevDash by itself: it runs only while `devdash serve` does.
+
+1. **Stop recording in every project.** In the dashboard, open each project and choose
+   "Remove project from DevDash" (or "Stop recording AI changes"). Or in a terminal, for
+   each project that records an AI tool:
+
+   ```sh
+   devdash disconnect claude /path/to/project
+   ```
+
+   This takes DevDash's lines out of that project's git hook, and once no project records
+   an AI tool any more, its hooks out of `~/.claude`, `~/.codex` or `~/.gemini`. Do this
+   first: after uninstalling, the `devdash` command isn't there to do it.
+2. **Stop DevDash:** Ctrl+C in the terminal running `devdash serve`.
+3. **Uninstall it:**
+
+   ```sh
+   pipx uninstall devdash
+   ```
+
+   or, if you installed it into a virtual environment, activate it and run
+   `pip uninstall devdash`. On Windows: `py -m pipx uninstall devdash`.
+4. **Optional, and permanent: delete DevDash's data.** Keep a copy first. Linux and macOS:
+
+   ```sh
+   cd ~ && tar -czf devdash-backup.tar.gz .devdash
+   rm -rf ~/.devdash
+   ```
+
+   Windows (PowerShell):
+
+   ```powershell
+   Compress-Archive -Path "$env:USERPROFILE\.devdash" -DestinationPath "$env:USERPROFILE\devdash-backup.zip"
+   Remove-Item -Recurse -Force "$env:USERPROFILE\.devdash"
+   ```
+
+   Windows (Command Prompt):
+
+   ```bat
+   tar -czf "%USERPROFILE%\devdash-backup.tar.gz" -C "%USERPROFILE%" .devdash
+   rmdir /s /q "%USERPROFILE%\.devdash"
+   ```
+
+If you uninstalled before step 1, the hooks are left calling a DevDash that isn't there. Git
+commits still work (the hook ends in `|| true`), but Claude Code reports a failing hook. Take
+them out by hand: delete DevDash's two lines from each project's `.git/hooks/post-commit`,
+and in `~/.claude/settings.json` (and `~/.codex/hooks.json`) delete each hook whose command
+contains `devdash record`, leaving the others. Or install DevDash again, do step 1, and
+uninstall.
 
 ## Tests
 
