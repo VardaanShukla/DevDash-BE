@@ -269,3 +269,70 @@ def test_an_empty_description_kept_by_an_older_version_is_asked_again(repo):
                      (explain.key("project", subject), json.dumps({"overview": "", "how_it_works": [], "parts": [], "state": ""})))
     conn.close()
     assert explain.cached("project", subject) is None
+
+
+def test_secrets_are_blanked_out_before_anything_reaches_an_ai():
+    from devdash.explain import REDACTED, redact
+
+    fake = {
+        "aws": "key = AKIAIOSFODNN7EXAMPLE",
+        "github": "token ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+        "anthropic": "sk-ant-api03-" + "x" * 40,
+        "openai": "sk-proj-" + "Y" * 40,
+        "slack": "xoxb-1234567890-abcdefghij",
+        "google": "AIza" + "S" * 35,
+        "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+        "pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----",
+    }
+    for name, secret in fake.items():
+        assert REDACTED in redact(secret), name
+        assert secret.split()[-1][-12:] not in redact(secret), name
+
+    code = (
+        'DB = "mongodb+srv://admin:Sup3rS3cret@cluster0.example.net/app"\n'
+        'api_key = "live_9f8e7d6c5b4a"\n'
+        '{"password": "hunter2hunter2"}\n'
+        "export STRIPE_SECRET_KEY=rk_live_abcdef123456\n"
+        'password = request.form["password"]\n'
+        "def total(items):\n    return sum(items)\n"
+    )
+    cleaned = redact(code)
+    for leaked in ("Sup3rS3cret", "live_9f8e7d6c5b4a", "hunter2hunter2", "rk_live_abcdef123456"):
+        assert leaked not in cleaned
+    assert "mongodb+srv://admin:[redacted]@cluster0.example.net/app" in cleaned
+    # Ordinary code is left alone, including code that only handles a password.
+    assert 'password = request.form["password"]' in cleaned
+    assert "def total(items):\n    return sum(items)" in cleaned
+
+
+def test_claude_runs_with_no_tools_and_an_old_one_is_asked_to_update(repo, tmp_path, monkeypatch):
+    repo_id = branch_with_changes(repo)
+    calls = fake_claude(tmp_path, monkeypatch, {"summary": "Says hi.", "change": "x", "improves": [],
+                                                "tradeoffs": [], "check": None})
+    assert client().post(f"/api/repos/{repo_id}/explain/function", json={"path": "app.py", "name": "hello"}).status_code == 200
+    [call] = calls.read_text().splitlines()
+    assert "--tools  --strict-mcp-config" in call and "dangerously" not in call and "bypass" not in call.lower()
+
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "claude").write_text("#!/bin/sh\nif [ \"$1 $2\" = 'auth status' ]; then echo '{\"loggedIn\": true}'; exit 0; fi\n"
+                                "cat > /dev/null\necho \"error: unknown option '--tools'\" >&2\nexit 1\n")
+    (old / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{old}{os.pathsep}{os.environ['PATH']}")
+    # The first answer is kept, so ask about code not explained yet.
+    (repo / "app.py").write_text("def hello(name):\n    return 'hey ' + name\n")
+    git(repo, "commit", "-q", "-am", "Hey")
+    answer = client().post(f"/api/repos/{repo_id}/explain/function", json={"path": "app.py", "name": "hello"})
+    assert answer.status_code == 502 and "Update Claude Code" in answer.json()["detail"]
+
+
+def test_devdash_data_is_private_to_its_user(tmp_path, monkeypatch):
+    from devdash import paths
+
+    home = tmp_path / "private-home"
+    home.mkdir(mode=0o755)
+    (home / "devdash.db.before-x").write_text("old copy")
+    monkeypatch.setenv("DEVDASH_HOME", str(home))
+    paths.home()
+    assert oct(home.stat().st_mode & 0o777) == "0o700"
+    assert oct((home / "devdash.db.before-x").stat().st_mode & 0o777) == "0o600"
