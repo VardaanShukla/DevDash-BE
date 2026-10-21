@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from devdash import git
-from devdash.projectmap import _files, project_map
+from devdash.projectmap import WORKTREE, _files, project_map, readable
 
 try:
     import tomllib
@@ -18,6 +18,11 @@ except ImportError:  # Python 3.10: a few fields are read with patterns instead.
 
 README_NAMES = ("readme.md", "readme.rst", "readme.txt", "readme")
 MANIFEST_NAMES = ("package.json", "pyproject.toml", "requirements.txt", "go.mod", "cargo.toml", "composer.json")
+# With nothing else saying what the project is, the AI reads how its code starts.
+CODE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".cs", ".php", ".rb", ".swift",
+                 ".c", ".cpp", ".h", ".vue", ".svelte", ".dart", ".html"}
+SAMPLES = 3
+SAMPLE_LINES = 40
 ENTRY_NAMES = {"main.ts", "main.tsx", "main.js", "main.jsx", "index.ts", "index.tsx", "index.js", "main.py",
                "__main__.py", "app.py", "manage.py", "server.js", "server.ts", "cli.py", "main.go", "main.rs",
                "app.tsx", "app.jsx", "app.js"}
@@ -93,6 +98,8 @@ TECH = {
 
 
 def summary(repo: Path, revision: str) -> dict:
+    # A project with no commit yet (only files in its folder) is read from the folder.
+    revision = readable(repo, revision)
     files = _files(repo, revision)
     paths = [path for path, _, _ in files]
     # The top-level readme, or else the one nearest the top, as in a folder per app.
@@ -129,13 +136,34 @@ def summary(repo: Path, revision: str) -> dict:
         "parts": project["areas"],
         "links": project["edges"],
         "history": _history(repo, revision),
+        # For the AI's description (not shown): what recent work was about, and, with no
+        # readme or package description to go on, how the code itself starts.
+        "recent_commits": _recent(repo, revision),
+        "samples": [] if readme or named else _samples(repo, revision, files),
     }
+
+
+def _recent(repo: Path, revision: str) -> list[str]:
+    if revision == WORKTREE:
+        return []
+    return [line for line in git.run(repo, "log", "-12", "--no-merges", "--format=%s", revision).splitlines() if line]
+
+
+def _samples(repo: Path, revision: str, files: list[tuple[str, str, int]]) -> list[dict]:
+    """The opening lines of the entry points, or else of the biggest code files."""
+    code = [(path, size) for path, _, size in files if PurePosixPath(path).suffix.lower() in CODE_SUFFIXES]
+    entry = [(p, s) for p, s in code if PurePosixPath(p).name.lower() in ENTRY_NAMES]
+    picked = (entry or sorted(code, key=lambda f: -f[1]))[:SAMPLES]
+    return [{"file": path, "start": "\n".join(_show(repo, revision, path).splitlines()[:SAMPLE_LINES])}
+            for path, _ in picked]
 
 
 def _show(repo: Path, revision: str, path: str) -> str:
     try:
+        if revision == WORKTREE:
+            return (repo / path).read_text(encoding="utf-8", errors="replace")
         return git.run(repo, "show", f"{revision}:{path}")
-    except git.GitError:
+    except (git.GitError, OSError):
         return ""
 
 
@@ -243,7 +271,7 @@ def _license(repo: Path, revision: str, paths: list[str]) -> str | None:
 
 def _history(repo: Path, revision: str) -> dict:
     """Commits, people and activity: how much work went in, by whom, and how recently."""
-    out = git.run(repo, "log", "--format=%aI%x00%an", revision)
+    out = "" if revision == WORKTREE else git.run(repo, "log", "--format=%aI%x00%an", revision)
     entries = [line.split("\x00", 1) for line in out.splitlines() if "\x00" in line]
     if not entries:
         return {"commits": 0, "people": [], "first": None, "last": None, "weeks": [0] * WEEKS, "branches": 0}

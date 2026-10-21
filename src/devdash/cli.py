@@ -9,7 +9,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="devdash")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    init_cmd = commands.add_parser("init", help="track a git repo (its own history needs no hooks)")
+    init_cmd = commands.add_parser("init", help="track a git repo (its own history needs no hooks), or remember a "
+                                                "folder of projects to pick from when adding one")
     init_cmd.add_argument("path", nargs="?", default=".")
 
     # The AI tools DevDash records (install.TOOLS), written out so `record` starts fast.
@@ -46,6 +47,16 @@ def main(argv: list[str] | None = None) -> int:
         from devdash.capture import install
 
         path = Path(args.path)
+        if args.command == "init" and path.is_dir() and git_toplevel(path) is None:
+            found = install.add_workspace(path)
+            if not found:
+                print(f"devdash: {path} is not inside a git repository, and has none inside it")
+                return 1
+            print(f"Found {len(found)} project(s) in {path.resolve()}:")
+            for repo in found:
+                print(f"  {repo}")
+            print("Nothing was added or changed in them. Pick the ones to track under Add project on the dashboard.")
+            return 0
         try:
             if args.command == "connect":
                 root = install.connect_tool(path, args.tool)
@@ -108,6 +119,12 @@ def _serve(port: int) -> int:
     print("Leave this running; press Ctrl+C to stop.")
     uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="warning")
     return 0
+
+
+def git_toplevel(path: Path):
+    from devdash import git
+
+    return git.toplevel(path)
 
 
 def _set_password() -> int:

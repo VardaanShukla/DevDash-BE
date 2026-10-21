@@ -54,6 +54,27 @@ class Repo(BaseModel):
     ai: Literal["claude", "codex", "antigravity"] | None
 
 
+class HookError(BaseModel):
+    at: str
+    event: str
+    detail: str
+
+
+class RecordingHealth(BaseModel):
+    errors: int  # hook calls that failed in the last `days` days
+    days: int
+    last_error: HookError | None
+    last_call: dict[str, str]  # event -> when a hook last called it
+    error_log: str
+    hook_log: str
+
+
+class Candidate(BaseModel):
+    path: str
+    name: str
+    folder: str  # the remembered folder it was found in
+
+
 class NewRepo(BaseModel):
     path: str
     ai: Literal["claude", "codex", "antigravity"] | None = None
@@ -679,6 +700,18 @@ def create_app() -> FastAPI:
         root = _install((lambda p: install.connect_tool(p, body.ai)) if body.ai else install.init, path)
         return _repo(_row_for(root))
 
+    @app.get("/api/recording/health", response_model=RecordingHealth)
+    def recording_health():
+        """Whether the hooks have been called lately, and how many failed, with the logs' paths."""
+        from devdash.capture import record
+
+        return record.health()
+
+    @app.get("/api/repos/candidates", response_model=list[Candidate])
+    def repo_candidates():
+        """Projects in the folders `devdash init` remembered, not added yet, to pick from."""
+        return install.candidates()
+
     @app.delete("/api/repos/{repo_id}", status_code=204)
     def remove_repo(repo_id: int):
         """Stops tracking the project. Its files and git history are not touched."""
@@ -1031,6 +1064,9 @@ def _project_context(facts: dict) -> dict:
         "history": {"commits": history["commits"], "people": len(history["people"]),
                     "first_commit": history["first"], "last_commit": history["last"],
                     "commits_per_week_last_12": history["weeks"]},
+        "recent_commit_messages": facts.get("recent_commits", []),
+        # Only when there's no readme or package description: the opening lines of the code.
+        "code_samples": facts.get("samples", []),
     }
 
 

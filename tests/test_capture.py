@@ -393,3 +393,67 @@ def test_large_files_and_files_from_another_project_are_left_out(repo, tmp_path)
     (repo / "app.py").write_text("def hello():\n    return 'yo'\n")
     send("stop", repo)
     assert set(turn_changes()) == {"app.py"}
+
+
+def test_a_session_started_elsewhere_is_attributed_by_the_files_it_edits(repo, tmp_path):
+    from devdash.capture import record
+
+    connect_claude(repo)
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    # Started outside the project (another folder, an editor, the desktop app).
+    send("user-prompt-submit", elsewhere, prompt="Fix the greeting")
+    send("pre-tool-use", elsewhere, tool_name="Edit", tool_input={"file_path": str(repo / "app.py")})
+    (repo / "app.py").write_text("def hello():\n    return 'hello'\n")
+    # A shell command in the same prompt also changes a file there: watched from the first edit.
+    (repo / "notes.md").write_text("made by a script\n")
+    send("stop", elsewhere)
+    files = {row[0] for row in connect().execute("SELECT file_path FROM changes WHERE source = 'ai'")}
+    assert files == {"app.py", "notes.md"}
+    assert record.health()["errors"] == 0
+
+
+def test_hook_failures_are_counted_with_their_reason(repo, devdash_home):
+    from devdash.capture import record
+
+    connect_claude(repo)
+    assert run_hook("user-prompt-submit", io.StringIO("{not json")) == 0
+    health = record.health()
+    assert health["errors"] == 1 and "JSONDecodeError" in health["last_error"]["detail"]
+    assert "ERROR JSONDecodeError" in (devdash_home / "hooks.log").read_text()
+    send("user-prompt-submit", repo, prompt="hi")
+    assert "user-prompt-submit" in record.health()["last_call"]
+
+
+def test_hook_commands_quote_a_windows_path_with_a_space_for_sh_and_cmd(monkeypatch):
+    from devdash.capture import install
+
+    monkeypatch.setattr(install.os, "name", "nt")
+    assert install._quote("C:/Users/Jo Smith/.local/pipx/venvs/devdash/Scripts/python.exe") == \
+        '"C:/Users/Jo Smith/.local/pipx/venvs/devdash/Scripts/python.exe"'
+    assert install._quote("C:/Users/jo/python.exe") == "C:/Users/jo/python.exe"
+
+
+def test_a_folder_of_projects_is_remembered_and_offered_without_adding_any(tmp_path, capsys):
+    from fastapi.testclient import TestClient
+
+    from devdash import cli
+    from devdash.api.app import create_app
+
+    work = tmp_path / "work"
+    for name in ("alpha", "beta", "node_modules/dep"):
+        (work / name).mkdir(parents=True)
+        git(work / name, "init", "-q")
+    assert cli.main(["init", str(work)]) == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out and "beta" in out and "dep" not in out
+    assert connect().execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 0  # nothing added
+    assert not (work / "alpha" / ".git" / "hooks" / "post-commit").exists()
+
+    api = TestClient(create_app(), base_url="http://127.0.0.1")
+    assert [c["name"] for c in api.get("/api/repos/candidates").json()] == ["alpha", "beta"]
+    assert api.post("/api/repos", json={"path": str(work / "alpha")}).status_code == 201
+    assert [c["name"] for c in api.get("/api/repos/candidates").json()] == ["beta"]
+    # Typing the folder itself says which projects are inside.
+    folder = api.post("/api/repos", json={"path": str(work)})
+    assert folder.status_code == 400 and "beta" in folder.json()["detail"]

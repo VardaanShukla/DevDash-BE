@@ -68,14 +68,46 @@ def run_hook(event: str, stdin=sys.stdin, tool: str = "claude", stdout=sys.stdou
             finally:
                 conn.close()
             _log_call(event, payload)
-        except Exception:
+        except Exception as error:
             with paths.error_log().open("a", encoding="utf-8") as log:
                 log.write(f"{now()} {event}\n{traceback.format_exc()}\n")
+            try:
+                # In the call log too, so the two read in order: what was called, what failed.
+                with paths.hook_log().open("a", encoding="utf-8") as log:
+                    log.write(f"{now()} {event} tool={tool} ERROR {type(error).__name__}: {str(error)[:200]}\n")
+            except OSError:
+                pass
         return 0
     finally:
         if tool == "antigravity" and event in ANTIGRAVITY_ANSWER:
             stdout.write(ANTIGRAVITY_ANSWER[event] + "\n")
             stdout.flush()
+
+
+def health(days: int = 7) -> dict:
+    """How recording has gone lately, from the hook logs: when each hook was last called and
+    the errors, so a prompt that's missing can be told apart from one that failed."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    errors, last_error = 0, None
+    log = paths.error_log()
+    if log.exists():
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        for at, line in enumerate(lines):
+            stamp = line.split(" ", 1)[0]
+            if re.match(r"\d{4}-\d\d-\d\dT", stamp) and stamp >= since:
+                errors += 1
+                # The exception's own line ends its traceback.
+                detail = next((l for l in lines[at + 1:] if l and not l.startswith((" ", "Traceback"))), "")
+                last_error = {"at": stamp, "event": line.split(" ", 1)[-1], "detail": detail[:300]}
+    last_call: dict[str, str] = {}
+    calls = paths.hook_log()
+    if calls.exists():
+        for line in calls.read_text(encoding="utf-8", errors="replace").splitlines()[-2000:]:
+            parts = line.split(" ")
+            if len(parts) > 1 and "ERROR" not in parts:
+                last_call[parts[1]] = parts[0]
+    return {"errors": errors, "days": days, "last_error": last_error, "last_call": last_call,
+            "error_log": str(log), "hook_log": str(calls)}
 
 
 def _normalize(tool: str, payload: dict) -> dict:
@@ -293,6 +325,11 @@ def _snapshot(conn, repos, payload, cwd: Path, target: str, tool: str) -> None:
         turn = _new_turn(conn, repo, session_id, UNKNOWN_PROMPT, tool)
     elif turn["branch"] is None:
         conn.execute("UPDATE turns SET branch = ? WHERE id = ?", (git.branch(Path(repo["path"])), turn["id"]))
+    # A session started outside the project (another folder, an editor, the desktop app)
+    # wasn't watching it: from its first edit there, the rest of what changes in it counts too.
+    if not conn.execute("SELECT 1 FROM turn_repos WHERE turn_id = ? AND repo_id = ?", (turn["id"], repo["id"])).fetchone():
+        root = Path(repo["path"])
+        _start_watch(conn, turn["id"], [repo], [root])
 
     before = None
     if absolute.exists():

@@ -221,8 +221,85 @@ def _write(path: Path, text: str) -> None:
 def _root(path: Path) -> Path:
     root = git.toplevel(path)
     if root is None:
+        found = find_repos(path) if path.is_dir() else []
+        if found:
+            names = ", ".join(str(p) for p in found[:6]) + (" …" if len(found) > 6 else "")
+            raise InitError(f"{path} isn't a git project itself, but these inside it are: {names}. Add one of them.")
         raise InitError(f"{path} is not inside a git repository")
     return root
+
+
+# Folders never searched for projects: dependencies, build output, caches.
+SKIP_SEARCH = {"node_modules", ".venv", "venv", "env", ".tox", "__pycache__", "dist", "build", "target",
+               ".next", ".cache", "site-packages", ".git", "vendor", "Library", "AppData"}
+SEARCH_DEPTH = 3
+MAX_FOUND = 50
+WORKSPACES = "workspaces"
+
+
+def find_repos(folder: Path, depth: int = SEARCH_DEPTH) -> list[Path]:
+    """Git projects in folder and up to `depth` folders down; not inside each other."""
+    found: list[Path] = []
+
+    def walk(current: Path, left: int) -> None:
+        if len(found) >= MAX_FOUND:
+            return
+        if (current / ".git").exists():
+            found.append(current.resolve())
+            return
+        if left == 0:
+            return
+        try:
+            children = sorted(p for p in current.iterdir() if p.is_dir() and not p.is_symlink())
+        except OSError:
+            return
+        for child in children:
+            if child.name not in SKIP_SEARCH and not child.name.startswith("."):
+                walk(child, left - 1)
+
+    walk(folder, depth)
+    return found
+
+
+def workspaces() -> list[str]:
+    """Folders `devdash init` was pointed at that hold projects, to offer when adding one."""
+    conn = connect()
+    row = conn.execute("SELECT value FROM settings WHERE name = ?", (WORKSPACES,)).fetchone()
+    conn.close()
+    return json.loads(row["value"]) if row else []
+
+
+def add_workspace(folder: Path) -> list[Path]:
+    """Remembers a folder of projects, without adding any or changing anything in them.
+    Returns the projects in it."""
+    folder = folder.resolve()
+    found = find_repos(folder)
+    known = workspaces()
+    if str(folder) not in known:
+        conn = connect()
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?, ?)",
+                         (WORKSPACES, json.dumps([*known, str(folder)])))
+        conn.close()
+    return found
+
+
+def candidates() -> list[dict]:
+    """Projects in the remembered folders that aren't added yet."""
+    conn = connect()
+    # normcase: on Windows C:\Users\Me and c:\users\me are the same folder.
+    added = {os.path.normcase(row["path"]) for row in conn.execute("SELECT path FROM repos")}
+    conn.close()
+    result, seen = [], set()
+    for folder in workspaces():
+        if not Path(folder).is_dir():
+            continue
+        for repo in find_repos(Path(folder)):
+            key = os.path.normcase(str(repo))
+            if key not in added and key not in seen:
+                seen.add(key)
+                result.append({"path": str(repo), "name": repo.name, "folder": folder})
+    return result
 
 
 def record_command(event: str, tool: str = "claude") -> str:
@@ -231,7 +308,16 @@ def record_command(event: str, tool: str = "claude") -> str:
     # The absolute interpreter path keeps hooks working when devdash is not on PATH;
     # -I stops a folder named devdash in the repo from shadowing the package. Forward
     # slashes, since on Windows these run in Git's sh, where a backslash escapes.
-    return f"{shlex.quote(Path(sys.executable).as_posix())} -I {RECORD} {event}{named}"
+    return f"{_quote(Path(sys.executable).as_posix())} -I {RECORD} {event}{named}"
+
+
+def _quote(path: str) -> str:
+    """A path for a hook command. On Windows the same command may run in Git's sh or in
+    cmd (Antigravity), which share only double quotes; a user name with a space puts one
+    in the path to pipx's Python."""
+    if os.name != "nt":
+        return shlex.quote(path)
+    return f'"{path}"' if any(c in path for c in " &()^%!'") else path
 
 
 def claude_settings_path() -> Path:

@@ -104,7 +104,9 @@ def _find_codex() -> str | None:
     for editor in (".vscode", ".vscode-insiders", ".cursor", ".windsurf"):
         bundled += glob.glob(str(home / editor / "extensions" / "openai.chatgpt-*" / "bin" / "*" / exe))
     bundled.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return _first(home / ".local" / "bin" / exe, home / ".codex" / "bin" / exe, *bundled)
+    npm = (Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "npm" / "codex.cmd" if _windows()
+           else home / ".npm-global" / "bin" / "codex")
+    return _first(home / ".local" / "bin" / exe, home / ".codex" / "bin" / exe, npm, *bundled)
 
 
 def _codex_status() -> dict:

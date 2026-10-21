@@ -112,9 +112,13 @@ def _find_claude() -> str | None:
     found = shutil.which("claude")
     if found:
         return found
-    name = "claude.exe" if platform.system() == "Windows" else "claude"
-    native = Path.home() / ".local" / "bin" / name
-    return str(native) if native.is_file() and os.access(native, os.X_OK) else None
+    if platform.system() == "Windows":
+        # The native installer's copy, or npm's (a .cmd that runs it through node).
+        places = [Path.home() / ".local" / "bin" / "claude.exe",
+                  Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "npm" / "claude.cmd"]
+    else:
+        places = [Path.home() / ".local" / "bin" / "claude", Path.home() / ".npm-global" / "bin" / "claude"]
+    return next((str(p) for p in places if p.is_file() and os.access(p, os.X_OK)), None)
 
 
 def _auth_status() -> dict:
@@ -146,7 +150,9 @@ def cached(kind: str, subject: dict) -> dict | None:
     conn = connect()
     row = conn.execute("SELECT result FROM explanations WHERE key = ?", (key(kind, subject),)).fetchone()
     conn.close()
-    return json.loads(row["result"]) if row else None
+    result = json.loads(row["result"]) if row else None
+    # Older versions kept answers with the description missing; those are asked again.
+    return result if result and _complete(kind, result) else None
 
 
 def explain(kind: str, subject: dict, context: dict | None = None) -> dict:
@@ -220,6 +226,8 @@ def _project_prompt(subject: dict, context: dict) -> str:
     ])
 
 
+# The field an explanation can't be without.
+MAIN_FIELD = {"function": "summary", "project": "overview"}
 PROMPTS = {"function": _function_prompt, "project": _project_prompt}
 
 FIELDS = {
@@ -368,6 +376,8 @@ def _clean(kind: str, data: dict) -> dict:
     result = {}
     for name, expected in FIELDS[kind].items():
         value = data.get(name)
+        if expected is str and isinstance(value, list) and all(isinstance(v, str) for v in value):
+            value = " ".join(value)  # sentences given as a list
         if expected is list:
             value = [item for item in value if isinstance(item, (str, dict))][:8] if isinstance(value, list) else []
         elif not isinstance(value, expected):
@@ -380,4 +390,12 @@ def _clean(kind: str, data: dict) -> dict:
     else:
         result["improves"] = [s for s in result["improves"] if isinstance(s, str)]
         result["tradeoffs"] = [s for s in result["tradeoffs"] if isinstance(s, str)]
+    if not _complete(kind, result):
+        # Never kept: the page would show an empty description, every time.
+        raise ExplainError("The AI's answer left out the description. Try again, or pick another model in Settings.")
     return result
+
+
+def _complete(kind: str, result: dict) -> bool:
+    main = result.get(MAIN_FIELD[kind])
+    return isinstance(main, str) and bool(main.strip())
