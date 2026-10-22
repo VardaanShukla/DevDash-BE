@@ -36,6 +36,9 @@ MAX_FILE_BYTES = 1_000_000
 # for that prompt, to keep the prompt hook quick; Edit and Write are still recorded.
 MAX_WATCHED_FILES = 2000
 WATCH_HOURS = timedelta(hours=3)
+# A prompt still open after this long lost its Stop and its session (killed, or a session
+# that was never resumed). It's closed with what its Edit, Write and shell hooks saw.
+STALE_HOURS = timedelta(hours=6)
 IGNORED = [
     "*.lock", "package-lock.json", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map",
     "node_modules/*", "*/node_modules/*", "dist/*", "build/*", "*/__pycache__/*", "__pycache__/*",
@@ -106,8 +109,33 @@ def health(days: int = 7) -> dict:
             parts = line.split(" ")
             if len(parts) > 1 and "ERROR" not in parts:
                 last_call[parts[1]] = parts[0]
+    # Problems to show on the dashboard: hooks that can't record (Repair fixes these), then
+    # a failure in the last day.
+    problems = [problem for tool in install.tools_in_use() if (problem := install.hooks_problem(tool))]
+    repairable = bool(problems)
+    stuck = _close_stale_prompts()
+    day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+    if last_error and last_error["at"] >= day_ago:
+        problems.append(f"A hook failed at {last_error['at']} ({last_error['event']}): {last_error['detail']}")
     return {"errors": errors, "days": days, "last_error": last_error, "last_call": last_call,
-            "error_log": str(log), "hook_log": str(calls)}
+            "error_log": str(log), "hook_log": str(calls), "problems": problems, "repairable": repairable, "stuck": stuck,
+            "tools": install.tools_in_use()}
+
+
+def _close_stale_prompts(conn: sqlite3.Connection | None = None) -> int:
+    """Closes prompts open longer than STALE_HOURS, keeping what their hooks saw; returns how many."""
+    own = conn is None
+    conn = conn or connect()
+    try:
+        since = (datetime.now(timezone.utc) - STALE_HOURS).isoformat(timespec="seconds")
+        stale = conn.execute("SELECT id, branch FROM turns WHERE ended_at IS NULL AND started_at < ?", (since,)).fetchall()
+        with conn:
+            for turn in stale:
+                _finish_turn(conn, turn, watch=False)
+        return len(stale)
+    finally:
+        if own:
+            conn.close()
 
 
 def _normalize(tool: str, payload: dict) -> dict:
@@ -152,13 +180,19 @@ def handle(conn: sqlite3.Connection, event: str, payload: dict, cwd: Path, tool:
             if repo is not None:
                 _commit(conn, repo)
         elif event == "user-prompt-submit":
+            _close_stale_prompts(conn)
             if tool == "antigravity":
                 _antigravity_invocation(conn, repos, payload, cwd)
             else:
                 _prompt(conn, repos, payload, cwd, tool)
         elif event == "pre-tool-use":
             _before_edit(conn, repos, payload, cwd, tool)
-        elif event == "stop":
+        elif event == "post-tool-use":
+            turn = _open_turn(conn, payload.get("session_id"))
+            if turn is not None:
+                _note_shell_changes(conn, turn["id"])
+        elif event in ("stop", "session-end"):
+            # Ending the session (exit, /clear) also ends a prompt whose Stop never came.
             turn = _open_turn(conn, payload.get("session_id"))
             if turn is not None:
                 _finish_turn(conn, turn, watch=True)
@@ -354,10 +388,17 @@ def _finish_turn(conn, turn, watch: bool) -> None:
     )]
     if watch:
         files += _changed_since_start(conn, turn["id"], {(f["repo_id"], f["file_path"]) for f in files})
+    others = _edited_by_others(conn, turn["id"])
     recorded = 0
     for row in files:
         if row["seen"] == -1:
             continue  # too large or not text when the prompt started
+        if row["seen"] == 0 and not watch:
+            # Its Stop never came, so there's no telling whether a later change to a file that
+            # was only noted at the start was this prompt's or the person's own.
+            continue
+        if row["seen"] != 1 and (row["repo_id"], row["file_path"]) in others:
+            continue  # another session's prompt changed it with Edit or Write: that one's change
         current_path = Path(row["path"]) / row["file_path"]
         after = None
         if current_path.exists():
@@ -389,6 +430,48 @@ def _finish_turn(conn, turn, watch: bool) -> None:
         )
         return
     conn.execute("UPDATE turns SET ended_at = ? WHERE id = ?", (now(), turn["id"]))
+
+
+def _note_shell_changes(conn, turn_id: int) -> None:
+    """After each shell command, notes the files it changed (seen = 2), so they still count
+    when the prompt is interrupted and its Stop never comes."""
+    known = {}
+    for row in conn.execute(
+        "SELECT f.repo_id, r.path, f.file_path, f.before_content, f.seen"
+        " FROM turn_files f JOIN repos r ON r.id = f.repo_id WHERE f.turn_id = ?", (turn_id,)
+    ):
+        known[(row["repo_id"], row["file_path"])] = row
+    others = _edited_by_others(conn, turn_id)
+    for key, row in known.items():
+        if row["seen"] != 0 or key in others:
+            continue
+        current = Path(row["path"]) / row["file_path"]
+        after = _read_text(current) if current.exists() else None
+        if after != row["before_content"]:
+            conn.execute("UPDATE turn_files SET seen = 2 WHERE turn_id = ? AND repo_id = ? AND file_path = ?",
+                         (turn_id, row["repo_id"], row["file_path"]))
+    for found in _changed_since_start(conn, turn_id, set(known)):
+        if (found["repo_id"], found["file_path"]) in others:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO turn_files (turn_id, repo_id, file_path, before_content, seen) VALUES (?, ?, ?, ?, 2)",
+            (turn_id, found["repo_id"], found["file_path"], found["before_content"]),
+        )
+
+
+def _edited_by_others(conn, turn_id: int) -> set:
+    """Files that another session's prompt changed with Edit or Write while this one ran.
+    Two sessions in one project each see the other's edits appear; these are left to the
+    prompt whose own tool made them, so no change is counted twice."""
+    started = conn.execute("SELECT started_at, session_id FROM turns WHERE id = ?", (turn_id,)).fetchone()
+    rows = conn.execute(
+        "SELECT f.repo_id, f.file_path FROM turn_files f JOIN turns t ON t.id = f.turn_id"
+        " WHERE f.seen = 1 AND t.session_id != ? AND t.ended_at IS NULL"
+        " UNION SELECT c.repo_id, c.file_path FROM changes c JOIN turns t ON t.id = c.turn_id"
+        " WHERE c.via = 'edit' AND t.session_id != ? AND c.created_at >= ?",
+        (started["session_id"], started["session_id"], started["started_at"]),
+    ).fetchall()
+    return {(row["repo_id"], row["file_path"]) for row in rows}
 
 
 def _link_commits_made_during(conn, turn_id: int) -> None:

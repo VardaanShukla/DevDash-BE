@@ -19,7 +19,12 @@ RECORD = "-m devdash record"
 CLAUDE_EVENTS = {
     "UserPromptSubmit": ("user-prompt-submit", None),
     "PreToolUse": ("pre-tool-use", "Edit|MultiEdit|Write|NotebookEdit"),
+    # After each shell command, the files it changed are noted, so an interrupted prompt
+    # (Esc sends no Stop) still keeps them.
+    "PostToolUse": ("post-tool-use", "Bash"),
     "Stop": ("stop", None),
+    # Quitting or /clear ends a prompt whose Stop never came.
+    "SessionEnd": ("session-end", None),
 }
 # The AI tools whose requests can be recorded. A project records one of them; `repos.claude`
 # says it records at all, `repos.ai` which one.
@@ -636,6 +641,39 @@ When you change files here:
    Co-Authored-By: Claude <noreply@anthropic.com>
 3. Never commit .devdash/ (git already ignores it on this machine).
 """
+
+
+def hooks_problem(tool: str) -> str | None:
+    """What's wrong with the AI tool's hooks, in a sentence, or None when each one is there
+    and calls this install of DevDash. A hook naming a Python that was since removed fails
+    before DevDash runs, so nothing would be logged: this is the only way to see it."""
+    path = tool_hooks_path(tool)
+    name = TOOL_NAMES[tool]
+    if not path.exists():
+        return f"{name}'s hooks aren't installed ({path} doesn't exist)."
+    try:
+        _, data = _load(path)
+    except InitError as error:
+        return str(error)
+    if tool == "antigravity":
+        entry = data.get(ANTIGRAVITY_HOOK) or {}
+        found = {event: [h.get("command", "") for h in entry.get(event) or [] if isinstance(h, dict)]
+                 for event in ANTIGRAVITY_EVENTS}
+        wanted = {event: f"{record_command(ours, tool)} || echo {{}}" for event, ours in ANTIGRAVITY_EVENTS.items()}
+    else:
+        events = CLAUDE_EVENTS if tool == "claude" else CODEX_EVENTS
+        hooks = data.get("hooks") or {}
+        found = {event: [h.get("command", "") for g in hooks.get(event) or [] if isinstance(g, dict) and _is_ours(g)
+                         for h in g.get("hooks", [])] for event in events}
+        wanted = {event: record_command(ours, tool) for event, (ours, _) in events.items()}
+    missing = [event for event, commands in found.items() if not commands]
+    if missing:
+        return f"{name} is missing DevDash's {', '.join(missing)} hook{'s' if len(missing) > 1 else ''}."
+    stale = [event for event, commands in found.items() if wanted[event] not in commands]
+    if stale:
+        return (f"{name}'s hooks call an older DevDash, so {', '.join(stale)} may not be recorded. "
+                "Repair them, or restart `devdash serve`.")
+    return None
 
 
 def _is_ours(group: dict) -> bool:

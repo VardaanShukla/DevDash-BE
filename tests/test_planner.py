@@ -11,34 +11,6 @@ def client():
     return TestClient(create_app(), base_url="http://127.0.0.1")
 
 
-def test_todos_for_everywhere_a_project_and_a_branch(repo):
-    init(repo)
-    [listed] = client().get("/api/repos").json()
-    api = client()
-    anywhere = api.post("/api/todos", json={"text": "  Book   flights "}).json()
-    branch = api.post("/api/todos", json={"text": "Fix the login test", "repo_id": listed["id"],
-                                          "branch": "feature"}).json()
-    assert anywhere["text"] == "Book flights" and anywhere["repo_id"] is None
-    assert (branch["repo_id"], branch["branch"]) == (listed["id"], "feature")
-
-    assert api.post("/api/todos", json={"text": " "}).status_code == 400
-    assert api.post("/api/todos", json={"text": "x", "branch": "feature"}).status_code == 400
-
-    done = api.patch(f"/api/todos/{anywhere['id']}", json={"done": True}).json()
-    assert done["done_at"] is not None
-    # Open ones first.
-    assert [t["text"] for t in api.get("/api/todos").json()] == ["Fix the login test", "Book flights"]
-    assert api.patch(f"/api/todos/{anywhere['id']}", json={"done": False}).json()["done_at"] is None
-    assert api.patch(f"/api/todos/{branch['id']}", json={"text": "Fix both tests"}).json()["text"] == "Fix both tests"
-
-    assert api.delete(f"/api/todos/{anywhere['id']}", headers={"content-type": "application/json"}).status_code == 204
-    assert api.patch("/api/todos/999", json={"done": True}).status_code == 404
-
-    # Removing the project removes its to-dos.
-    api.request("DELETE", f"/api/repos/{listed['id']}", json={})
-    assert api.get("/api/todos").json() == []
-
-
 def test_calendar_from_its_private_address(monkeypatch):
     today = date.today()
     day = lambda n: (today + timedelta(days=n)).strftime("%Y%m%d")

@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("path", nargs="?", default=".")
 
     record_cmd = commands.add_parser("record", help="called by hooks; reads the event from stdin")
-    record_cmd.add_argument("event", choices=["user-prompt-submit", "pre-tool-use", "stop", "post-commit"])
+    record_cmd.add_argument("event", choices=["user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "session-end", "post-commit"])
     record_cmd.add_argument("--tool", choices=tools, default="claude", help="the AI tool whose hook this is")
 
     turns_cmd = commands.add_parser("turns", help="list recent turns")

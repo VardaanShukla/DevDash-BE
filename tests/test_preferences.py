@@ -50,10 +50,22 @@ def test_number_keys_follow_the_menu_and_old_saved_defaults_move_with_them():
     prefs = client().get("/api/preferences").json()
     keys = prefs["shortcuts"]
     assert prefs["theme"] == "light" and prefs["uncommitted"] is True
-    assert keys["view:constellation"] == "4" and keys["view:changes"] == "5" and keys["view:commits"] == "6"
+    assert keys["view:changes"] == "4" and keys["view:commits"] == "5" and keys["view:project"] == "6"
     assert keys["view:overview"] == "" and keys["view:map"] == ""  # sections of Home now
-    assert keys["view:planner"] == "m"  # picked by the person, kept
-    assert keys["view:project"] == "8"
+    assert "view:constellation" not in keys and "view:planner" not in keys  # screens since removed
+
+
+def test_home_widgets_can_be_reordered_hidden_and_reset():
+    api = client()
+    home = api.get("/api/preferences").json()["home"]
+    assert home == {"order": ["ai", "projects", "branch", "flow", "map", "calendar"], "hidden": ["map", "calendar"]}
+    changed = api.put("/api/preferences", json={"home": {"order": ["flow", "ai"], "hidden": ["projects"]}}).json()
+    # Widgets left out join at the end, hidden if they are by default; a hidden one stays listed.
+    assert changed["home"] == {"order": ["flow", "ai", "projects", "branch", "map", "calendar"],
+                               "hidden": ["projects", "map", "calendar"]}
+    assert api.get("/api/preferences").json()["home"] == changed["home"]
+    assert api.put("/api/preferences", json={"home": {"order": ["sky"], "hidden": []}}).status_code == 400
+    assert api.post("/api/preferences/reset-home", json={}).json()["home"] == home
 
 
 def test_shortcuts_go_back_to_the_defaults():

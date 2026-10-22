@@ -209,9 +209,16 @@ Other endpoints:
   file or none, and nothing is committed, so the undo is an ordinary change to review and
   commit. A 409 means a file changed since and the change no longer fits; nothing is
   touched then. `POST /api/digest/put-back` reapplies an undone change
-- `GET /api/todos`, `POST /api/todos` (`{"text", "repo_id", "branch"}`),
-  `PATCH /api/todos/{id}` (`{"text"}` or `{"done"}`) and `DELETE /api/todos/{id}` keep a
-  to-do list; each item is for everywhere, one project, or one branch of it
+  The day's totals leave out undone changes (`undone` counts them) and count a prompt
+  that edited several projects once; `watched_files` counts files a prompt changed through
+  a shell command rather than its edit tool, which may include your own edits made meanwhile
+- `GET /api/recording/health` says whether recording works: when each hook last ran, recent
+  errors, and `problems` in plain sentences (hooks missing or naming an old install, prompts
+  whose end never arrived). `POST /api/recording/repair` reinstalls the hooks
+- `GET /api/autostart` and `PUT /api/autostart` (`{"enabled"}`) turn starting DevDash at
+  sign-in on or off: a systemd user service or desktop autostart entry on Linux, a
+  LaunchAgent on macOS, the per-user Run key on Windows. No admin rights; it needs a
+  dashboard password first, and takes effect from the next sign-in
 - `GET /api/calendar?days=7` lists events from the calendar connected with
   `PUT /api/calendar` (`{"url"}`: its private iCal address, such as Google Calendar's
   "Secret address in iCal format"); `DELETE /api/calendar` forgets it. Read-only, fetched at
@@ -255,7 +262,8 @@ devdash disconnect claude ~/Projects/SomeRepo   # stop; recorded history is kept
 
 - a git `post-commit` hook in that repo (added to any existing shell hook, not replacing it)
 - Claude Code hooks in your user settings, `~/.claude/settings.json`
-  (`UserPromptSubmit`, `PreToolUse`, `Stop`). Nothing is added to the repo itself.
+  (`UserPromptSubmit`, `PreToolUse`, `PostToolUse` for Bash, `Stop`, `SessionEnd`). Nothing
+  is added to the repo itself.
 
 The Claude hooks run in every Claude Code session, wherever you start it: inside the repo,
 or in a parent folder holding several repos. An edit is recorded only when the edited file
@@ -291,9 +299,13 @@ Every hook call is logged (tool and file, never the prompt) to `~/.devdash/hooks
 
 1. `UserPromptSubmit` starts a turn and saves the prompt and branch.
 2. `PreToolUse` saves each file's content just before Claude first edits it in that turn.
-3. `Stop` diffs those files against their saved content. Your own edits to other files,
-   or edits made before the turn, are left out.
-4. `post-commit` links the turn's changes to the commit. Files in the commit that Claude
+3. `PostToolUse` notes the files each shell command changed, so they still count if you
+   press Esc (an interrupted prompt gets no `Stop`).
+4. `Stop` (or `SessionEnd`, when you quit or `/clear` mid-prompt) diffs those files against
+   their saved content, plus any other file that changed while the prompt ran. Your own
+   edits made before the turn are left out, and a file another Claude session changed with
+   its own edit tool is left to that session, so nothing is counted twice.
+5. `post-commit` links the turn's changes to the commit. Files in the commit that Claude
    didn't touch are recorded as human changes.
 
 Lockfiles, `node_modules`, build output and files over 1 MB are skipped.
@@ -309,11 +321,15 @@ again when a project stops recording:
   `/.devdash/` line in `.git/info/exclude`, so a Claude app chat's notes there stay out of
   git. That line is harmless and stays.
 - For the AI tool a project records, while any project records it:
-  - Claude Code: three entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
-    `PreToolUse` and `Stop`, each running `… -m devdash record …`. Your other settings and
+  - Claude Code: five entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
+    `PreToolUse`, `PostToolUse`, `Stop` and `SessionEnd`, each running `… -m devdash record …`. Your other settings and
     hooks stay.
-  - Codex: the same three in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
+  - Codex: `UserPromptSubmit`, `PreToolUse` and `Stop` in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
   - Antigravity: a `devdash` entry in `~/.gemini/config/hooks.json`.
+- If you turned on Start at sign-in: `~/.config/systemd/user/devdash.service` or
+  `~/.config/autostart/devdash.desktop` (Linux), `~/Library/LaunchAgents/com.devdash.serve.plist`
+  (macOS), or a `DevDash` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  (Windows). Turn it off in Settings before uninstalling, and it's removed.
 - Its own data in `~/.devdash` (`%USERPROFILE%\.devdash` on Windows): the projects list,
   what was recorded, settings and the dashboard password.
 

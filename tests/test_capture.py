@@ -32,7 +32,7 @@ def test_init_installs_hooks_once(repo, tmp_path):
 
     hooks = user_settings()["hooks"]
     assert {e: len(groups) for e, groups in hooks.items()} == {
-        "UserPromptSubmit": 1, "PreToolUse": 1, "Stop": 1,
+        "UserPromptSubmit": 1, "PreToolUse": 1, "PostToolUse": 1, "Stop": 1, "SessionEnd": 1,
     }
     assert hooks["PreToolUse"][0]["matcher"] == "Edit|MultiEdit|Write|NotebookEdit"
     hook = (repo / ".git" / "hooks" / "post-commit").read_text()
@@ -457,3 +457,47 @@ def test_a_folder_of_projects_is_remembered_and_offered_without_adding_any(tmp_p
     # Typing the folder itself says which projects are inside.
     folder = api.post("/api/repos", json={"path": str(work)})
     assert folder.status_code == 400 and "beta" in folder.json()["detail"]
+
+
+def test_health_names_hooks_that_cannot_record_and_repair_fixes_them(repo):
+    from fastapi.testclient import TestClient
+
+    from devdash.api.app import create_app
+    from devdash.capture import record
+
+    connect_claude(repo)
+    assert record.health()["problems"] == []
+    # A reinstall moved Python: the hooks still name the old one, which fails before DevDash runs.
+    settings = user_settings()
+    settings["hooks"]["Stop"][0]["hooks"][0]["command"] = "/gone/python -I -m devdash record stop"
+    del settings["hooks"]["SessionEnd"]
+    claude_settings_path().write_text(json.dumps(settings))
+    [problem] = record.health()["problems"]
+    assert "missing DevDash's SessionEnd hook" in problem
+
+    settings["hooks"]["SessionEnd"] = [{"hooks": [{"type": "command", "command": record_command("session-end")}]}]
+    claude_settings_path().write_text(json.dumps(settings))
+    [problem] = record.health()["problems"]
+    assert "older DevDash" in problem and "Stop" in problem
+
+    api = TestClient(create_app(), base_url="http://127.0.0.1")
+    repaired = api.post("/api/recording/repair", json={})
+    assert repaired.status_code == 200, repaired.text
+    assert repaired.json()["problems"] == []
+
+
+def test_prompts_left_open_by_a_dead_session_are_closed_with_what_was_seen(repo):
+    from devdash.capture import record
+
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="long ago")
+    conn = connect()
+    with conn:
+        conn.execute("UPDATE turns SET started_at = '2020-01-01T00:00:00+00:00'")
+    edit(repo, "app.py")
+    (repo / "app.py").write_text("def hello():\n    return 'late'\n")
+    health = record.health()
+    assert health["stuck"] == 1 and health["problems"] == [] and not health["repairable"]
+    row = connect().execute("SELECT t.ended_at, c.file_path FROM turns t JOIN changes c ON c.turn_id = t.id").fetchone()
+    assert row["ended_at"] and row["file_path"] == "app.py"
+    assert record.health()["stuck"] == 0

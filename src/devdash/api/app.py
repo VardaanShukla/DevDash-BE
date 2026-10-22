@@ -26,7 +26,6 @@ from devdash import git
 from devdash import home as home_module
 from devdash import projectmap
 from devdash import summary as summary_module
-from devdash import todos as todos_module
 from devdash import undo as undo_module
 from devdash.capture import install
 from devdash.store import connect
@@ -67,6 +66,10 @@ class RecordingHealth(BaseModel):
     last_call: dict[str, str]  # event -> when a hook last called it
     error_log: str
     hook_log: str
+    problems: list[str]  # what needs fixing, in plain sentences; empty when recording works
+    repairable: bool  # some of the problems are hooks that Repair reinstalls
+    stuck: int  # prompts left open for hours by a session that ended; closed just now
+    tools: list[str]  # the AI tools some project records
 
 
 class Candidate(BaseModel):
@@ -522,6 +525,8 @@ class DigestClaude(BaseModel):
     deletions: int
     risky: int
     uncommitted: int
+    undone: int  # listed but left out of the numbers above
+    watched_files: int  # changed during a prompt but not by its Edit or Write
 
 
 class DigestYou(BaseModel):
@@ -553,11 +558,30 @@ class AuthStatus(BaseModel):
     username: str | None = None  # only for a signed-in browser
 
 
+class Autostart(BaseModel):
+    supported: bool
+    enabled: bool
+    method: str | None  # how this system starts it, in words
+    current: bool  # it starts this install of DevDash (False after a reinstall: turn it on again)
+    port: int | None
+    password_set: bool  # needed before it can be turned on
+
+
+class AutostartChange(BaseModel):
+    enabled: bool
+
+
+class HomeLayout(BaseModel):
+    order: list[str]  # every widget, in the order Home shows them
+    hidden: list[str]
+
+
 class Preferences(BaseModel):
     theme: Literal["dark", "light"]
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
     ai: ExplainerChoice  # which AI writes explanations, and with which model
+    home: HomeLayout  # the Home widgets in order, and the ones hidden
 
 
 class PreferenceChange(BaseModel):
@@ -565,6 +589,7 @@ class PreferenceChange(BaseModel):
     uncommitted: bool | None = None
     shortcuts: dict[str, str] | None = None  # only the actions to change; "" turns one off
     ai: ExplainerChoiceChange | None = None
+    home: HomeLayout | None = None
 
 
 class Login(BaseModel):
@@ -577,26 +602,6 @@ class NewPassword(BaseModel):
     username: str | None = None
     password: str
     current: str | None = None
-
-
-class Todo(BaseModel):
-    id: int
-    text: str
-    repo_id: int | None  # None: not tied to a project
-    branch: str | None  # None: the whole project
-    created_at: str
-    done_at: str | None  # None while open
-
-
-class NewTodo(BaseModel):
-    text: str
-    repo_id: int | None = None
-    branch: str | None = None
-
-
-class TodoChange(BaseModel):
-    text: str | None = None
-    done: bool | None = None
 
 
 class Event(BaseModel):
@@ -705,6 +710,16 @@ def create_app() -> FastAPI:
         """Whether the hooks have been called lately, and how many failed, with the logs' paths."""
         from devdash.capture import record
 
+        return record.health()
+
+    @app.post("/api/recording/repair", response_model=RecordingHealth)
+    def repair_recording():
+        """Reinstalls the hooks of every AI tool in use so they call this install of DevDash."""
+        from devdash.capture import install, record
+
+        problems = install.refresh()
+        if problems:
+            raise HTTPException(409, "; ".join(problems))
         return record.health()
 
     @app.get("/api/repos/candidates", response_model=list[Candidate])
@@ -940,33 +955,27 @@ def create_app() -> FastAPI:
     def reset_shortcuts():
         return preferences_module.reset_shortcuts()
 
-    @app.get("/api/todos", response_model=list[Todo])
-    def list_todos():
-        """Open to-dos oldest first, then the most recently finished."""
-        return todos_module.items()
+    @app.post("/api/preferences/reset-home", response_model=Preferences)
+    def reset_home():
+        """Home's widgets back to the default order and selection."""
+        return preferences_module.reset_home()
 
-    @app.post("/api/todos", response_model=Todo, status_code=201)
-    def add_todo(body: NewTodo):
+    @app.get("/api/autostart", response_model=Autostart)
+    def get_autostart():
+        """Whether DevDash starts when you sign in to this computer."""
+        from devdash import autostart
+
+        return autostart.status()
+
+    @app.put("/api/autostart", response_model=Autostart)
+    def change_autostart(body: AutostartChange, request: Request):
+        """Turns starting at sign-in on (on the port this page uses) or off."""
+        from devdash import autostart
+
         try:
-            return todos_module.add(body.text, body.repo_id, body.branch)
-        except todos_module.TodoError as error:
-            raise HTTPException(400, str(error))
-
-    @app.patch("/api/todos/{todo_id}", response_model=Todo)
-    def change_todo(todo_id: int, body: TodoChange):
-        """Ticks a to-do off (or back on), or rewords it."""
-        try:
-            item = todos_module.update(todo_id, body.text, body.done)
-        except todos_module.TodoError as error:
-            raise HTTPException(400, str(error))
-        if item is None:
-            raise HTTPException(404, "no such to-do")
-        return item
-
-    @app.delete("/api/todos/{todo_id}", status_code=204)
-    def remove_todo(todo_id: int):
-        if not todos_module.remove(todo_id):
-            raise HTTPException(404, "no such to-do")
+            return autostart.enable(request.url.port or autostart.DEFAULT_PORT) if body.enabled else autostart.disable()
+        except autostart.AutostartError as error:
+            raise HTTPException(409, str(error))
 
     @app.get("/api/calendar", response_model=Agenda)
     def calendar(days: int = Query(7, ge=1, le=31), refresh: bool = Query(False, description="Fetch it now")):
