@@ -155,13 +155,41 @@ def cached(kind: str, subject: dict) -> dict | None:
     return result if result and _complete(kind, result) else None
 
 
+# Secrets that may sit in what an explanation is built from (a readme, commit messages, the
+# opening lines of code, a function): blanked out before anything is sent to an AI.
+REDACTED = "[redacted]"
+_SECRET_TOKENS = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"                      # AWS access key ids
+    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{30,}"
+    r"|\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"             # Anthropic and OpenAI keys
+    r"|\bxox[abposr]-[A-Za-z0-9-]{10,}"                    # Slack
+    r"|\bAIza[0-9A-Za-z_-]{35}"                            # Google
+    r"|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")  # JSON web tokens
+# The password in a connection string: scheme://user:password@host.
+_URL_PASSWORD = re.compile(r"(\b[a-z][\w+.-]*://[^\s:/@]+:)([^\s@/]+)(@)", re.I)
+_SECRET_NAME = r"[\w.-]*(?:api[_-]?key|secret|passw(?:or)?d|pwd|token|access[_-]?key|private[_-]?key|credentials?)[\w-]*"
+# A quoted value given to something named like a secret: api_key = "…", "password": "…".
+_QUOTED = re.compile(r"(\b" + _SECRET_NAME + r"[\"']?\s*[:=]\s*)([\"'])([^\"'\s]{4,})\2", re.I)
+# An .env-style line: API_KEY=… with no quotes.
+_ENV_LINE = re.compile(r"^(\s*(?:export\s+)?[A-Z0-9_]*(?:KEY|SECRET|PASSWORD|PASSWD|TOKEN|PWD)[A-Z0-9_]*\s*=\s*)(\S+)",
+                       re.M)
+
+
+def redact(text: str) -> str:
+    text = _SECRET_TOKENS.sub(REDACTED, text)
+    text = _URL_PASSWORD.sub(lambda m: m.group(1) + REDACTED + m.group(3), text)
+    text = _QUOTED.sub(lambda m: m.group(1) + m.group(2) + REDACTED + m.group(2), text)
+    return _ENV_LINE.sub(lambda m: m.group(1) + REDACTED, text)
+
+
 def explain(kind: str, subject: dict, context: dict | None = None) -> dict:
     """The explanation for `subject` (what is explained, and the cache key), with
     `context` adding background that doesn't change the answer much, like commit titles."""
     found = cached(kind, subject)
     if found:
         return found
-    prompt = PROMPTS[kind](subject, context or {})[:MAX_PROMPT_CHARS]
+    prompt = redact(PROMPTS[kind](subject, context or {}))[:MAX_PROMPT_CHARS]
     result = _clean(kind, _parse(_run(prompt)))
     conn = connect()
     with conn:
@@ -252,19 +280,20 @@ def _ask_claude(model: str, prompt: str) -> str:
     if not _find_claude():
         raise ExplainError("Claude Code isn't installed on this computer, so DevDash can't write explanations.")
     flags = ["--output-format", "json", "--model", model, "--system-prompt", SYSTEM_PROMPT,
-             "--tools", "", "--no-session-persistence"]
+             "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
+    # `--tools ""` leaves Claude none of its own tools (no reading files, no commands), and
+    # --strict-mcp-config none from MCP servers either, so text in a project can't make it do
+    # anything; it only answers. Never run without them.
     with tempfile.TemporaryDirectory(prefix="devdash-explain-") as folder:
-        for attempt in (flags, flags[:4]):
-            try:
-                result = subprocess.run([_claude(), "-p", *attempt], input=prompt, cwd=folder, env=_env(),
-                                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                        timeout=TIMEOUT)
-            except subprocess.TimeoutExpired:
-                raise ExplainError("Claude took too long to answer. Try again.")
-            # An older Claude Code without the newer flags: ask again without them.
-            if result.returncode != 0 and "unknown option" in result.stderr.lower() and attempt is flags:
-                continue
-            break
+        try:
+            result = subprocess.run([_claude(), "-p", *flags], input=prompt, cwd=folder, env=_env(),
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise ExplainError("Claude took too long to answer. Try again.")
+    if result.returncode != 0 and re.search(r"unknown option|unrecognized|unexpected argument", result.stderr, re.I):
+        raise ExplainError("This Claude Code is too old for DevDash's explanations. Update Claude Code "
+                           "(run `claude update`), then try again.")
     if not result.stdout.strip():
         lines = [line for line in result.stderr.strip().splitlines() if line.strip()]
         _fail(lines[-1] if lines else "Claude Code didn't answer.")
