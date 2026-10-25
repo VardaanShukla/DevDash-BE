@@ -60,7 +60,7 @@ def test_digest_lists_claudes_prompts_with_functions_and_flags(repo):
     result = client().get("/api/digest").json()
     assert result["date"] == date.today().isoformat()
     assert result["claude"] == {"prompts": 2, "files": 5, "functions": 4, "additions": 8, "deletions": 6,
-                                     "risky": 1, "uncommitted": 1}
+                                     "risky": 1, "uncommitted": 1, "undone": 0, "watched_files": 0}
     assert result["you"] == {"files": 1, "additions": 1, "deletions": 0, "commits": 1}
 
     newest, older = result["changes"]
@@ -254,3 +254,108 @@ def test_words_in_text_and_comments_are_not_payment_or_sign_in_code(repo):
     [change] = client().get("/api/digest").json()["changes"]
     flags = {f["path"]: [flag["kind"] for flag in f["flags"]] for f in change["files"]}
     assert flags == {"billing.ts": ["payments"], "help.ts": [], "README.md": []}
+
+
+# The numbers the dashboard shows, checked against git itself.
+
+
+def numstat(repo):
+    """git's own count of lines added and removed in the working tree, new files included."""
+    git(repo, "add", "-N", ".")
+    out = git(repo, "diff", "--numstat", "HEAD")
+    git(repo, "reset", "-q")
+    rows = [line.split("\t") for line in out.splitlines()]
+    return {path: (int(add), int(rm)) for add, rm, path in rows}
+
+
+def test_digest_line_counts_match_git_exactly(repo):
+    connect_claude(repo)
+    (repo / "keep.txt").write_text("one\ntwo\nthree\n")
+    (repo / "gone.py").write_text("a = 1\nb = 2\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "more")
+    claude_edits(repo, "Many kinds of change", {
+        "app.py": "def hello():\n    return 'hello'\n\n\ndef bye():\n    return 'bye'",  # no final newline
+        "keep.txt": "one\n2\nthree\nfour\n",
+        "gone.py": None,
+        "pkg/new.py": "x = 1\ny = 2\nz = 3\n",
+        "empty.txt": "",
+    })
+    truth = numstat(repo)
+    digest = client().get("/api/digest").json()
+    [change] = digest["changes"]
+    files = {f["path"]: (f["additions"], f["deletions"]) for f in change["files"]}
+    assert files == {path: counts for path, counts in truth.items() if counts != (0, 0)}
+    assert digest["claude"]["additions"] == sum(a for a, _ in truth.values())
+    assert digest["claude"]["deletions"] == sum(d for _, d in truth.values())
+    assert digest["claude"]["files"] == len(files)
+    assert digest["claude"]["prompts"] == 1
+
+
+def test_one_prompt_across_two_projects_is_one_prompt(repo, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    connect_claude(repo)
+    connect_claude(other)
+    send("user-prompt-submit", tmp_path, prompt="touch both")
+    for path in (repo / "app.py", other / "b.py"):
+        send("pre-tool-use", tmp_path, tool_name="Write", tool_input={"file_path": str(path)})
+        path.write_text("v = 2\n")
+    send("stop", tmp_path)
+    claude = client().get("/api/digest").json()["claude"]
+    assert claude["prompts"] == 1 and claude["files"] == 2
+
+
+def test_two_sessions_at_once_do_not_count_each_others_edits(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="slow one", session_id="a")
+    send("user-prompt-submit", repo, prompt="quick one", session_id="b")
+    send("pre-tool-use", repo, tool_name="Edit", tool_input={"file_path": str(repo / "app.py")}, session_id="b")
+    (repo / "app.py").write_text("def hello():\n    return 'from b'\n")
+    send("stop", repo, session_id="b")
+    send("pre-tool-use", repo, tool_name="Write", tool_input={"file_path": str(repo / "a.py")}, session_id="a")
+    (repo / "a.py").write_text("a = 1\n")
+    send("stop", repo, session_id="a")
+
+    digest = client().get("/api/digest").json()
+    by_prompt = {c["prompt"]: sorted(f["path"] for f in c["files"]) for c in digest["changes"]}
+    assert by_prompt == {"quick one": ["app.py"], "slow one": ["a.py"]}
+    truth = numstat(repo)
+    assert digest["claude"]["additions"] == sum(a for a, _ in truth.values())
+
+
+def test_an_undone_change_leaves_the_totals(repo):
+    connect_claude(repo)
+    claude_edits(repo, "Shout", {"app.py": "def hello():\n    return 'HI'\n"})
+    claude_edits(repo, "Add bye", {"bye.py": "def bye():\n    return 'bye'\n"})
+    api = client()
+    shout = next(c for c in api.get("/api/digest").json()["changes"] if c["prompt"] == "Shout")
+    api.post("/api/digest/undo", json={"change": shout["id"]})
+    claude = api.get("/api/digest").json()["claude"]
+    assert (claude["prompts"], claude["files"], claude["additions"], claude["deletions"]) == (1, 1, 2, 0)
+    assert claude["undone"] == 1
+    assert claude["additions"] == sum(a for a, _ in numstat(repo).values())
+
+
+def test_an_interrupted_prompt_keeps_what_its_shell_commands_changed(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="run the formatter")
+    (repo / "app.py").write_text("def hello():\n    return \"hi\"\n")  # changed by a Bash command
+    send("post-tool-use", repo, tool_name="Bash", tool_input={"command": "black ."})
+    # Esc: Claude Code sends no Stop. Later the person edits by hand, then asks again.
+    (repo / "mine.py").write_text("by hand\n")
+    send("user-prompt-submit", repo, prompt="next thing")
+    send("stop", repo)
+    by_prompt = {c["prompt"]: [f["path"] for f in c["files"]] for c in client().get("/api/digest").json()["changes"]}
+    assert by_prompt["run the formatter"] == ["app.py"]
+    assert "mine.py" not in by_prompt["run the formatter"]
+
+
+def test_ending_the_session_closes_its_prompt(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="quit halfway")
+    (repo / "app.py").write_text("def hello():\n    return 'bye'\n")
+    send("session-end", repo, reason="prompt_input_exit")
+    [change] = client().get("/api/digest").json()["changes"]
+    assert change["prompt"] == "quit halfway" and [f["path"] for f in change["files"]] == ["app.py"]

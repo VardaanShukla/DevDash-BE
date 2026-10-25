@@ -3,11 +3,12 @@
 import io
 import json
 
+from conftest import git
 from fastapi.testclient import TestClient
 
 from devdash.api.app import create_app
 from devdash.capture.install import (antigravity_hooks_path, claude_settings_path, codex_hooks_path,
-                                     connect_tool, record_command)
+                                     connect_tool, record_command, remove_all_hooks)
 from devdash.capture.record import run_hook
 from devdash.store import connect
 
@@ -115,3 +116,20 @@ def test_antigravity_always_gets_its_json_answer(tmp_path):
 def test_hooks_name_their_tool():
     assert record_command("stop", "codex").endswith("record stop --tool codex")
     assert record_command("stop").endswith("record stop")
+
+
+def test_remove_all_hooks_takes_devdash_out_of_every_project_and_tool(repo, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-q")
+    hook = other / ".git" / "hooks" / "post-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho mine\n")
+    connect_tool(repo, "claude")
+    connect_tool(other.resolve(), "codex")
+
+    assert set(remove_all_hooks()) == {repo, other.resolve()}
+    assert not (repo / ".git" / "hooks" / "post-commit").exists()
+    assert hook.read_text() == "#!/bin/sh\necho mine\n"  # the project's own hook stays
+    assert "hooks" not in json.loads(claude_settings_path().read_text())
+    assert not codex_hooks_path().exists()

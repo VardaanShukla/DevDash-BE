@@ -70,6 +70,19 @@ def set_password(new: str, current: str | None = None, check_current: bool = Tru
     conn.close()
 
 
+def set_username(name: str, current: str) -> None:
+    """Changes the username, with the current password. Browsers stay signed in."""
+    name = (name or "").strip()
+    if not name or len(name) > MAX_USERNAME:
+        raise AuthError(f"Pick a username of 1 to {MAX_USERNAME} characters.")
+    if not verify(current or ""):
+        raise AuthError("The current password is wrong.")
+    conn = connect()
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?, ?)", (USERNAME, name))
+    conn.close()
+
+
 def verify(password: str) -> bool:
     stored = _stored()
     if stored is None:

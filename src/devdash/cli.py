@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("path", nargs="?", default=".")
 
     record_cmd = commands.add_parser("record", help="called by hooks; reads the event from stdin")
-    record_cmd.add_argument("event", choices=["user-prompt-submit", "pre-tool-use", "stop", "post-commit"])
+    record_cmd.add_argument("event", choices=["user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "session-end", "post-commit"])
     record_cmd.add_argument("--tool", choices=tools, default="claude", help="the AI tool whose hook this is")
 
     turns_cmd = commands.add_parser("turns", help="list recent turns")
@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     turns_cmd.add_argument("--all", action="store_true", help="include turns that changed no files")
 
     commands.add_parser("instructions", help="print the text to give Claude so app chats are recorded")
+
+    commands.add_parser("remove-hooks", help="take DevDash's hooks out of every project and AI tool (before uninstalling)")
 
     commands.add_parser("password", help="set the dashboard's username and password (also the way back in if it's forgotten)")
 
@@ -94,6 +96,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "password":
         return _set_password()
+
+    if args.command == "remove-hooks":
+        from devdash.capture import install
+
+        for root in install.remove_all_hooks():
+            print(f"Took DevDash's git hook out of {root}")
+        print("Took DevDash's hooks out of Claude Code, Codex and Antigravity.")
+        return 0
 
     if args.command == "serve":
         return _serve(args.port)

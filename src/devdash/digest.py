@@ -104,17 +104,25 @@ def digest(day: date | None = None) -> dict:
     for change in changes:
         change["undone_at"] = gone.get(change["id"])
     changes.sort(key=lambda g: g["at"], reverse=True)
-    functions = {(g["repo"]["id"], f["path"], fn["name"]) for g in changes for f in g["files"] for fn in f["functions"]}
+    # Undone changes stay listed, so they can be put back, but no longer count: the totals
+    # describe what's in the files now.
+    live = [g for g in changes if not g["undone_at"]]
+    functions = {(g["repo"]["id"], f["path"], fn["name"]) for g in live for f in g["files"] for fn in f["functions"]}
     return {
         "date": day.isoformat(),
         "claude": {
-            "prompts": len(changes),
-            "files": len({(g["repo"]["id"], f["path"]) for g in changes for f in g["files"]}),
+            # One prompt that edits several projects is listed once per project but is one prompt.
+            "prompts": len({_prompt_of(g) for g in live}),
+            "files": len({(g["repo"]["id"], f["path"]) for g in live for f in g["files"]}),
             "functions": len(functions),
-            "additions": sum(g["additions"] for g in changes),
-            "deletions": sum(g["deletions"] for g in changes),
-            "risky": sum(1 for g in changes if g["risky"]),
-            "uncommitted": sum(1 for g in changes if g["commit"] is None),
+            "additions": sum(g["additions"] for g in live),
+            "deletions": sum(g["deletions"] for g in live),
+            "risky": sum(1 for g in live if g["risky"]),
+            "uncommitted": sum(1 for g in live if g["commit"] is None),
+            "undone": len(changes) - len(live),
+            # Files changed while a prompt ran but not through its Edit or Write (a shell
+            # command, or possibly the person at the same time): counted, but less certain.
+            "watched_files": len({(g["repo"]["id"], f["path"]) for g in live for f in g["files"] if f["watched"]}),
         },
         "you": {
             "files": len(human["files"]),
@@ -124,6 +132,11 @@ def digest(day: date | None = None) -> dict:
         },
         "changes": changes,
     }
+
+
+def _prompt_of(group: dict) -> str:
+    """The prompt (or commit) behind a group, without the project: turn-<id> or commit-<sha>."""
+    return group["id"].rsplit("-", 1)[0]
 
 
 def parse_day(text: str | None) -> date | None:

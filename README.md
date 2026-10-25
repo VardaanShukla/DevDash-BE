@@ -17,6 +17,46 @@ with this package.
 DevDash needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io) (which installs
 Python apps in their own space). Node is not needed: the dashboard page comes built in.
 
+### The easy way: the installer script
+
+With DevDash-BE and DevDash-FE cloned side by side, the `Scripts` folder next to them
+installs, repairs, uninstalls or starts DevDash from one menu:
+
+```
+DevDash/
+  DevDash-BE/
+  DevDash-FE/
+  Scripts/
+    devdash.sh     Linux and macOS
+    devdash.bat    Windows (double-click it; it runs devdash.ps1)
+    devdash.ps1
+```
+
+Linux and macOS: double-click `devdash.sh` (it opens a terminal), or run it yourself:
+
+```sh
+chmod +x Scripts/devdash.sh   # once
+./Scripts/devdash.sh
+```
+
+Windows: double-click `Scripts\devdash.bat`.
+
+The menu:
+
+| Option | What it does |
+|---|---|
+| **1 Install** | Checks for Python 3.10+, pipx and Node 18+, and asks before installing any that are missing (with `sudo apt`/`dnf`/`pacman`/`zypper` or `brew` on Linux and macOS, `winget` on Windows; your password goes to those, never to the script). Builds the page from DevDash-FE, installs DevDash with pipx, asks where your projects are and runs `devdash init` on that folder, then offers to start it. If DevDash is already installed, it says to use Repair. |
+| **2 Repair** | The same, but reinstalls over whatever is there (`pipx install --force`), stopping a running DevDash first. Your data in `~/.devdash` stays. Use it after pulling new code or changing the page. |
+| **3 Uninstall** | After you type `DELETE`: takes DevDash's hooks out of every project and AI tool (`devdash remove-hooks`), uninstalls DevDash and **deletes `~/.devdash`** (your DevDash account, project list and recorded history). Your projects' files and git history, Ollama and its models are not touched. Back up `~/.devdash` first if you may want it again (see "Uninstall DevDash safely"). |
+| **4 Start** | Runs `devdash serve` and opens http://127.0.0.1:8765. Keep the window open while you use it; Ctrl+C stops it. |
+
+Without DevDash-FE next to it, the script uses the page already built into DevDash-BE and
+doesn't need Node. The install is a regular one, not editable: after changing the code, run
+Repair. Every project doesn't need `devdash init`: the folder you give at install is searched
+for git repos, and you pick the ones to track under Add project.
+
+The steps below do the same by hand.
+
 ### Windows
 
 1. **Check what you have.** In Command Prompt or PowerShell:
@@ -94,8 +134,8 @@ adding a project to record each request it worked on (see below).
 
 ### Update to the latest version
 
-Run the same install command again: `pipx install --force <GitHub URL or folder>`
-(Windows: `py -m pipx install --force …`). Then stop `devdash serve` (Ctrl+C) and start it
+Run the installer script and choose **Repair**, or run the same install command again:
+`pipx install --force <GitHub URL or folder>` (Windows: `py -m pipx install --force …`). Then stop `devdash serve` (Ctrl+C) and start it
 again: it points the hooks at the new install by itself.
 
 ### If something goes wrong
@@ -209,9 +249,12 @@ Other endpoints:
   file or none, and nothing is committed, so the undo is an ordinary change to review and
   commit. A 409 means a file changed since and the change no longer fits; nothing is
   touched then. `POST /api/digest/put-back` reapplies an undone change
-- `GET /api/todos`, `POST /api/todos` (`{"text", "repo_id", "branch"}`),
-  `PATCH /api/todos/{id}` (`{"text"}` or `{"done"}`) and `DELETE /api/todos/{id}` keep a
-  to-do list; each item is for everywhere, one project, or one branch of it
+  The day's totals leave out undone changes (`undone` counts them) and count a prompt
+  that edited several projects once; `watched_files` counts files a prompt changed through
+  a shell command rather than its edit tool, which may include your own edits made meanwhile
+- `GET /api/recording/health` says whether recording works: when each hook last ran, recent
+  errors, and `problems` in plain sentences (hooks missing or naming an old install, prompts
+  whose end never arrived). `POST /api/recording/repair` reinstalls the hooks
 - `GET /api/calendar?days=7` lists events from the calendar connected with
   `PUT /api/calendar` (`{"url"}`: its private iCal address, such as Google Calendar's
   "Secret address in iCal format"); `DELETE /api/calendar` forgets it. Read-only, fetched at
@@ -255,7 +298,8 @@ devdash disconnect claude ~/Projects/SomeRepo   # stop; recorded history is kept
 
 - a git `post-commit` hook in that repo (added to any existing shell hook, not replacing it)
 - Claude Code hooks in your user settings, `~/.claude/settings.json`
-  (`UserPromptSubmit`, `PreToolUse`, `Stop`). Nothing is added to the repo itself.
+  (`UserPromptSubmit`, `PreToolUse`, `PostToolUse` for Bash, `Stop`, `SessionEnd`). Nothing
+  is added to the repo itself.
 
 The Claude hooks run in every Claude Code session, wherever you start it: inside the repo,
 or in a parent folder holding several repos. An edit is recorded only when the edited file
@@ -291,9 +335,13 @@ Every hook call is logged (tool and file, never the prompt) to `~/.devdash/hooks
 
 1. `UserPromptSubmit` starts a turn and saves the prompt and branch.
 2. `PreToolUse` saves each file's content just before Claude first edits it in that turn.
-3. `Stop` diffs those files against their saved content. Your own edits to other files,
-   or edits made before the turn, are left out.
-4. `post-commit` links the turn's changes to the commit. Files in the commit that Claude
+3. `PostToolUse` notes the files each shell command changed, so they still count if you
+   press Esc (an interrupted prompt gets no `Stop`).
+4. `Stop` (or `SessionEnd`, when you quit or `/clear` mid-prompt) diffs those files against
+   their saved content, plus any other file that changed while the prompt ran. Your own
+   edits made before the turn are left out, and a file another Claude session changed with
+   its own edit tool is left to that session, so nothing is counted twice.
+5. `post-commit` links the turn's changes to the commit. Files in the commit that Claude
    didn't touch are recorded as human changes.
 
 Lockfiles, `node_modules`, build output and files over 1 MB are skipped.
@@ -309,19 +357,31 @@ again when a project stops recording:
   `/.devdash/` line in `.git/info/exclude`, so a Claude app chat's notes there stay out of
   git. That line is harmless and stays.
 - For the AI tool a project records, while any project records it:
-  - Claude Code: three entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
-    `PreToolUse` and `Stop`, each running `… -m devdash record …`. Your other settings and
+  - Claude Code: five entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
+    `PreToolUse`, `PostToolUse`, `Stop` and `SessionEnd`, each running `… -m devdash record …`. Your other settings and
     hooks stay.
-  - Codex: the same three in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
+  - Codex: `UserPromptSubmit`, `PreToolUse` and `Stop` in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
   - Antigravity: a `devdash` entry in `~/.gemini/config/hooks.json`.
 - Its own data in `~/.devdash` (`%USERPROFILE%\.devdash` on Windows): the projects list,
   what was recorded, settings and the dashboard password.
 
 Nothing starts DevDash by itself: it runs only while `devdash serve` does.
 
-1. **Stop recording in every project.** In the dashboard, open each project and choose
-   "Remove project from DevDash" (or "Stop recording AI changes"). Or in a terminal, for
-   each project that records an AI tool:
+**The quick way:** run the installer script (`Scripts/devdash.sh`, or `Scripts\devdash.bat` on
+Windows) and choose **3 Uninstall**. It does steps 1 to 3 below and deletes `~/.devdash`
+without a backup, so make one first (step 4) if you may want the history again.
+
+By hand:
+
+1. **Stop recording in every project.** One command does them all:
+
+   ```sh
+   devdash remove-hooks
+   ```
+
+   It takes DevDash's lines out of every recording project's git hook and DevDash's hooks out
+   of Claude Code, Codex and Antigravity. Or, one project at a time: in the dashboard choose
+   "Remove project from DevDash" (or "Stop recording AI changes"), or run:
 
    ```sh
    devdash disconnect claude /path/to/project
