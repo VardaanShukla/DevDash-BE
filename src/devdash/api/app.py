@@ -25,6 +25,7 @@ from devdash import preferences as preferences_module
 from devdash import git
 from devdash import home as home_module
 from devdash import projectmap
+from devdash import providers
 from devdash import summary as summary_module
 from devdash import undo as undo_module
 from devdash.capture import install
@@ -338,8 +339,25 @@ class AiModel(BaseModel):
     note: str = ""  # what it's good for, or its size
 
 
+class HostedServer(BaseModel):
+    url: str  # where the model is served, without any password in it
+    style: Literal["openai", "ollama"]  # OpenAI-style /v1/chat/completions, or Ollama's /api/chat
+    key: str | None  # only the key's last four characters, or "set"; never the key
+    headers: list[str]  # the names of the headers sent with each request
+    unencrypted: bool  # plain http to another computer: code goes over the network unencrypted
+
+
+class HostedConnect(BaseModel):
+    # The curl command that reaches the model, as pasted; it is read, never run.
+    curl: str | None = None
+    # Or the parts typed in: the address, an API key, and the model.
+    url: str | None = None
+    key: str | None = None
+    model: str | None = None
+
+
 class AiStatus(BaseModel):
-    provider: str = "claude"  # claude, codex, ollama or antigravity
+    provider: str = "claude"  # claude, codex, ollama, antigravity or hosted (your own server)
     name: str = "Claude"
     tool: str
     available: bool  # installed and ready to answer (Ollama: running, with a model)
@@ -352,15 +370,16 @@ class AiStatus(BaseModel):
     login_command: str | None = None  # the command that signs in (for "terminal": run it yourself)
     models: list[AiModel] = []  # cheapest first; may be empty when the tool can't list them
     default_model: str | None = None
+    server: HostedServer | None = None  # hosted only: the connected server
 
 
 class ExplainerChoice(BaseModel):
-    provider: Literal["claude", "codex", "ollama", "antigravity"]
+    provider: Literal["claude", "codex", "ollama", "antigravity", "hosted"]
     models: dict[str, str]  # the model picked for each AI; missing: its default
 
 
 class ExplainerChoiceChange(BaseModel):
-    provider: Literal["claude", "codex", "ollama", "antigravity"] | None = None
+    provider: Literal["claude", "codex", "ollama", "antigravity", "hosted"] | None = None
     models: dict[str, str] | None = None  # only the AIs to change; "" goes back to the default
 
 
@@ -552,23 +571,88 @@ class Digest(BaseModel):
     changes: list[DigestChange]
 
 
+class NewUsername(BaseModel):
+    username: str
+    current: str  # the current password
+
+
+class OllamaModel(BaseModel):
+    name: str
+    size: int  # bytes on disk
+    parameters: str | None  # e.g. "3.1B"
+    family: str | None
+    loaded: bool  # in memory now, so it answers at once
+    until: str | None  # when it's unloaded if unused
+
+
+class OllamaPull(BaseModel):
+    name: str
+    status: str  # Ollama's own words: "pulling manifest", "verifying sha256 digest", "success"
+    completed: int  # bytes so far of the part downloading now
+    total: int
+    error: str | None
+    done: bool
+
+
+class OllamaState(BaseModel):
+    installed: bool
+    running: bool
+    version: str | None
+    host: str  # where DevDash looks for it (OLLAMA_HOST, or 127.0.0.1:11434)
+    started_here: bool  # started from DevDash
+    # What runs it, so Start and Stop go through the same thing: devdash, service (Linux's
+    # systemd service: Linux asks for your password), app (macOS, Windows) or command.
+    managed_by: Literal["devdash", "service", "app", "command"] | None
+    # Starting or stopping takes an administrator's password (the Linux service): the page
+    # asks first, and sends confirm.
+    needs_admin: bool
+    local: bool  # on this computer; one OLLAMA_HOST points elsewhere is started and stopped there
+    models: list[OllamaModel]  # smallest first
+    pulls: list[OllamaPull]  # downloads under way, or just finished
+    install: list[InstallCommand]  # when it isn't installed
+
+
+class GpuUse(BaseModel):
+    name: str
+    percent: float  # busy, 0-100
+    memory_used: int  # bytes
+    memory_total: int
+
+
+class LoadedModel(BaseModel):
+    name: str
+    size: int  # bytes in memory
+    on_gpu: float  # share on the GPU, 0-1, as `ollama ps` shows it
+
+
+class MemoryUse(BaseModel):
+    used: int
+    total: int
+
+
+class OllamaUsage(BaseModel):
+    gpus: list[GpuUse]  # empty: no GPU DevDash can read, so the CPU is shown
+    cpu: float | None  # busy, 0-100
+    cores: int
+    memory: MemoryUse | None
+    models: list[LoadedModel]  # loaded in memory now
+    note: str | None  # why the CPU is shown instead of a GPU
+
+
+class OllamaSwitch(BaseModel):
+    # The person said yes, on the page, to DevDash asking for their password (pkexec) to run
+    # systemctl start or stop ollama. Without it, a service is never started or stopped.
+    confirm: bool = False
+
+
+class ModelName(BaseModel):
+    name: str
+
+
 class AuthStatus(BaseModel):
     password_set: bool
     signed_in: bool
     username: str | None = None  # only for a signed-in browser
-
-
-class Autostart(BaseModel):
-    supported: bool
-    enabled: bool
-    method: str | None  # how this system starts it, in words
-    current: bool  # it starts this install of DevDash (False after a reinstall: turn it on again)
-    port: int | None
-    password_set: bool  # needed before it can be turned on
-
-
-class AutostartChange(BaseModel):
-    enabled: bool
 
 
 class HomeLayout(BaseModel):
@@ -689,6 +773,15 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(error))
         _set_login(response, auth.new_login())
         return AuthStatus(password_set=True, signed_in=True)
+
+    @app.put("/api/auth/username", response_model=AuthStatus, response_model_exclude_none=True)
+    def set_username(body: NewUsername):
+        """Changes the username, with the current password."""
+        try:
+            auth.set_username(body.username, body.current)
+        except auth.AuthError as error:
+            raise HTTPException(400, str(error))
+        return AuthStatus(password_set=True, signed_in=True, username=auth.username())
 
     @app.get("/api/repos", response_model=list[Repo])
     def list_repos():
@@ -856,6 +949,85 @@ def create_app() -> FastAPI:
         """Every AI that can write explanations, each with its state and models."""
         return explain_module.all_status()
 
+    @app.post("/api/ai/hosted", response_model=AiStatus)
+    def connect_hosted(body: HostedConnect):
+        """Connects a model on your own server from the curl command that reaches it (or its
+        address, key and model), once it has answered a test question, and picks it to write
+        explanations. The curl command is only read, never run."""
+        try:
+            if body.curl and body.curl.strip():
+                connection = providers.parse_curl(body.curl)
+                if body.model and body.model.strip():
+                    connection["model"] = body.model.strip()[:100]
+            else:
+                connection = providers.hosted_connection(body.url or "", model=body.model, key=body.key)
+            checked = providers.check_hosted(connection)
+        except providers.ProviderError as error:
+            raise HTTPException(400, str(error))
+        checked.pop("models")
+        providers.save_hosted(checked)
+        preferences_module.update({"ai": {"provider": "hosted", "models": {"hosted": checked["model"]}}})
+        return explain_module.provider_status("hosted")
+
+    @app.delete("/api/ai/hosted", response_model=AiStatus)
+    def forget_hosted():
+        """Forgets the server and its key; explanations go back to Claude if it wrote them."""
+        providers.forget_hosted()
+        if preferences_module.ai_choice()[0] == "hosted":
+            preferences_module.update({"ai": {"provider": "claude", "models": {"hosted": ""}}})
+        return explain_module.active_status()
+
+    @app.get("/api/ollama", response_model=OllamaState)
+    def ollama_state():
+        """Ollama on this computer: running or not, its models, and downloads under way."""
+        return providers.ollama_state()
+
+    def _ollama(action, *args) -> dict:
+        try:
+            action(*args)
+        except providers.NeedsPermission as error:
+            raise HTTPException(409, str(error))
+        except providers.ProviderError as error:
+            raise HTTPException(400, str(error))
+        return providers.ollama_state()
+
+    @app.get("/api/ollama/usage", response_model=OllamaUsage)
+    def ollama_usage():
+        """The GPU's use and memory (or the CPU's, with no GPU), and how much of each loaded
+        model is on the GPU. Read every couple of seconds by the chart in Settings."""
+        return providers.ollama_usage()
+
+    @app.post("/api/ollama/start", response_model=OllamaState)
+    def ollama_start(body: OllamaSwitch | None = None):
+        """Starts Ollama the way it's set up here: its service (with your OK, then your
+        password), its app, or `ollama serve`."""
+        return _ollama(providers.start_ollama, (body or OllamaSwitch()).confirm)
+
+    @app.post("/api/ollama/stop", response_model=OllamaState)
+    def ollama_stop(body: OllamaSwitch | None = None):
+        """Stops Ollama however it was started (its service with your OK, then your password)."""
+        return _ollama(providers.stop_ollama, (body or OllamaSwitch()).confirm)
+
+    @app.post("/api/ollama/pull", response_model=OllamaState)
+    def ollama_pull(body: ModelName):
+        """Starts downloading a model; GET /api/ollama shows its progress."""
+        return _ollama(providers.pull_model, body.name)
+
+    @app.post("/api/ollama/load", response_model=OllamaState)
+    def ollama_load(body: ModelName):
+        """Loads a model into memory, as `ollama run` does."""
+        return _ollama(providers.load_model, body.name)
+
+    @app.post("/api/ollama/unload", response_model=OllamaState)
+    def ollama_unload(body: ModelName):
+        """Frees a model's memory, as `ollama stop` does."""
+        return _ollama(providers.unload_model, body.name)
+
+    @app.post("/api/ollama/remove", response_model=OllamaState)
+    def ollama_remove(body: ModelName):
+        """Deletes a downloaded model from disk."""
+        return _ollama(providers.remove_model, body.name)
+
     @app.post("/api/ai/sign-in", response_model=SignIn)
     def sign_in(body: SignInStart | None = None):
         """Starts signing in to an AI (Claude unless named): its sign-in page opens in the browser."""
@@ -959,23 +1131,6 @@ def create_app() -> FastAPI:
     def reset_home():
         """Home's widgets back to the default order and selection."""
         return preferences_module.reset_home()
-
-    @app.get("/api/autostart", response_model=Autostart)
-    def get_autostart():
-        """Whether DevDash starts when you sign in to this computer."""
-        from devdash import autostart
-
-        return autostart.status()
-
-    @app.put("/api/autostart", response_model=Autostart)
-    def change_autostart(body: AutostartChange, request: Request):
-        """Turns starting at sign-in on (on the port this page uses) or off."""
-        from devdash import autostart
-
-        try:
-            return autostart.enable(request.url.port or autostart.DEFAULT_PORT) if body.enabled else autostart.disable()
-        except autostart.AutostartError as error:
-            raise HTTPException(409, str(error))
 
     @app.get("/api/calendar", response_model=Agenda)
     def calendar(days: int = Query(7, ge=1, le=31), refresh: bool = Query(False, description="Fetch it now")):

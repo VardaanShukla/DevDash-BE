@@ -46,7 +46,7 @@ DEFAULTS = {
 }
 MAX_KEY = 20
 # The AIs that can write explanations (see providers.py), and the longest model name taken.
-AI_PROVIDERS = ("claude", "codex", "ollama", "antigravity")
+AI_PROVIDERS = ("claude", "codex", "ollama", "antigravity", "hosted")
 MAX_MODEL = 100
 
 

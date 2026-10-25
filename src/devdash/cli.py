@@ -31,6 +31,8 @@ def main(argv: list[str] | None = None) -> int:
 
     commands.add_parser("instructions", help="print the text to give Claude so app chats are recorded")
 
+    commands.add_parser("remove-hooks", help="take DevDash's hooks out of every project and AI tool (before uninstalling)")
+
     commands.add_parser("password", help="set the dashboard's username and password (also the way back in if it's forgotten)")
 
     serve_cmd = commands.add_parser("serve", help="run the local API the UI talks to")
@@ -94,6 +96,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "password":
         return _set_password()
+
+    if args.command == "remove-hooks":
+        from devdash.capture import install
+
+        for root in install.remove_all_hooks():
+            print(f"Took DevDash's git hook out of {root}")
+        print("Took DevDash's hooks out of Claude Code, Codex and Antigravity.")
+        return 0
 
     if args.command == "serve":
         return _serve(args.port)

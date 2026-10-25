@@ -176,6 +176,26 @@ def _remove_unused_hooks() -> None:
             remove_tool_hooks(tool)
 
 
+def remove_all_hooks() -> list[Path]:
+    """Takes DevDash out of every project and AI tool, before DevDash itself is uninstalled:
+    each project's git hook and each AI tool's hooks, which would otherwise call a DevDash
+    that's gone. Returns the projects it took the git hook out of."""
+    conn = connect()
+    rows = conn.execute("SELECT path FROM repos WHERE claude = 1").fetchall()
+    conn.close()
+    cleaned = []
+    for row in rows:
+        root = Path(row["path"])
+        if git.toplevel(root) is None:
+            continue  # moved or deleted: there's no hook left to take out
+        remove_git_hook(root)
+        _remove_repo_claude_hooks(root)
+        cleaned.append(root)
+    for tool in TOOLS:
+        remove_tool_hooks(tool)
+    return cleaned
+
+
 def remove(repo_id: int) -> bool:
     """Stops tracking a repo and forgets what DevDash recorded about it. The repo's own
     files and git history are untouched; DevDash's git hook comes out if an AI tool was

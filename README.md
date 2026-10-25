@@ -215,10 +215,6 @@ Other endpoints:
 - `GET /api/recording/health` says whether recording works: when each hook last ran, recent
   errors, and `problems` in plain sentences (hooks missing or naming an old install, prompts
   whose end never arrived). `POST /api/recording/repair` reinstalls the hooks
-- `GET /api/autostart` and `PUT /api/autostart` (`{"enabled"}`) turn starting DevDash at
-  sign-in on or off: a systemd user service or desktop autostart entry on Linux, a
-  LaunchAgent on macOS, the per-user Run key on Windows. No admin rights; it needs a
-  dashboard password first, and takes effect from the next sign-in
 - `GET /api/calendar?days=7` lists events from the calendar connected with
   `PUT /api/calendar` (`{"url"}`: its private iCal address, such as Google Calendar's
   "Secret address in iCal format"); `DELETE /api/calendar` forgets it. Read-only, fetched at
@@ -326,10 +322,6 @@ again when a project stops recording:
     hooks stay.
   - Codex: `UserPromptSubmit`, `PreToolUse` and `Stop` in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
   - Antigravity: a `devdash` entry in `~/.gemini/config/hooks.json`.
-- If you turned on Start at sign-in: `~/.config/systemd/user/devdash.service` or
-  `~/.config/autostart/devdash.desktop` (Linux), `~/Library/LaunchAgents/com.devdash.serve.plist`
-  (macOS), or a `DevDash` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-  (Windows). Turn it off in Settings before uninstalling, and it's removed.
 - Its own data in `~/.devdash` (`%USERPROFILE%\.devdash` on Windows): the projects list,
   what was recorded, settings and the dashboard password.
 
