@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Installs, repairs, uninstalls or starts DevDash on Linux and macOS, from the DevDash-BE
-# and DevDash-FE folders next to this Scripts folder. Double-click it, or run:
+# Installs, repairs, uninstalls or starts DevDash on Linux and macOS, from this DevDash-BE
+# clone (the folder above scripts/) and a DevDash-FE clone next to it. Double-click it, or run:
 #
-#     bash Scripts/devdash.sh
+#     bash scripts/devdash.sh
+#
+# DEVDASH_FE=/path/to/DevDash-FE points it at a page clone somewhere else.
 #
 # Installing never touches your projects. Uninstalling deletes DevDash's data, after you
 # type DELETE to confirm.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
-BE="$ROOT/DevDash-BE"
-FE="$ROOT/DevDash-FE"
+BE="$(dirname "$HERE")"
+FE="${DEVDASH_FE:-$(dirname "$BE")/DevDash-FE}"
 DATA="${DEVDASH_HOME:-$HOME/.devdash}"
 URL="http://127.0.0.1:8765"
 # Where pipx puts the devdash command; a fresh pipx may not have it on PATH yet.
@@ -78,7 +79,7 @@ system_install() { # system_install what-for apt-names dnf-names pacman-names zy
 }
 
 needs() {
-  [ -d "$BE" ] || fail "No DevDash-BE folder next to Scripts (looked in $ROOT)."
+  [ -f "$BE/pyproject.toml" ] || fail "This script belongs in DevDash-BE/scripts; there's no DevDash-BE in $BE."
   if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
     system_install "Python 3.10 or newer" "python3 python3-venv" python3 python python3 python
     python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail "DevDash needs Python 3.10 or newer; this one is $(python3 --version)."
@@ -97,7 +98,7 @@ needs() {
     major="$(node -p 'process.versions.node.split(".")[0]')"
     [ "$major" -ge 18 ] || fail "Building the page needs Node 18 or newer; this computer has $(node --version). Get a newer one from https://nodejs.org, then run this again."
   elif [ ! -f "$BE/src/devdash/web/index.html" ]; then
-    fail "No DevDash-FE folder next to Scripts, and no page built into DevDash-BE."
+    fail "No DevDash-FE folder at $FE, and no page built into DevDash-BE."
   fi
 }
 

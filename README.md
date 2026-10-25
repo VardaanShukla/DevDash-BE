@@ -19,41 +19,35 @@ Python apps in their own space). Node is not needed: the dashboard page comes bu
 
 ### The easy way: the installer script
 
-With DevDash-BE and DevDash-FE cloned side by side, the `Scripts` folder next to them
-installs, repairs, uninstalls or starts DevDash from one menu:
+`scripts/devdash.sh` (Linux and macOS) and `scripts/devdash.bat` (Windows; it runs
+`devdash.ps1`) install, repair, uninstall or start DevDash from one menu. Clone DevDash-FE
+next to this repo if you want the page built from its source; otherwise the page already
+built in here is used, and Node isn't needed:
 
 ```
-DevDash/
-  DevDash-BE/
-  DevDash-FE/
-  Scripts/
+DevDash-BE/
+  scripts/
     devdash.sh     Linux and macOS
-    devdash.bat    Windows (double-click it; it runs devdash.ps1)
+    devdash.bat    Windows (double-click it)
     devdash.ps1
+    build_ui.py    builds the page (the scripts run it for you)
+DevDash-FE/        optional, next to DevDash-BE
 ```
 
-Linux and macOS: double-click `devdash.sh` (it opens a terminal), or run it yourself:
-
-```sh
-chmod +x Scripts/devdash.sh   # once
-./Scripts/devdash.sh
-```
-
-Windows: double-click `Scripts\devdash.bat`.
-
-The menu:
+Linux and macOS: double-click `scripts/devdash.sh` (it opens a terminal), or run
+`bash scripts/devdash.sh` in DevDash-BE. Windows: double-click `scripts\devdash.bat`. To
+build the page from a DevDash-FE somewhere else, set `DEVDASH_FE` to its folder first.
 
 | Option | What it does |
 |---|---|
-| **1 Install** | Checks for Python 3.10+, pipx and Node 18+, and asks before installing any that are missing (with `sudo apt`/`dnf`/`pacman`/`zypper` or `brew` on Linux and macOS, `winget` on Windows; your password goes to those, never to the script). Builds the page from DevDash-FE, installs DevDash with pipx, asks where your projects are and runs `devdash init` on that folder, then offers to start it. If DevDash is already installed, it says to use Repair. |
-| **2 Repair** | The same, but reinstalls over whatever is there (`pipx install --force`), stopping a running DevDash first. Your data in `~/.devdash` stays. Use it after pulling new code or changing the page. |
+| **1 Install** | Checks for Python 3.10+, pipx and (when DevDash-FE is there) Node 18+, and asks before installing any that are missing (`sudo apt`/`dnf`/`pacman`/`zypper` or `brew` on Linux and macOS, `winget` on Windows; your password goes to those, never to the script). Builds the page, installs DevDash with pipx, asks where your projects are and runs `devdash init` on that folder, then offers to start it. If DevDash is already installed, it says to use Repair. |
+| **2 Repair** | The same, but reinstalls over whatever is there (`pipx install --force`), stopping a running DevDash first. Your data in `~/.devdash` stays. Use it after pulling new code. |
 | **3 Uninstall** | After you type `DELETE`: takes DevDash's hooks out of every project and AI tool (`devdash remove-hooks`), uninstalls DevDash and **deletes `~/.devdash`** (your DevDash account, project list and recorded history). Your projects' files and git history, Ollama and its models are not touched. Back up `~/.devdash` first if you may want it again (see "Uninstall DevDash safely"). |
 | **4 Start** | Runs `devdash serve` and opens http://127.0.0.1:8765. Keep the window open while you use it; Ctrl+C stops it. |
 
-Without DevDash-FE next to it, the script uses the page already built into DevDash-BE and
-doesn't need Node. The install is a regular one, not editable: after changing the code, run
-Repair. Every project doesn't need `devdash init`: the folder you give at install is searched
-for git repos, and you pick the ones to track under Add project.
+The install is a regular one, not editable: after changing the code, run Repair. Projects
+don't each need `devdash init`: the folder you give at install is searched for git repos,
+and you pick the ones to track under Add project.
 
 The steps below do the same by hand.
 
@@ -134,7 +128,7 @@ adding a project to record each request it worked on (see below).
 
 ### Update to the latest version
 
-Run the installer script and choose **Repair**, or run the same install command again:
+Run `scripts/devdash.sh` (Windows: `scripts\devdash.bat`) and choose **Repair**, or run the same install command again:
 `pipx install --force <GitHub URL or folder>` (Windows: `py -m pipx install --force …`). Then stop `devdash serve` (Ctrl+C) and start it
 again: it points the hooks at the new install by itself.
 
@@ -367,8 +361,7 @@ again when a project stops recording:
 
 Nothing starts DevDash by itself: it runs only while `devdash serve` does.
 
-**The quick way:** run the installer script (`Scripts/devdash.sh`, or `Scripts\devdash.bat` on
-Windows) and choose **3 Uninstall**. It does steps 1 to 3 below and deletes `~/.devdash`
+**The quick way:** run `scripts/devdash.sh` (Windows: `scripts\devdash.bat`) and choose **3 Uninstall**. It does steps 1 to 3 below and deletes `~/.devdash`
 without a backup, so make one first (step 4) if you may want the history again.
 
 By hand:

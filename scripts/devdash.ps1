@@ -1,5 +1,6 @@
-# Installs, repairs, uninstalls or starts DevDash on Windows, from the DevDash-BE and
-# DevDash-FE folders next to this Scripts folder. Double-click devdash.bat to run it.
+# Installs, repairs, uninstalls or starts DevDash on Windows, from this DevDash-BE clone (the
+# folder above scripts\) and a DevDash-FE clone next to it. Double-click devdash.bat to run it.
+# DEVDASH_FE set to a folder points it at a page clone somewhere else.
 #
 # Installing never touches your projects. Uninstalling deletes DevDash's data, after you
 # type DELETE to confirm. (ASCII only: Windows PowerShell 5 misreads other characters.)
@@ -7,9 +8,8 @@
 # Programs report failure by exit code, checked after each one that matters (Check); "Stop"
 # would also stop on the warnings they print, under Windows PowerShell 5.
 $ErrorActionPreference = "Continue"
-$Root = Split-Path $PSScriptRoot -Parent
-$BE = Join-Path $Root "DevDash-BE"
-$FE = Join-Path $Root "DevDash-FE"
+$BE = Split-Path $PSScriptRoot -Parent
+$FE = if ($env:DEVDASH_FE) { $env:DEVDASH_FE } else { Join-Path (Split-Path $BE -Parent) "DevDash-FE" }
 $Data = if ($env:DEVDASH_HOME) { $env:DEVDASH_HOME } else { Join-Path $HOME ".devdash" }
 $Url = "http://127.0.0.1:8765"
 $Bin = Join-Path $HOME ".local\bin"  # where pipx puts devdash.exe
@@ -69,7 +69,7 @@ function Install-WithWinget($what, $id) {
 }
 
 function Assert-Ready {
-    if (-not (Test-Path $BE)) { Fail "No DevDash-BE folder next to Scripts (looked in $Root)." }
+    if (-not (Test-Path (Join-Path $BE "pyproject.toml"))) { Fail "This script belongs in DevDash-BE\scripts; there's no DevDash-BE in $BE." }
     if (-not $script:Python) {
         Install-WithWinget "Python 3.10 or newer" "Python.Python.3.12"
         $script:Python = Find-Python
@@ -89,7 +89,7 @@ function Assert-Ready {
         $major = [int](node -p "process.versions.node.split('.')[0]")
         if ($major -lt 18) { Fail "Building the page needs Node 18 or newer; this computer has $(node --version). Get a newer one from https://nodejs.org." }
     } elseif (-not (Test-Path (Join-Path $BE "src\devdash\web\index.html"))) {
-        Fail "No DevDash-FE folder next to Scripts, and no page built into DevDash-BE."
+        Fail "No DevDash-FE folder at $FE, and no page built into DevDash-BE."
     }
 }
 
