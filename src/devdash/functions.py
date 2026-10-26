@@ -1,9 +1,12 @@
 """Each function a change touched, as it was and as it is now, with the facts git can show
 about the difference: its inputs, what it calls, how many decisions it makes, what is
 written about it. Python is read with its own parser; JavaScript, TypeScript and other
-brace languages with patterns and brace matching, which is close but not exact."""
+brace languages with patterns and brace matching, which is close but not exact. Style
+sheets split into their rules and docs into their sections; any other file (settings,
+HTML, SQL, scripts, data) is one unit, the whole file, with the lines that changed."""
 
 import ast
+import difflib
 import re
 from pathlib import Path, PurePosixPath
 
@@ -12,9 +15,14 @@ from devdash import git
 MAX_UNITS = 60
 MAX_CODE_LINES = 300
 MAX_USES = 8
+# The changed lines of a file read as a whole, for the AI and for its cache key.
+MAX_DIFF_LINES = 200
 
 BRACE_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".cs", ".php",
                   ".c", ".h", ".cpp", ".swift"}
+STYLE_SUFFIXES = {".css", ".scss", ".sass", ".less"}
+DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
+HEADING = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$")
 
 # A declaration at the start of a line, in the brace languages. Each pattern's group 1 is
 # the name; the kind follows from which pattern matched.
@@ -73,6 +81,10 @@ def function_changes(repo: Path, before_rev: str, after_rev: str | None, path: s
     new_text = _read(repo, after_rev, path)
     old_units = {unit["name"]: unit for unit in units(path, old_text)} if old_text is not None else {}
     new_units = {unit["name"]: unit for unit in units(path, new_text)} if new_text is not None else {}
+    if not old_units and not new_units:
+        # Settings, HTML, SQL, scripts, data, or code that doesn't parse: the file is the unit.
+        whole = _whole_file(path, old_text, new_text)
+        return [whole] if whole else []
 
     changes = []
     for name in list(new_units) + [n for n in old_units if n not in new_units]:
@@ -92,9 +104,65 @@ def function_changes(repo: Path, before_rev: str, after_rev: str | None, path: s
         if len(changes) >= MAX_UNITS:
             break
     for item in changes:
-        if item["change"] != "deleted":
+        if item["change"] != "deleted" and item["kind"] not in ("style", "section"):
             item["used_by"] = _uses(repo, after_rev, item["name"].split(".")[-1], path, item["after"])
+    if not changes:
+        # Only lines outside every function changed (imports, settings, comments): those
+        # still get explained, as the file's change.
+        whole = _whole_file(path, old_text, new_text)
+        return [whole] if whole else []
     return changes
+
+
+def _whole_file(path: str, old_text: str | None, new_text: str | None) -> dict | None:
+    """The whole file as one unit, with the changed lines as a diff, so a change to any
+    kind of file can be read and explained."""
+    if old_text is not None and new_text is not None and _normal(old_text) == _normal(new_text):
+        return None
+    if old_text is None and new_text is None:
+        return None
+    before = _file_unit(path, old_text) if old_text is not None else None
+    after = _file_unit(path, new_text) if new_text is not None else None
+    diff = None
+    if before and after and not _binary(old_text) and not _binary(new_text):
+        lines = list(difflib.unified_diff(old_text.splitlines(), new_text.splitlines(), lineterm="", n=2))[2:]
+        if len(lines) > MAX_DIFF_LINES:
+            lines = lines[:MAX_DIFF_LINES] + [f"… {len(lines) - MAX_DIFF_LINES} more lines"]
+        diff = "\n".join(lines)
+    return {
+        "name": PurePosixPath(path).name,
+        "kind": "file",
+        "change": "modified" if before and after else "added" if after else "deleted",
+        "before": before,
+        "after": after,
+        "facts": _facts(before, after),
+        "used_by": [],
+        "diff": diff,
+    }
+
+
+def _binary(text: str) -> bool:
+    return "\x00" in text[:8000]
+
+
+def _file_unit(path: str, text: str) -> dict:
+    lines = text.splitlines()
+    code = "(a binary file, such as an image, so there is no text to show)" if _binary(text) else _clip(text)
+    return {
+        "name": PurePosixPath(path).name,
+        "kind": "file",
+        "start": 1,
+        "end": max(1, len(lines)),
+        "lines": len(lines),
+        "code": code,
+        "signature": lines[0].strip()[:200] if lines and not _binary(text) else "",
+        "doc": None,
+        "params": [],
+        "returns": None,
+        "is_async": False,
+        "calls": [],
+        "decisions": 0,
+    }
 
 
 def units(path: str, text: str) -> list[dict]:
@@ -107,6 +175,10 @@ def units(path: str, text: str) -> list[dict]:
             return []
     if suffix in BRACE_SUFFIXES:
         return _brace_units(path, text)
+    if suffix in STYLE_SUFFIXES:
+        return _style_units(text)
+    if suffix in DOC_SUFFIXES:
+        return _doc_units(text)
     return []
 
 
@@ -354,6 +426,69 @@ def _params(code: str) -> list[str]:
 
 def _strip_comments(line: str) -> str:
     return re.sub(r"//.*$", "", line)
+
+
+# --- Style sheets and docs --------------------------------------------------------------
+
+def _style_units(text: str) -> list[dict]:
+    """Each top-level rule (or @media block) of a style sheet, named by its selector."""
+    lines = text.splitlines()
+    found: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if "{" not in line or stripped.startswith(("/*", "*", "//")):
+            i += 1
+            continue
+        # A selector can run over several lines: "a,\nb {".
+        start = i
+        while start > 0 and lines[start - 1].rstrip().endswith(","):
+            start -= 1
+        selector = " ".join(l.strip() for l in lines[start:i + 1]).split("{")[0].strip()
+        end = _block_end(lines, i)
+        if selector:
+            unit = _brace_unit(lines, start, end, _unique(selector[:80], found), "style")
+            unit.update(params=[], calls=[], decisions=0)
+            found.append(unit)
+        i = max(end, i + 1)
+    return found
+
+
+def _doc_units(text: str) -> list[dict]:
+    """Each section of a doc, from one heading to the next."""
+    lines = text.splitlines()
+    starts: list[tuple[int, str]] = []
+    in_code = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith(("```", "~~~")):
+            in_code = not in_code
+        heading = None if in_code else HEADING.match(line)
+        if heading:
+            starts.append((i, heading[2]))
+    if not starts or starts[0][0] > 0:
+        starts.insert(0, (0, "Opening"))
+    found: list[dict] = []
+    for n, (start, title) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        if not "\n".join(lines[start:end]).strip():
+            continue
+        unit = _file_unit("", "\n".join(lines[start:end]))
+        unit.update(name=_unique(title[:80], found), kind="section", start=start + 1, end=max(start + 1, end),
+                    signature=lines[start].strip())
+        found.append(unit)
+    return found
+
+
+def _unique(name: str, found: list[dict]) -> str:
+    """The same selector or heading can appear twice; the second is told apart by number."""
+    taken = {unit["name"] for unit in found}
+    if name not in taken:
+        return name
+    n = 2
+    while f"{name} ({n})" in taken:
+        n += 1
+    return f"{name} ({n})"
 
 
 # --- Shared -----------------------------------------------------------------------------

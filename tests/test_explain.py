@@ -336,3 +336,135 @@ def test_devdash_data_is_private_to_its_user(tmp_path, monkeypatch):
     paths.home()
     assert oct(home.stat().st_mode & 0o777) == "0o700"
     assert oct((home / "devdash.db.before-x").stat().st_mode & 0o777) == "0o600"
+
+
+def test_every_kind_of_changed_file_has_something_to_explain(repo):
+    init(repo)
+    (repo / "style.css").write_text("a,\nb {\n  color: red;\n}\n\n.card { padding: 4px; }\n")
+    (repo / "README.md").write_text("Intro.\n\n# Setup\n\nRun it.\n\n## Use\n\nClick.\n")
+    (repo / "config.json").write_text('{\n  "port": 80,\n  "debug": false\n}\n')
+    (repo / "app.py").write_text("import os\n\n\ndef hello():\n    return 'hi'\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "files")
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "style.css").write_text("a,\nb {\n  color: blue;\n}\n\n.card { padding: 4px; }\n")
+    (repo / "README.md").write_text("Intro.\n\n# Setup\n\nRun it twice.\n\n## Use\n\nClick.\n")
+    (repo / "config.json").write_text('{\n  "port": 8080,\n  "debug": false\n}\n')
+    # Only an import changes: outside every function.
+    (repo / "app.py").write_text("import sys\n\n\ndef hello():\n    return 'hi'\n")
+    (repo / "deploy.sh").write_text("#!/bin/sh\necho deploy\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "change them")
+    [listed] = client().get("/api/repos").json()
+
+    def changed(path):
+        result = client().get(f"/api/repos/{listed['id']}/functions", params={"path": path}).json()
+        return [(f["name"], f["kind"], f["change"]) for f in result["functions"]], result["functions"]
+
+    assert changed("style.css")[0] == [("a, b", "style", "modified")]
+    assert changed("README.md")[0] == [("Setup", "section", "modified")]
+    names, [config] = changed("config.json")
+    assert names == [("config.json", "file", "modified")]
+    assert '-  "port": 80,' in config["diff"] and '+  "port": 8080,' in config["diff"]
+    assert changed("app.py")[0] == [("app.py", "file", "modified")]
+    names, [script] = changed("deploy.sh")
+    assert names == [("deploy.sh", "file", "added")] and script["diff"] is None
+    assert script["after"]["code"].strip() == "#!/bin/sh\necho deploy"
+
+
+def test_a_whole_file_is_explained_from_its_diff(repo, tmp_path, monkeypatch):
+    init(repo)
+    (repo / "settings.yaml").write_text("retries: 3\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "settings")
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "settings.yaml").write_text("retries: 5\n")
+    git(repo, "commit", "-q", "-am", "more retries")
+    [listed] = client().get("/api/repos").json()
+    prompts = tmp_path / "prompts"
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    reply = json.dumps({"type": "result", "is_error": False, "result": json.dumps({
+        "summary": "Sets how often to retry.", "change": "Retries more.", "improves": [], "tradeoffs": [],
+        "check": None})})
+    (folder / "claude").write_text(f"#!/bin/sh\ncat >> {prompts}\ncat <<'EOF'\n{reply}\nEOF\n")
+    (folder / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+
+    made = client().post(f"/api/repos/{listed['id']}/explain/function",
+                         json={"path": "settings.yaml", "name": "settings.yaml"})
+    assert made.status_code == 200 and made.json()["summary"] == "Sets how often to retry."
+    asked = prompts.read_text()
+    assert "Whole file: settings.yaml" in asked and "+retries: 5" in asked
+
+
+def test_prompts_fit_small_models_without_losing_the_instructions(monkeypatch):
+    from devdash import explain
+
+    long = "x" * 50_000 + "\nReply with only a JSON object"
+    fitted = explain._fit(long, 12_000)
+    assert len(fitted) <= 12_000 and fitted.endswith("Reply with only a JSON object")
+    monkeypatch.setattr(explain.preferences, "ai_choice", lambda: ("ollama", "qwen2.5:3b"))
+    assert explain.prompt_budget() == explain.SMALL_PROMPT_CHARS
+    subject = {"path": "big.py", "sha": "1"}
+    prompt = explain._file_prompt(subject, {"text": "y\n" * 40_000, "outline": []}, explain.SMALL_PROMPT_CHARS)
+    assert len(prompt) < explain.SMALL_PROMPT_CHARS and '"purpose"' in prompt
+
+
+def test_knowledge_transfer_file_by_file(repo, tmp_path, monkeypatch):
+    init(repo)
+    (repo / "app.py").write_text("def hello(name):\n    \"\"\"Greets someone.\"\"\"\n    return name\n")
+    (repo / "logo.png").write_bytes(b"\x89PNG\x00\x00")
+    (repo / "package-lock.json").write_text("{}\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "app")
+    [listed] = client().get("/api/repos").json()
+    kt = client().get(f"/api/repos/{listed['id']}/kt").json()
+    # Images and lockfiles aren't explained.
+    paths = [f["path"] for f in kt["files"]]
+    assert "app.py" in paths and "logo.png" not in paths and "package-lock.json" not in paths
+    assert kt["explained"] == 0
+
+    calls = fake_claude(tmp_path, monkeypatch, {
+        "purpose": "Greets people.", "functions": [{"name": "hello", "what": "Returns the name."}, "junk"],
+        "connects": "Nothing else.", "notes": ["Keep it short"],
+    })
+    made = client().post(f"/api/repos/{listed['id']}/explain/file", json={"path": "app.py"}).json()
+    assert made == {"purpose": "Greets people.", "functions": [{"name": "hello", "what": "Returns the name."}],
+                    "connects": "Nothing else.", "notes": ["Keep it short"]}
+    client().post(f"/api/repos/{listed['id']}/explain/file", json={"path": "app.py"})
+    assert len(calls.read_text().splitlines()) == 1  # saved: asked once
+    kt = client().get(f"/api/repos/{listed['id']}/kt").json()
+    assert kt["explained"] == 1
+    assert next(f for f in kt["files"] if f["path"] == "app.py")["explanation"]["purpose"] == "Greets people."
+    missing = client().post(f"/api/repos/{listed['id']}/explain/file", json={"path": "logo.png"})
+    assert missing.status_code == 404
+
+    # An edit to the file asks again.
+    (repo / "app.py").write_text("def hello(name):\n    return name.title()\n")
+    git(repo, "commit", "-q", "-am", "title case")
+    assert client().get(f"/api/repos/{listed['id']}/kt").json()["explained"] == 0
+
+
+def test_project_kt_reads_the_file_notes(repo, tmp_path, monkeypatch):
+    init(repo)
+    [listed] = client().get("/api/repos").json()
+    fake_claude(tmp_path, monkeypatch, {"purpose": "Says hi.", "functions": [], "connects": "", "notes": []})
+    client().post(f"/api/repos/{listed['id']}/explain/file", json={"path": "app.py"})
+
+    prompts = tmp_path / "prompts"
+    folder = tmp_path / "bin"
+    reply = json.dumps({"type": "result", "is_error": False, "result": json.dumps({
+        "overview": "A greeter.", "how_it_works": ["It greets."], "parts": [],
+        "flows": [{"name": "Greeting", "steps": ["app.py says hi", 3]}, "junk"],
+        "start_here": [{"path": "app.py", "why": "It's all there."}], "state": "New."})})
+    (folder / "claude").write_text(f"#!/bin/sh\ncat >> {prompts}\ncat <<'EOF'\n{reply}\nEOF\n")
+    made = client().post(f"/api/repos/{listed['id']}/explain/project", json={}).json()
+    assert made["flows"] == [{"name": "Greeting", "steps": ["app.py says hi"]}]
+    assert made["start_here"] == [{"path": "app.py", "why": "It's all there."}]
+    assert "- app.py: Says hi." in prompts.read_text()
+    # Saved, unless asked afresh.
+    client().post(f"/api/repos/{listed['id']}/explain/project", json={})
+    assert prompts.read_text().count("What each file is for") == 1
+    client().post(f"/api/repos/{listed['id']}/explain/project", json={"fresh": True})
+    assert prompts.read_text().count("What each file is for") == 2
