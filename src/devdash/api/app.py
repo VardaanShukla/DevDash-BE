@@ -115,6 +115,8 @@ class BranchInfo(BaseModel):
     name: str
     merged: bool
     gone: bool
+    # When DevDash stops listing a merged or deleted branch; None for an open one.
+    removes_at: str | None = None
 
 
 class Branches(BaseModel):
@@ -245,6 +247,8 @@ class Comparison(BaseModel):
     # What was actually compared against: origin/Dev when it is newer than Dev.
     base_ref: str
     head: str
+    # Where the branch's own work starts: where it left the base, or where it was made from
+    # another branch that isn't merged yet.
     merge_base: str
     uncommitted: bool
     ahead: int
@@ -302,7 +306,9 @@ class FunctionExplanation(BaseModel):
 
 class FunctionDetail(BaseModel):
     name: str
-    kind: Literal["function", "method", "component", "class", "type"]
+    # style: a rule in a style sheet; section: part of a doc; file: a whole file of
+    # another kind (settings, HTML, SQL, a script), or edits outside every function.
+    kind: Literal["function", "method", "component", "class", "type", "style", "section", "file"]
     change: Literal["added", "deleted", "modified"]
     before: UnitSide | None
     after: UnitSide | None
@@ -312,6 +318,8 @@ class FunctionDetail(BaseModel):
     used_by: list[Use]
     # Saved from an earlier Explain, if there is one.
     explanation: FunctionExplanation | None
+    # For a whole file: the lines that changed, as a unified diff.
+    diff: str | None = None
 
 
 class FileFunctions(BaseModel):
@@ -435,11 +443,56 @@ class PartExplanation(BaseModel):
     what: str
 
 
+class ProjectFlow(BaseModel):
+    name: str
+    steps: list[str]
+
+
+class StartHere(BaseModel):
+    path: str
+    why: str
+
+
 class ProjectExplanation(BaseModel):
     overview: str
     how_it_works: list[str]
     parts: list[PartExplanation]
+    # Main things the project does, step by step, naming the files involved.
+    flows: list[ProjectFlow] = []
+    # The files a new team member should read first, in order.
+    start_here: list[StartHere] = []
     state: str
+
+
+class FunctionNote(BaseModel):
+    name: str
+    what: str
+
+
+class FileExplanation(BaseModel):
+    purpose: str
+    functions: list[FunctionNote]
+    connects: str
+    notes: list[str]
+
+
+class KtFile(BaseModel):
+    path: str
+    part: str
+    language: str
+    bytes: int
+    explanation: FileExplanation | None
+
+
+class KnowledgeTransfer(BaseModel):
+    """Every file of the project a KT explains, with the notes written so far."""
+    files: list[KtFile]
+    explained: int
+
+
+class ExplainFileRequest(BaseModel):
+    path: str
+    head: str | None = None
 
 
 class Summary(BaseModel):
@@ -463,6 +516,8 @@ class Summary(BaseModel):
 
 class ExplainProjectRequest(BaseModel):
     head: str | None = None
+    # Write it again, as when the file-by-file notes have filled in since.
+    fresh: bool = False
 
 
 class LastCommit(BaseModel):
@@ -478,7 +533,7 @@ class ProjectCard(BaseModel):
     exists: bool
     branch: str | None
     base: str | None
-    ahead: int | None  # commits on the branch that the base doesn't have; None on the base itself
+    ahead: int | None  # the branch's own commits, since it was made; None on the base itself
     uncommitted: int  # files changed but not committed
     last_commit: LastCommit | None
     commits_this_week: int
@@ -850,8 +905,12 @@ def create_app() -> FastAPI:
     def list_branches(repo_id: int):
         path = _repo_path(repo_id)
         base = compare_module.default_base(path)
-        return Branches(current=git.branch(path), default_base=base, branches=compare_module.branches(path),
-                        details=compare_module.branch_details(path, base))
+        current = git.branch(path)
+        # Merged and deleted branches go after a while; see compare.retire.
+        details = compare_module.retire(str(repo_id), compare_module.branch_details(path, base), current)
+        shown = {branch["name"] for branch in details}
+        return Branches(current=current, default_base=base,
+                        branches=[name for name in compare_module.branches(path) if name in shown], details=details)
 
     @app.post("/api/repos/{repo_id}/sync", response_model=Sync)
     def sync(repo_id: int):
@@ -931,7 +990,8 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"{request.name} didn't change in {request.path}")
         head = request.head or git.branch(repo) or "HEAD"
         base_ref = compare_module.freshest(repo, request.base or compare_module.default_base(repo))
-        context = {"commits": [c["subject"] for c in compare_module.commits(repo, f"{base_ref}..{head}")],
+        start = compare_module.fork_point(repo, base_ref, head)
+        context = {"commits": [c["subject"] for c in compare_module.commits(repo, f"{start}..{head}")],
                    "used_by": item["used_by"]}
         try:
             return explain_module.explain("function", _function_subject(request.path, item), context)
@@ -1059,11 +1119,42 @@ def create_app() -> FastAPI:
 
     @app.post("/api/repos/{repo_id}/explain/project", response_model=ProjectExplanation)
     def explain_project(repo_id: int, request: ExplainProjectRequest):
-        """Asks Claude Code to describe the project, from the facts on the summary."""
+        """Asks the AI to describe the project, from the facts on the summary and the notes
+        on each file written for the knowledge transfer so far."""
         repo = _repo_path(repo_id)
         try:
             facts = summary_module.summary(repo, request.head or "HEAD")
-            return explain_module.explain("project", _project_subject(facts), _project_context(facts))
+            context = _project_context(facts)
+            context["file_notes"] = {f["path"]: f["explanation"]["purpose"]
+                                     for f in _kt_files(repo, request.head) if f["explanation"]}
+            return explain_module.explain("project", _project_subject(facts), context, fresh=request.fresh)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        except explain_module.ExplainError as error:
+            raise _explain_failed(error)
+
+    @app.get("/api/repos/{repo_id}/kt", response_model=KnowledgeTransfer)
+    def knowledge_transfer(repo_id: int, head: str | None = Query(None, description="Defaults to the checked-out branch")):
+        """Every file the project's knowledge transfer explains, with the notes written so far."""
+        repo = _repo_path(repo_id)
+        try:
+            files = _kt_files(repo, head)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        return KnowledgeTransfer(files=files, explained=sum(1 for f in files if f["explanation"]))
+
+    @app.post("/api/repos/{repo_id}/explain/file", response_model=FileExplanation)
+    def explain_file(repo_id: int, request: ExplainFileRequest):
+        """Asks the AI what one file is for and what each function in it does, for the KT."""
+        repo = _repo_path(repo_id)
+        try:
+            file = summary_module.kt_file(repo, request.head or "HEAD", request.path)
+            if file is None:
+                raise HTTPException(404, f"{request.path} isn't one of the project's files the KT explains")
+            facts = summary_module.summary(repo, request.head or "HEAD")
+            context = {"text": file["text"], "outline": file["outline"], "part": file["part"],
+                       "project": {"name": facts["name"], "description": facts["description"]}}
+            return explain_module.explain("file", _file_subject(file), context)
         except git.GitError as error:
             raise HTTPException(400, str(error))
         except explain_module.ExplainError as error:
@@ -1189,7 +1280,7 @@ def _function_changes(repo: Path, path: str, old_path: str | None, base: str | N
         raise HTTPException(400, "no main, master, develop or dev branch to compare against; pick one")
     try:
         base_ref = compare_module.freshest(repo, base)
-        merge_base = git.run(repo, "merge-base", base_ref, head).strip()
+        merge_base = compare_module.fork_point(repo, base_ref, head)
     except git.GitError as error:
         raise HTTPException(400, str(error))
     return functions_module.function_changes(repo, merge_base, None if uncommitted else head, path, old_path)
@@ -1197,8 +1288,23 @@ def _function_changes(repo: Path, path: str, old_path: str | None, base: str | N
 
 def _function_subject(path: str, item: dict) -> dict:
     # What the explanation depends on; the same code always gets the same one.
-    return {"path": path, "name": item["name"], "kind": item["kind"], "change": item["change"],
-            "before": (item["before"] or {}).get("code"), "after": (item["after"] or {}).get("code")}
+    subject = {"path": path, "name": item["name"], "kind": item["kind"], "change": item["change"],
+               "before": (item["before"] or {}).get("code"), "after": (item["after"] or {}).get("code")}
+    if item.get("diff"):
+        # A whole file's code is cut short; its diff says what changed further down.
+        subject["diff"] = item["diff"]
+    return subject
+
+
+def _file_subject(file: dict) -> dict:
+    # The file's content, by its git blob: an edit to it gets a new note.
+    return {"path": file["path"], "sha": file["sha"]}
+
+
+def _kt_files(repo: Path, head: str | None) -> list[dict]:
+    return [{**{k: f[k] for k in ("path", "part", "language", "bytes")},
+             "explanation": explain_module.cached("file", _file_subject(f))}
+            for f in summary_module.kt_files(repo, head or "HEAD")]
 
 
 def _project_subject(facts: dict) -> dict:

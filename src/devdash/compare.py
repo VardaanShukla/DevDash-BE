@@ -2,14 +2,19 @@
 covers every change: the developer's own, and anything an AI tool committed."""
 
 import hashlib
+import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from devdash import git, paths
 from devdash.capture.record import AI_TRAILER, _ignored
+from devdash.store import connect
 
 MAX_LINES_PER_FILE = 2000
 MAX_UNTRACKED = 200
+# How long a merged or deleted branch stays listed, marked as such, before DevDash drops it.
+RETIRE_AFTER = timedelta(minutes=15)
 
 # Git only knows where functions start for some languages. These attributes turn its
 # built-in drivers on, and add one for JavaScript and TypeScript, so each hunk header
@@ -76,7 +81,7 @@ def compare(repo: Path, base: str | None = None, head: str | None = None,
     # Compare with the newest copy of the base: after a pull request is merged on GitHub,
     # origin/Dev has the merge long before the local Dev is pulled.
     base_ref = freshest(repo, base)
-    merge_base = git.run(repo, "merge-base", base_ref, head).strip()
+    merge_base = fork_point(repo, base_ref, head)
     target = [] if uncommitted else [head]
     patch = _git_diff(repo, merge_base, *target)
     files = parse_patch(patch)
@@ -88,7 +93,7 @@ def compare(repo: Path, base: str | None = None, head: str | None = None,
         _finish(item)
         item["uncommitted"] = item["path"] in not_committed
 
-    ahead = int(git.run(repo, "rev-list", "--count", f"{base_ref}..{head}").strip())
+    ahead = int(git.run(repo, "rev-list", "--count", f"{merge_base}..{head}").strip())
     behind = int(git.run(repo, "rev-list", "--count", f"{head}..{base_ref}").strip())
     return {
         "base": base,
@@ -98,7 +103,7 @@ def compare(repo: Path, base: str | None = None, head: str | None = None,
         "uncommitted": uncommitted,
         "ahead": ahead,
         "behind": behind,
-        "commits": commits(repo, f"{base_ref}..{head}"),
+        "commits": commits(repo, f"{merge_base}..{head}"),
         "files": files,
         "totals": {
             "files": len(files),
@@ -182,9 +187,90 @@ def branch_details(repo: Path, base: str | None) -> list[dict]:
         name, upstream, track = (line.split("\x00") + ["", ""])[:3]
         if not name:
             continue
-        merged = bool(base_ref) and name != base and _is_ancestor(repo, name, base_ref)
+        # A branch just made from the base, with nothing committed yet, is also part of
+        # the base; it is new, not merged.
+        merged = (bool(base_ref) and name != base and _is_ancestor(repo, name, base_ref)
+                  and not _untouched(repo, name))
         result.append({"name": name, "merged": merged, "gone": bool(upstream) and "gone" in track})
     return result
+
+
+def retire(key: str, details: list[dict], current: str | None, now: datetime | None = None) -> list[dict]:
+    """Merged and deleted branches stay listed for RETIRE_AFTER from when DevDash first saw
+    them so, each with the time it goes (`removes_at`); after that they are left out. The
+    checked-out branch always stays. When each was first seen is kept in the database, so
+    a restart doesn't start the clock again. `key` names the project."""
+    now = now or datetime.now(timezone.utc)
+    setting = f"retired-branches:{key}"
+    conn = connect()
+    row = conn.execute("SELECT value FROM settings WHERE name = ?", (setting,)).fetchone()
+    seen = json.loads(row["value"]) if row else {}
+    kept, still = [], {}
+    for branch in details:
+        if not (branch["merged"] or branch["gone"]):
+            kept.append({**branch, "removes_at": None})
+            continue
+        first = seen.get(branch["name"]) or now.isoformat(timespec="seconds")
+        still[branch["name"]] = first
+        removes_at = datetime.fromisoformat(first) + RETIRE_AFTER
+        if removes_at > now or branch["name"] == current:
+            kept.append({**branch, "removes_at": removes_at.isoformat(timespec="seconds")})
+    # A branch that was deleted, or got new work, is forgotten; seen again, its clock restarts.
+    if still != seen:
+        if still:
+            conn.execute("INSERT INTO settings (name, value) VALUES (?, ?) "
+                         "ON CONFLICT(name) DO UPDATE SET value = excluded.value", (setting, json.dumps(still)))
+        else:
+            conn.execute("DELETE FROM settings WHERE name = ?", (setting,))
+        conn.commit()
+    conn.close()
+    return kept
+
+
+def fork_point(repo: Path, base_ref: str, head: str) -> str:
+    """Where `head`'s own work starts. Usually where it left the base; but a branch made
+    from another branch that isn't merged yet would then count that branch's commits as
+    its own too, so when the branch's reflog says where it was made, and that is later,
+    it starts there. A rebase or an expired reflog falls back to where it left the base."""
+    merge_base = git.run(repo, "merge-base", base_ref, head).strip()
+    created = _created_at(repo, head)
+    if (created and created != merge_base and _is_ancestor(repo, merge_base, created)
+            and _is_ancestor(repo, created, head)):
+        return created
+    return merge_base
+
+
+def _reflog(repo: Path, branch: str) -> list[tuple[str, str]]:
+    """A local branch's reflog, oldest first, as (commit, what happened); empty for
+    anything that isn't a local branch."""
+    try:
+        out = git.run(repo, "reflog", "show", "--format=%H%x00%gs", f"refs/heads/{branch}")
+    except git.GitError:
+        return []
+    entries = [tuple(line.split("\x00", 1)) for line in out.splitlines() if "\x00" in line]
+    return entries[::-1]
+
+
+def _created_at(repo: Path, branch: str) -> str | None:
+    """The commit a local branch was made at, while its reflog still goes back that far."""
+    entries = _reflog(repo, branch)
+    if not entries:
+        return None
+    sha, subject = entries[0]
+    if not subject.startswith("branch: Created from "):
+        return None
+    source = subject.removeprefix("branch: Created from ")
+    # Checking out a branch that exists on the remote makes a local copy of it: its
+    # commits there are the branch's own, not where it was made.
+    if source.endswith("/" + branch):
+        return None
+    return sha
+
+
+def _untouched(repo: Path, branch: str) -> bool:
+    """True when the branch was made and nothing has moved it since."""
+    entries = _reflog(repo, branch)
+    return len(entries) == 1 and entries[0][1].startswith("branch: Created from ")
 
 
 def freshest(repo: Path, branch: str) -> str:

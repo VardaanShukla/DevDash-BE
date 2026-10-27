@@ -17,7 +17,8 @@ def project(path: Path) -> dict:
     ahead = None
     if has_commits and base and branch != base:
         try:
-            ahead = int(git.run(path, "rev-list", "--count", f"{compare.freshest(path, base)}..HEAD").strip())
+            start = compare.fork_point(path, compare.freshest(path, base), branch or "HEAD")
+            ahead = int(git.run(path, "rev-list", "--count", f"{start}..HEAD").strip())
         except git.GitError:
             ahead = None
     last = None

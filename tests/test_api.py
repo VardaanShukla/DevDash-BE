@@ -101,12 +101,47 @@ def test_merge_and_delete_on_github_show_up_after_sync(repo, tmp_path):
     assert synced["error"] is None and synced["synced_at"]
 
     details = {b["name"]: b for b in api.get(f"/api/repos/{repo_id}/branches").json()["details"]}
-    assert details["feature/addLogin"] == {"name": "feature/addLogin", "merged": True, "gone": True}
+    shown = details["feature/addLogin"]
+    assert (shown["merged"], shown["gone"]) == (True, True) and shown["removes_at"]
     after = api.get(f"/api/repos/{repo_id}/compare").json()
     assert after["base_ref"] == "origin/Dev" and after["files"] == [] and after["ahead"] == 0
 
     with_edits = api.get(f"/api/repos/{repo_id}/compare", params={"uncommitted": True}).json()
     assert [(f["path"], f["uncommitted"]) for f in with_edits["files"]] == [("notes.txt", True)]
+
+
+def test_merged_branch_is_marked_then_dropped_after_15_minutes(repo):
+    from datetime import datetime, timedelta, timezone
+
+    from devdash.store import connect
+
+    git(repo, "checkout", "-q", "-b", "done")
+    (repo / "done.py").write_text("x = 1\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "done")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--no-ff", "-m", "Merge done", "done")
+    git(repo, "checkout", "-q", "-b", "next")  # new, nothing committed: not merged
+    init(repo)
+    api = client()
+    repo_id = api.get("/api/repos").json()[0]["id"]
+
+    listed = api.get(f"/api/repos/{repo_id}/branches").json()
+    details = {b["name"]: b for b in listed["details"]}
+    assert details["done"]["merged"] and details["done"]["removes_at"]
+    assert (details["next"]["merged"], details["next"]["removes_at"]) == (False, None)
+    assert "done" in listed["branches"]
+
+    # 16 minutes later.
+    conn = connect()
+    earlier = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds")
+    conn.execute("UPDATE settings SET value = ? WHERE name = ?", (f'{{"done": "{earlier}"}}', f"retired-branches:{repo_id}"))
+    conn.commit()
+    conn.close()
+    listed = api.get(f"/api/repos/{repo_id}/branches").json()
+    assert sorted(listed["branches"]) == ["main", "next"]
+    assert "done" not in {b["name"] for b in listed["details"]}
+    assert "done" in git(repo, "branch", "--list", "done")  # still in git; only DevDash stops showing it
 
 
 def test_sync_reports_an_unreachable_remote(repo):

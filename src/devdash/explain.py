@@ -2,6 +2,10 @@
 the user's own Claude Code (`claude -p`), so DevDash needs no API key of its own. Only
 asked for when someone clicks Explain, and saved, so the same code is explained once.
 
+A full knowledge transfer (KT) of a project is built a file at a time: each file is
+explained on its own (its purpose and every function in it), so even a small local model
+only ever reads one file, and the project's overview is then written from those notes.
+
 Claude runs in an empty folder with its tools turned off and a short system prompt of
 DevDash's own: it sees only what the prompt holds, and DevDash's own recorder skips the
 run. It uses a small, cheap model (Haiku) unless DEVDASH_CLAUDE_MODEL names another.
@@ -30,7 +34,12 @@ from devdash.store.db import now
 TIMEOUT = 240
 # Bump when a prompt changes, so explanations written for the old one are asked again.
 PROMPT_VERSION = "1"
+VERSIONS = {"project": "2"}
 MAX_PROMPT_CHARS = 30_000
+# Local and self-hosted models are often small, with a short memory (context): their
+# prompts are kept to this many characters, about 3,500 tokens.
+SMALL_PROMPT_CHARS = 12_000
+SMALL_PROVIDERS = {"ollama", "hosted"}
 MODEL = os.environ.get("DEVDASH_CLAUDE_MODEL", "haiku")
 SYSTEM_PROMPT = ("You turn code and facts about software projects into plain-English explanations for people "
                  "who don't write code. Reply with only the JSON object you are asked for.")
@@ -142,7 +151,7 @@ def _env() -> dict:
 
 
 def key(kind: str, subject: dict) -> str:
-    text = json.dumps({"kind": kind, "version": PROMPT_VERSION, **subject}, sort_keys=True)
+    text = json.dumps({"kind": kind, "version": VERSIONS.get(kind, PROMPT_VERSION), **subject}, sort_keys=True)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -183,13 +192,15 @@ def redact(text: str) -> str:
     return _ENV_LINE.sub(lambda m: m.group(1) + REDACTED, text)
 
 
-def explain(kind: str, subject: dict, context: dict | None = None) -> dict:
+def explain(kind: str, subject: dict, context: dict | None = None, fresh: bool = False) -> dict:
     """The explanation for `subject` (what is explained, and the cache key), with
-    `context` adding background that doesn't change the answer much, like commit titles."""
-    found = cached(kind, subject)
+    `context` adding background that doesn't change the answer much, like commit titles.
+    `fresh` asks again even when an answer is saved, as when more context has come in."""
+    found = None if fresh else cached(kind, subject)
     if found:
         return found
-    prompt = redact(PROMPTS[kind](subject, context or {}))[:MAX_PROMPT_CHARS]
+    budget = prompt_budget()
+    prompt = _fit(redact(PROMPTS[kind](subject, context or {}, budget)), budget)
     result = _clean(kind, _parse(_run(prompt)))
     conn = connect()
     with conn:
@@ -199,23 +210,56 @@ def explain(kind: str, subject: dict, context: dict | None = None) -> dict:
     return result
 
 
-def _function_prompt(subject: dict, context: dict) -> str:
+def prompt_budget() -> int:
+    """How long a prompt the AI picked in Settings can take."""
+    return SMALL_PROMPT_CHARS if preferences.ai_choice()[0] in SMALL_PROVIDERS else MAX_PROMPT_CHARS
+
+
+def _fit(prompt: str, budget: int) -> str:
+    """The prompt within budget. The middle goes, never the end: that is where the
+    instructions for the answer are."""
+    if len(prompt) <= budget:
+        return prompt
+    tail = min(len(prompt) // 3, budget // 3)
+    return prompt[:budget - tail - 40] + "\n… (cut to fit) …\n" + prompt[-tail:]
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit("\n", 1)[0] + f"\n… ({len(text) - limit:,} more characters not shown)"
+
+
+# What each kind of unit is, for the prompt.
+UNIT_WORDS = {"style": "Style rule", "section": "Section", "file": "Whole file"}
+
+
+def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
     what = {"added": "It is new on this branch.", "deleted": "This branch removes it.",
             "modified": "This branch changes it."}[subject["change"]]
+    kind = subject["kind"]
     parts = [
         "You explain code changes to people who don't write code: product managers, designers and testers.",
         "",
         f"File: {subject['path']}",
-        f"{subject['kind'].capitalize()}: {subject['name']}. {what}",
+        f"{UNIT_WORDS.get(kind, kind.capitalize())}: {subject['name']}. {what}",
     ]
+    if kind == "file":
+        parts.append("It is not split into functions (settings, styles, a page, data, docs or a script): "
+                     "explain what the file is for and what its change does.")
     if context.get("commits"):
         parts += ["Commit titles on this branch:", *[f"- {c}" for c in context["commits"][:12]]]
     if context.get("used_by"):
         parts += ["Used in:", *[f"- {u['path']}:{u['line']}: {u['text']}" for u in context["used_by"][:6]]]
-    if subject.get("before"):
-        parts += ["", "Before:", "```", subject["before"], "```"]
-    if subject.get("after"):
-        parts += ["", "After:" if subject.get("before") else "The code:", "```", subject["after"], "```"]
+    # Room for the code: what's left after the rest of the prompt (about 2,000 characters).
+    room = max(2_000, budget - 2_500)
+    if subject.get("diff"):
+        parts += ["", "The lines that changed (- removed, + added):", "```", _clip(subject["diff"], room), "```"]
+    else:
+        sides = [side for side in ("before", "after") if subject.get(side)]
+        for side in sides:
+            title = ("Before:" if side == "before" else "After:") if len(sides) == 2 else "The code:"
+            parts += ["", title, "```", _clip(subject[side], room // len(sides)), "```"]
     parts += [
         "",
         "Reply with only a JSON object and no other text, with these keys:",
@@ -233,35 +277,97 @@ def _function_prompt(subject: dict, context: dict) -> str:
     return "\n".join(parts)
 
 
-def _project_prompt(subject: dict, context: dict) -> str:
+def _project_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    # What each file is for, from the file-by-file notes written so far: as many as fit,
+    # one line each, so a small model still gets the whole picture.
+    notes = context.get("file_notes") or {}
+    context = {k: v for k, v in context.items() if k != "file_notes"}
     facts = json.dumps({**subject, **context}, indent=1)
+    lines, room = [], max(1_500, budget - len(facts) - 3_000)
+    for path, purpose in notes.items():
+        line = f"- {path}: {purpose}"
+        if room - len(line) < 0:
+            lines.append(f"- … and {len(notes) - len(lines)} more files")
+            break
+        lines.append(line)
+        room -= len(line) + 1
     return "\n".join([
-        "You explain software projects to people who don't write code: product managers, designers, new team members.",
+        "You write the knowledge transfer (KT) for a software project: what a new team member needs to take it "
+        "over, in words product managers and designers follow too.",
         "Here are facts about one project, read from its files and git history:",
         "```json",
         facts,
         "```",
+        *(["", "What each file is for:", *lines] if lines else []),
         "",
         "Reply with only a JSON object and no other text, with these keys:",
-        '"overview": three or four sentences on what the project is, what problem it solves and who uses it.',
-        '"how_it_works": a list of three to six short sentences that follow what happens, from what a person '
-        "does to what the project does in response, naming the parts involved.",
-        '"parts": a list of objects {"name": a part name exactly as given, "what": one sentence on its job}, '
-        "for the parts that matter most, at most eight.",
+        '"overview": three to five sentences on what the project is, what problem it solves and who uses it.',
+        '"how_it_works": a list of four to eight short sentences that follow what happens, from what a person '
+        "does to what the project does in response, naming the parts and files involved.",
+        '"parts": a list of objects {"name": a part name exactly as given, "what": one or two sentences on its '
+        "job and its most important files}, for every part given, at most twelve.",
+        '"flows": a list of up to four objects {"name": a main thing the project does, "steps": a list of short '
+        "sentences, in order, each naming the file that does that step}.",
+        '"start_here": a list of up to six objects {"path": a file path exactly as given, "why": one sentence}, '
+        "the files a new team member should read first, in order.",
         '"state": one or two sentences on how far along and how active it looks, from the history.',
         "Use plain words. When a technical term can't be avoided, explain it in brackets. Say only what the "
         "facts support; write \"unclear\" rather than guess.",
     ])
 
 
+def _file_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    """One file of the project's KT: what it is for, and each of its functions."""
+    outline = context.get("outline") or []
+    listed = []
+    for unit in outline[:MAX_OUTLINE]:
+        doc = f" — {unit['doc'].splitlines()[0][:160]}" if unit.get("doc") else ""
+        listed.append(f"- {unit['name']} ({unit['kind']}, line {unit['start']}): {unit['signature'][:160]}{doc}")
+    if len(outline) > MAX_OUTLINE:
+        listed.append(f"- … and {len(outline) - MAX_OUTLINE} more")
+    room = max(2_000, budget - sum(len(l) + 1 for l in listed) - 2_500)
+    project = context.get("project") or {}
+    parts = [
+        "You write the knowledge transfer (KT) for a software project, one file at a time, so a new team "
+        "member can take it over.",
+        "",
+        f"Project: {project.get('name') or 'unnamed'}" + (f". {project['description']}" if project.get("description") else ""),
+        f"File: {subject['path']}" + (f" (in the part \"{context['part']}\")" if context.get("part") else ""),
+    ]
+    if listed:
+        parts += ["Its functions, classes and types, as read from the code:", *listed]
+    parts += ["", "The file" + (" (cut to fit; the list above has all of it):" if len(context.get("text", "")) > room else ":"),
+              "```", _clip(context.get("text", ""), room), "```", "",
+              "Reply with only a JSON object and no other text, with these keys:",
+              '"purpose": two or three sentences on what this file is for, why the project needs it, and when it '
+              "is used.",
+              '"functions": a list of objects {"name": a name exactly as listed above, "what": one sentence on what '
+              "it does, what it takes and what it gives back}, for every one listed, in order. An empty list when "
+              "none are listed.",
+              '"connects": one or two sentences on which other files or parts it uses, or that use it, from its '
+              "imports and the names in it. \"unclear\" if the file doesn't show.",
+              '"notes": up to three short phrases on what to watch out for when changing it, such as settings it '
+              "reads, data it writes, or things that must stay in step elsewhere. An empty list if none.",
+              "Use plain words. When a technical term can't be avoided, explain it in brackets. Say only what the "
+              "code shows; write \"unclear\" rather than guess."]
+    return "\n".join(parts)
+
+
+MAX_OUTLINE = 60
+
+
 # The field an explanation can't be without.
-MAIN_FIELD = {"function": "summary", "project": "overview"}
-PROMPTS = {"function": _function_prompt, "project": _project_prompt}
+MAIN_FIELD = {"function": "summary", "project": "overview", "file": "purpose"}
+PROMPTS = {"function": _function_prompt, "project": _project_prompt, "file": _file_prompt}
 
 FIELDS = {
     "function": {"summary": str, "change": str, "improves": list, "tradeoffs": list, "check": (str, type(None))},
-    "project": {"overview": str, "how_it_works": list, "parts": list, "state": str},
+    "project": {"overview": str, "how_it_works": list, "parts": list, "flows": list, "start_here": list,
+                "state": str},
+    "file": {"purpose": str, "functions": list, "connects": str, "notes": list},
 }
+# The most items kept in each list of an answer.
+LIST_LIMITS = {"functions": MAX_OUTLINE, "parts": 12, "how_it_works": 8}
 
 
 def _run(prompt: str) -> str:
@@ -408,14 +514,21 @@ def _clean(kind: str, data: dict) -> dict:
         if expected is str and isinstance(value, list) and all(isinstance(v, str) for v in value):
             value = " ".join(value)  # sentences given as a list
         if expected is list:
-            value = [item for item in value if isinstance(item, (str, dict))][:8] if isinstance(value, list) else []
+            limit = LIST_LIMITS.get(name, 8)
+            value = [item for item in value if isinstance(item, (str, dict))][:limit] if isinstance(value, list) else []
         elif not isinstance(value, expected):
             value = None if type(None) in (expected if isinstance(expected, tuple) else (expected,)) else ""
         result[name] = value
     if kind == "project":
-        result["parts"] = [p for p in result["parts"] if isinstance(p, dict) and isinstance(p.get("name"), str)
-                           and isinstance(p.get("what"), str)]
+        result["parts"] = _pairs(result["parts"], "name", "what")
         result["how_it_works"] = [s for s in result["how_it_works"] if isinstance(s, str)]
+        result["start_here"] = _pairs(result["start_here"], "path", "why")[:6]
+        result["flows"] = [{"name": f["name"], "steps": [s for s in f["steps"] if isinstance(s, str)][:10]}
+                           for f in result["flows"][:4] if isinstance(f, dict) and isinstance(f.get("name"), str)
+                           and isinstance(f.get("steps"), list)]
+    elif kind == "file":
+        result["functions"] = _pairs(result["functions"], "name", "what")
+        result["notes"] = [s for s in result["notes"] if isinstance(s, str)][:3]
     else:
         result["improves"] = [s for s in result["improves"] if isinstance(s, str)]
         result["tradeoffs"] = [s for s in result["tradeoffs"] if isinstance(s, str)]
@@ -423,6 +536,12 @@ def _clean(kind: str, data: dict) -> dict:
         # Never kept: the page would show an empty description, every time.
         raise ExplainError("The AI's answer left out the description. Try again, or pick another model in Settings.")
     return result
+
+
+def _pairs(items: list, first: str, second: str) -> list[dict]:
+    """The items that are objects with both text fields, and only those fields."""
+    return [{first: item[first], second: item[second]} for item in items
+            if isinstance(item, dict) and isinstance(item.get(first), str) and isinstance(item.get(second), str)]
 
 
 def _complete(kind: str, result: dict) -> bool:

@@ -237,13 +237,18 @@ def _size(count) -> str | None:
     return f"{count / 1e9:.1f} GB" if isinstance(count, (int, float)) and count else None
 
 
+# Ollama reads only its first 2,048 or 4,096 tokens unless told otherwise, and cuts the rest
+# of a prompt without saying so. Explanations' prompts fit in this (see explain.py).
+NUM_CTX = 8192
+
+
 def _ollama_ask(model: str | None, system: str, prompt: str) -> str:
     if not model:
         ready = _ollama_status()
         if not ready["available"]:
             raise ProviderError(f"The local model isn't ready: {ready['detail']}.")
         model = ready["default_model"]
-    body = json.dumps({"model": model, "stream": False, "format": "json", "options": {"temperature": 0.2},
+    body = json.dumps({"model": model, "stream": False, "format": "json", "options": {"temperature": 0.2, "num_ctx": NUM_CTX},
                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]})
     request = urllib.request.Request(_ollama_url("/api/chat"), data=body.encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
@@ -1037,7 +1042,7 @@ def _hosted_chat(connection: dict, model: str, system: str, prompt: str, tokens:
                  timeout: float = TIMEOUT) -> str:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     if connection["style"] == "ollama":
-        options = {"temperature": 0.2, **({"num_predict": tokens} if tokens else {})}
+        options = {"temperature": 0.2, "num_ctx": NUM_CTX, **({"num_predict": tokens} if tokens else {})}
         reply = _hosted_call(connection, "/api/chat", {"model": model, "stream": False, "options": options,
                                                        "messages": messages}, timeout)
         return (reply.get("message") or {}).get("content") or ""

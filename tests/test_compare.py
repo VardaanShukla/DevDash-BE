@@ -1,7 +1,7 @@
 import pytest
 
 from conftest import git
-from devdash.compare import CompareError, compare, default_base, parse_patch
+from devdash.compare import CompareError, branch_details, compare, default_base, parse_patch, retire
 
 
 def by_path(result):
@@ -151,3 +151,113 @@ def test_state_changes_with_branches_commits_checkouts_and_edits(repo):
     assert state(repo, uncommitted=True) != first_edit
     git(repo, "commit", "-q", "-am", "edit")
     assert state(repo) not in seen
+
+
+def commit_file(repo, name, text="x = 1\n"):
+    (repo / name).write_text(text)
+    git(repo, "add", name)
+    git(repo, "commit", "-q", "-m", name)
+
+
+def test_branch_made_from_an_unmerged_branch_counts_only_its_own_changes(repo):
+    git(repo, "checkout", "-q", "-b", "first")
+    commit_file(repo, "first.py")
+    commit_file(repo, "first_more.py")
+    git(repo, "checkout", "-q", "-b", "second")  # made while on first, before first is merged
+
+    fresh = compare(repo)
+    assert (fresh["head"], fresh["ahead"], fresh["files"], fresh["commits"]) == ("second", 0, [], [])
+
+    commit_file(repo, "second.py")
+    result = compare(repo)
+    assert list(by_path(result)) == ["second.py"]
+    assert result["ahead"] == 1 and [c["subject"] for c in result["commits"]] == ["second.py"]
+    # The first branch still shows all of its own.
+    assert sorted(by_path(compare(repo, head="first"))) == ["first.py", "first_more.py"]
+
+
+def test_branch_made_from_an_unmerged_branch_with_uncommitted_work(repo):
+    git(repo, "checkout", "-q", "-b", "first")
+    commit_file(repo, "first.py")
+    git(repo, "checkout", "-q", "-b", "second")
+    (repo / "wip.py").write_text("y = 2\n")
+
+    assert list(by_path(compare(repo, uncommitted=True))) == ["wip.py"]
+
+
+def test_once_the_first_branch_is_merged_the_second_counts_from_main(repo):
+    git(repo, "checkout", "-q", "-b", "first")
+    commit_file(repo, "first.py")
+    git(repo, "checkout", "-q", "-b", "second")
+    commit_file(repo, "second.py")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--no-ff", "-m", "Merge first", "first")
+    commit_file(repo, "main.py")
+
+    result = compare(repo, head="second")
+    assert list(by_path(result)) == ["second.py"] and (result["ahead"], result["behind"]) == (1, 2)
+
+
+def test_branch_checked_out_from_the_remote_keeps_its_commits(tmp_path, repo):
+    git(repo, "checkout", "-q", "-b", "shared")
+    commit_file(repo, "shared.py")
+    git(repo, "checkout", "-q", "main")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(repo), str(clone))
+    git(clone, "checkout", "-q", "shared")  # a local copy of origin/shared, not a new branch
+
+    assert list(by_path(compare(clone))) == ["shared.py"]
+
+
+def test_rebased_branch_falls_back_to_where_it_left_main(repo):
+    git(repo, "checkout", "-q", "-b", "first")
+    commit_file(repo, "first.py")
+    git(repo, "checkout", "-q", "-b", "second")
+    commit_file(repo, "second.py")
+    git(repo, "rebase", "-q", "--onto", "main", "first", "second")
+
+    assert list(by_path(compare(repo))) == ["second.py"]
+
+
+def test_new_branch_with_nothing_committed_is_not_merged(repo):
+    git(repo, "branch", "fresh")
+    git(repo, "checkout", "-q", "-b", "done")
+    commit_file(repo, "done.py")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--ff-only", "done")
+
+    details = {b["name"]: b["merged"] for b in branch_details(repo, "main")}
+    assert details == {"main": False, "fresh": False, "done": True}
+
+
+def test_merged_and_deleted_branches_go_after_15_minutes():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+    details = [{"name": "open", "merged": False, "gone": False},
+               {"name": "merged", "merged": True, "gone": False},
+               {"name": "gone", "merged": False, "gone": True},
+               {"name": "here", "merged": True, "gone": True}]
+
+    first = {b["name"]: b["removes_at"] for b in retire("1", details, "here", now=start)}
+    assert first == {"open": None, "merged": "2026-10-26T12:15:00+00:00",
+                     "gone": "2026-10-26T12:15:00+00:00", "here": "2026-10-26T12:15:00+00:00"}
+    # The clock runs from when each was first seen, not from each look.
+    later = retire("1", details, "here", now=start + timedelta(minutes=14))
+    assert [b["removes_at"] for b in later if b["name"] == "merged"] == ["2026-10-26T12:15:00+00:00"]
+    # After 15 minutes they're gone, except the checked-out branch; other projects keep their own clock.
+    after = retire("1", details, "here", now=start + timedelta(minutes=15))
+    assert [b["name"] for b in after] == ["open", "here"]
+    assert [b["name"] for b in retire("2", details, None, now=start + timedelta(minutes=15))] == [
+        "open", "merged", "gone", "here"]
+
+
+def test_a_branch_that_gets_new_work_starts_its_clock_again():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+    merged = [{"name": "b", "merged": True, "gone": False}]
+    retire("1", merged, None, now=start)
+    retire("1", [{"name": "b", "merged": False, "gone": False}], None, now=start + timedelta(minutes=5))
+    [again] = retire("1", merged, None, now=start + timedelta(minutes=20))
+    assert again["removes_at"] == "2026-10-26T12:35:00+00:00"

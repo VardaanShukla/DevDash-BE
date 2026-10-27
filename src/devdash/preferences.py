@@ -36,8 +36,8 @@ OLD_DEFAULTS = {
 }
 SHORTCUTS_VERSION = 3
 # Home's widgets in their default order, and the ones hidden until the person shows them.
-WIDGETS = ("ai", "projects", "branch", "flow", "map", "calendar")
-DEFAULT_HIDDEN = ("map", "calendar")
+WIDGETS = ("pulse", "ai", "branch", "keys", "flow", "commits", "map", "calendar")
+DEFAULT_HIDDEN = ("calendar",)
 DEFAULTS = {
     "theme": "dark",
     # None until the person picks: the dashboard asks once.
@@ -70,7 +70,7 @@ def get() -> dict:
         defaults[action] = "" if key in taken else key
     ai = saved.get("ai") or {}
     return {"theme": saved.get("theme", DEFAULTS["theme"]), "uncommitted": saved.get("uncommitted"),
-            "shortcuts": {**defaults, **chosen}, "home": _layout(saved.get("home")),
+            "shortcuts": {**defaults, **chosen}, "home": _layout(_since_redesign(saved.get("home"))),
             "ai": {"provider": ai.get("provider") if ai.get("provider") in AI_PROVIDERS else "claude",
                    "models": {k: v for k, v in (ai.get("models") or {}).items() if k in AI_PROVIDERS and isinstance(v, str)}}}
 
@@ -154,6 +154,14 @@ def _layout(saved) -> dict:
     hidden = [w for w in saved.get("hidden", DEFAULT_HIDDEN) if w in WIDGETS] if "order" in saved else list(DEFAULT_HIDDEN)
     hidden += [w for w in new if w in DEFAULT_HIDDEN and "order" in saved]
     return {"order": order + new, "hidden": [w for w in WIDGETS if w in hidden]}
+
+
+def _since_redesign(saved):
+    """A layout saved before Home's redesign (it had Projects, and no dial) goes back to the
+    new default, so the new widgets don't all land at the bottom of the old order."""
+    if isinstance(saved, dict) and "pulse" not in (saved.get("order") or []):
+        return None
+    return saved
 
 
 def _checked_layout(value) -> dict:

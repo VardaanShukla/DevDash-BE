@@ -2,14 +2,16 @@
 is built with, how to run it, its parts, and who has worked on it and when. All of it is
 read from git, so it is the same for everyone and needs no AI."""
 
+import hashlib
 import json
 import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from devdash import git
-from devdash.projectmap import WORKTREE, _files, project_map, readable
+from devdash import functions, git
+from devdash.capture.record import _ignored
+from devdash.projectmap import LANGUAGES, WORKTREE, _area_for, _areas, _files, _name, project_map, readable
 
 try:
     import tomllib
@@ -95,6 +97,49 @@ TECH = {
     "click": "Builds the command-line tool",
     "typer": "Builds the command-line tool",
 }
+
+
+# The knowledge transfer reads the project's own text files: not images, fonts, media,
+# lockfiles or build output, and not files too big to be anyone's code.
+KT_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg", ".pdf", ".zip", ".gz",
+                    ".tar", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".webm", ".mov", ".wav",
+                    ".exe", ".dll", ".so", ".dylib", ".bin", ".pyc", ".jar", ".map", ".db", ".sqlite"}
+MAX_KT_FILES = 400
+MAX_KT_BYTES = 300_000
+
+
+def kt_files(repo: Path, revision: str) -> list[dict]:
+    """The files a knowledge transfer explains, each with its part of the project, in the
+    order a reader takes them: part by part, then by path."""
+    revision = readable(repo, revision)
+    files = _files(repo, revision)
+    areas = _areas([path for path, _, _ in files])
+    found = []
+    for path, sha, size in files:
+        suffix = PurePosixPath(path).suffix.lower()
+        if suffix in KT_SKIP_SUFFIXES or size > MAX_KT_BYTES or _ignored(path) or ".min." in path:
+            continue
+        if revision == WORKTREE:
+            # No blob to name the content by: its hash, so an edit is explained again.
+            sha = hashlib.sha1((repo / path).read_bytes()).hexdigest()
+        area = _area_for(path, areas)
+        found.append({"path": path, "sha": sha, "bytes": size, "part": _name(area), "area": area,
+                      "language": LANGUAGES.get(suffix) or "Other"})
+    found.sort(key=lambda f: (f["area"] != "", f["area"], f["path"].count("/"), f["path"]))
+    return [{k: v for k, v in f.items() if k != "area"} for f in found[:MAX_KT_FILES]]
+
+
+def kt_file(repo: Path, revision: str, path: str) -> dict | None:
+    """One file of the knowledge transfer: its text and the functions in it."""
+    entry = next((f for f in kt_files(repo, revision) if f["path"] == path), None)
+    if entry is None:
+        return None
+    text = _show(repo, readable(repo, revision), path)
+    if "\x00" in text[:8000]:
+        return None
+    outline = [{k: unit[k] for k in ("name", "kind", "start", "signature", "doc")}
+               for unit in functions.units(path, text)]
+    return {**entry, "text": text, "outline": outline}
 
 
 def summary(repo: Path, revision: str) -> dict:

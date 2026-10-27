@@ -58,11 +58,11 @@ def test_number_keys_follow_the_menu_and_old_saved_defaults_move_with_them():
 def test_home_widgets_can_be_reordered_hidden_and_reset():
     api = client()
     home = api.get("/api/preferences").json()["home"]
-    assert home == {"order": ["ai", "projects", "branch", "flow", "map", "calendar"], "hidden": ["map", "calendar"]}
-    changed = api.put("/api/preferences", json={"home": {"order": ["flow", "ai"], "hidden": ["projects"]}}).json()
+    assert home == {"order": ["pulse", "ai", "branch", "keys", "flow", "commits", "map", "calendar"], "hidden": ["calendar"]}
+    changed = api.put("/api/preferences", json={"home": {"order": ["flow", "ai"], "hidden": ["keys"]}}).json()
     # Widgets left out join at the end, hidden if they are by default; a hidden one stays listed.
-    assert changed["home"] == {"order": ["flow", "ai", "projects", "branch", "map", "calendar"],
-                               "hidden": ["projects", "map", "calendar"]}
+    assert changed["home"] == {"order": ["flow", "ai", "pulse", "branch", "keys", "commits", "map", "calendar"],
+                               "hidden": ["keys", "calendar"]}
     assert api.get("/api/preferences").json()["home"] == changed["home"]
     assert api.put("/api/preferences", json={"home": {"order": ["sky"], "hidden": []}}).status_code == 400
     assert api.post("/api/preferences/reset-home", json={}).json()["home"] == home
@@ -72,3 +72,10 @@ def test_shortcuts_go_back_to_the_defaults():
     api = client()
     api.put("/api/preferences", json={"shortcuts": {"sync": "r"}})
     assert api.post("/api/preferences/reset-shortcuts", json={}).json()["shortcuts"]["sync"] == "s"
+
+
+def test_a_home_layout_from_before_the_redesign_goes_back_to_the_default():
+    from devdash import preferences
+
+    old = {"order": ["ai", "projects", "branch", "flow", "map", "calendar"], "hidden": ["map", "calendar"]}
+    assert preferences._layout(preferences._since_redesign(old)) == preferences._layout(None)
