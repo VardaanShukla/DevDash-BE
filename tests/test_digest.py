@@ -61,7 +61,7 @@ def test_digest_lists_claudes_prompts_with_functions_and_flags(repo):
     assert result["date"] == date.today().isoformat()
     assert result["claude"] == {"prompts": 2, "files": 5, "functions": 4, "additions": 8, "deletions": 6,
                                      "risky": 1, "uncommitted": 1, "undone": 0, "watched_files": 0}
-    assert result["you"] == {"files": 1, "additions": 1, "deletions": 0, "commits": 1}
+    assert "you" not in result
 
     newest, older = result["changes"]
     assert newest["prompt"] == "Make login faster and drop the slow test" and newest["commit"] is None

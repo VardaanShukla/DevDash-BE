@@ -20,6 +20,7 @@ MAX_DIFF_LINES = 200
 
 BRACE_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".cs", ".php",
                   ".c", ".h", ".cpp", ".swift"}
+JS_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
 STYLE_SUFFIXES = {".css", ".scss", ".sass", ".less"}
 DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
 HEADING = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$")
@@ -29,10 +30,13 @@ HEADING = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$")
 JS_DECLARATIONS = [
     ("function", re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[<(]")),
     ("function", re.compile(
-        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?"
-        r"(?:function\b|\([^)]*\)?\s*(?::[^=]+)?=>|\(|[A-Za-z_$][\w$]*\s*=>)")),
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:<[^>]*>\s*)?"
+        r"(?:function\b|\([^)]*\)?\s*(?::[^=]+)?=>|\(\s*\{?\s*$|[A-Za-z_$][\w$]*\s*=>"
+        # A component wrapped as it's made: React.forwardRef(...), memo(...).
+        r"|(?:[A-Za-z_$][\w$]*\.)?(?:forwardRef|memo)\b)")),
     ("class", re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)")),
-    ("type", re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)")),
+    # Not `type X,` inside a multi-line import.
+    ("type", re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)\s*(?:[<={]|extends\b|$)")),
     ("function", re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*[(\[]")),
     ("function", re.compile(r"^\s*(?:pub(?:\([\w:]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)")),
     ("type", re.compile(r"^\s*(?:pub(?:\([\w:]+\))?\s+)?(?:struct|trait|enum)\s+([A-Za-z_]\w*)")),
@@ -274,6 +278,7 @@ def _call_name(func) -> str | None:
 def _brace_units(path: str, text: str) -> list[dict]:
     lines = text.splitlines()
     component_file = PurePosixPath(path).suffix in (".tsx", ".jsx")
+    js = PurePosixPath(path).suffix in JS_SUFFIXES
     found: list[dict] = []
     classes: list[tuple[str, int, int]] = []
     i = 0
@@ -288,7 +293,7 @@ def _brace_units(path: str, text: str) -> list[dict]:
         if not kind:
             i += 1
             continue
-        end = _block_end(lines, i)
+        end = _block_end(lines, i, js=js)
         if kind == "class":
             classes.append((name, i + 1, end))
             # Methods are units of their own; a class with none is one unit.
@@ -315,16 +320,20 @@ def _declaration(line: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _block_end(lines: list[str], start: int) -> int:
+def _block_end(lines: list[str], start: int, js: bool = False) -> int:
     """The 1-based last line of the declaration starting at `start` (0-based): where its
-    first brace block closes, or the first statement end when it has no block."""
+    first brace block closes, or the first statement end when it has no block. With `js`,
+    TypeScript's object types (`): { a: T } {`) aren't taken for the body, and an apostrophe
+    inside a word (JSX text: `Antigravity's`) doesn't start a string."""
     depth = 0
     opened = False
     in_block_comment = False
+    quote = None
     for i in range(start, len(lines)):
         line = lines[i]
         j = 0
-        quote = None
+        if quote != "`":
+            quote = None  # only template strings run over several lines
         while j < len(line):
             ch = line[j]
             nxt = line[j + 1] if j + 1 < len(line) else ""
@@ -343,10 +352,12 @@ def _block_end(lines: list[str], start: int) -> int:
                 in_block_comment = True
                 j += 1
             elif ch in "'\"`":
-                quote = ch
+                if not (js and ch == "'" and j and line[j - 1].isalpha() and nxt.isalpha()):
+                    quote = ch
             elif ch in "{([":
                 depth += 1
-                if ch == "{":
+                before = line[:j].rstrip()[-1:] or _last_char(lines, start, i)
+                if ch == "{" and not (js and depth == 1 and before in (":", "|", "&")):
                     opened = True
             elif ch in "})]":
                 depth -= 1
@@ -355,12 +366,23 @@ def _block_end(lines: list[str], start: int) -> int:
             elif ch == ";" and depth == 0:
                 return i + 1
             j += 1
-        # A one-line arrow or type with no braces and no semicolon.
-        if depth == 0 and not opened and i > start and not line.rstrip().endswith((",", "=>", "(", "=", "|", "&")):
+        # A one-line arrow or type with no braces and no semicolon, unless the next line
+        # carries it on (a type's next `| member`).
+        following = lines[i + 1].lstrip()[:1] if i + 1 < len(lines) else ""
+        if depth == 0 and not opened and i > start and not line.rstrip().endswith((",", "=>", "(", "=", "|", "&", "<")) \
+                and following not in ("|", "&", ".", "?", ":", ">"):
             return i + 1
         if depth == 0 and not opened and i == start and line.rstrip().endswith((")", '"', "'")) and "=>" in line:
             return i + 1
     return len(lines)
+
+
+def _last_char(lines: list[str], start: int, i: int) -> str:
+    """The last character before line i, back to line start, that isn't blank."""
+    for k in range(i - 1, start - 1, -1):
+        if lines[k].strip():
+            return lines[k].rstrip()[-1]
+    return ""
 
 
 def _brace_unit(lines: list[str], start: int, end: int, name: str, kind: str) -> dict:

@@ -183,8 +183,50 @@ do_install() {
   git_tools
   build_page
   say "Installing DevDash…"
+  rm -rf "$BE/build"
   pipx install "$BE"
+  mkdir -p "$DATA"
+  source_stamp > "$STAMP"
   after_install
+}
+
+# The newest change to the code DevDash is installed from: DevDash-BE's code (not its built
+# page, which is made from DevDash-FE) and DevDash-FE's. Start reinstalls when it moves on.
+STAMP="$DATA/installed-from"
+source_stamp() {
+  python3 - "$BE" "$FE" <<'PY'
+import os, sys
+be, fe = sys.argv[1:3]
+roots = [os.path.join(be, "src"), os.path.join(be, "pyproject.toml"), os.path.join(fe, "src"),
+         os.path.join(fe, "index.html"), os.path.join(fe, "package.json")]
+newest = 0.0
+for root in roots:
+    if os.path.isfile(root):
+        newest = max(newest, os.path.getmtime(root))
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("web", "__pycache__", "node_modules")]
+        for name in files:
+            newest = max(newest, os.path.getmtime(os.path.join(folder, name)))
+print(int(newest))
+PY
+}
+
+# pipx builds from DevDash-BE; setuptools' build/ folder keeps files deleted since, so
+# it's cleared first. Then the stamp notes what this install was made from.
+reinstall() {
+  rm -rf "$BE/build"
+  pipx install --force "$BE"
+  mkdir -p "$DATA"
+  source_stamp > "$STAMP"
+}
+
+# Start runs the installed copy, so edits to the code show only after reinstalling it.
+update_if_changed() {
+  [ -f "$STAMP" ] && [ "$(source_stamp)" = "$(cat "$STAMP")" ] && return 0
+  say "DevDash's code changed since it was installed. Updating…"
+  build_page
+  stop_running
+  reinstall
 }
 
 # Reinstalls over whatever is there, broken or not. Your data stays.
@@ -194,7 +236,7 @@ repair() {
   build_page
   say "Reinstalling DevDash…"
   stop_running
-  pipx install --force "$BE"
+  reinstall
   after_install
 }
 
@@ -231,6 +273,7 @@ uninstall() {
 
 start() {
   command -v devdash >/dev/null || fail "DevDash isn't installed. Choose Install first."
+  update_if_changed
   if pgrep -f 'devdash serve' >/dev/null; then
     echo "DevDash is already running."
   else

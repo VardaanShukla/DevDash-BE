@@ -501,3 +501,76 @@ def test_prompts_left_open_by_a_dead_session_are_closed_with_what_was_seen(repo)
     row = connect().execute("SELECT t.ended_at, c.file_path FROM turns t JOIN changes c ON c.turn_id = t.id").fetchone()
     assert row["ended_at"] and row["file_path"] == "app.py"
     assert record.health()["stuck"] == 0
+
+
+def test_a_background_task_notification_keeps_the_sessions_request(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="build the docker image")
+    send("stop", repo)
+    send("user-prompt-submit", repo, prompt="<task-notification>\n<task-id>b1</task-id>\n</task-notification>")
+    (repo / "app.py").write_text("def hello():\n    return 'built'\n")
+    send("stop", repo)
+
+    prompts = [r["prompt"] for r in connect().execute("SELECT prompt FROM turns ORDER BY id")]
+    assert prompts == ["build the docker image", "build the docker image"]
+
+
+def test_a_prompt_from_the_parent_folder_takes_the_branch_of_what_it_changed(tmp_path):
+    parent = tmp_path / "Projects"
+    be = parent / "BE"
+    be.mkdir(parents=True)
+    git(be, "init", "-q", "-b", "feature")
+    git(be, "config", "user.email", "test@example.com")
+    git(be, "config", "user.name", "Test")
+    (be / "app.py").write_text("x = 1\n")
+    git(be, "add", ".")
+    git(be, "commit", "-q", "-m", "initial")
+    connect_claude(be)
+
+    send("user-prompt-submit", parent, prompt="bump x")
+    (be / "app.py").write_text("x = 2\n")  # through a shell command: no Edit hook
+    send("stop", parent)
+
+    turn = connect().execute("SELECT branch FROM turns").fetchone()
+    assert turn["branch"] == "feature"
+
+
+def test_a_commit_made_during_a_prompt_that_never_stopped_keeps_its_files(repo):
+    connect_claude(repo)
+    send("user-prompt-submit", repo, prompt="first")
+    (repo / "notes.md").write_text("by hand\n")
+    git(repo, "add", "notes.md")
+    git(repo, "commit", "-q", "-m", "Add notes")  # left to the prompt, which never stops
+    send("user-prompt-submit", repo, prompt="second")  # closes the first without its Stop
+
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    rows = connect().execute("SELECT file_path FROM changes WHERE commit_sha = ?", (sha,)).fetchall()
+    assert [r["file_path"] for r in rows] == ["notes.md"]
+
+
+def test_commits_made_while_the_git_hook_was_missing_are_caught_up(repo, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from devdash.capture import install, scan
+
+    connect_claude(repo)
+    (repo / "a.py").write_text("a = 1\n")
+    git(repo, "add", "a.py")
+    git(repo, "commit", "-q", "-m", "Add a")  # recorded by the hook
+    (repo / ".git" / "hooks" / "post-commit").unlink()  # as after cloning the project again
+    later = (datetime.now() + timedelta(minutes=1)).isoformat(timespec="seconds")
+    monkeypatch.setenv("GIT_AUTHOR_DATE", later)
+    monkeypatch.setenv("GIT_COMMITTER_DATE", later)
+    (repo / "b.py").write_text("b = 1\n")
+    git(repo, "add", "b.py")
+    git(repo, "commit", "-q", "-m", "Add b")  # no hook ran
+
+    scan.scan_all()
+
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    conn = connect()
+    assert conn.execute("SELECT message FROM commits WHERE sha = ?", (sha,)).fetchone()["message"] == "Add b"
+    assert [r["file_path"] for r in conn.execute("SELECT file_path FROM changes WHERE commit_sha = ?", (sha,))] == ["b.py"]
+    assert install.git_hook_installed(repo)
+    scan.scan_all()  # nothing twice
+    assert conn.execute("SELECT COUNT(*) FROM changes WHERE commit_sha = ?", (sha,)).fetchone()[0] == 1

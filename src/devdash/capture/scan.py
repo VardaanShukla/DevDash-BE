@@ -7,10 +7,12 @@ Edits written straight to disk with no hook and no commit can't be told apart fr
 own, so they aren't guessed at: they show as uncommitted work like any other edit."""
 
 import re
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from devdash import git
+from devdash import git, paths
+from devdash.capture import record
 from devdash.capture.record import _ignored
 from devdash.store import connect, now
 
@@ -29,17 +31,30 @@ def scan_all() -> None:
     one `git log` per project."""
     conn = connect()
     try:
-        repos = conn.execute("SELECT id, path FROM repos").fetchall()
+        repos = conn.execute("SELECT id, path, claude FROM repos").fetchall()
         for repo in repos:
             root = Path(repo["path"])
             if not root.is_dir():
                 continue
             try:
                 scan(conn, repo)
+                if repo["claude"]:
+                    _catch_up(conn, repo)
             except git.GitError:
                 continue  # not a git folder any more, or no commits yet
     finally:
         conn.close()
+
+
+def _catch_up(conn, repo) -> None:
+    """Commits the post-commit hook missed, such as after cloning the project again. A
+    failure here is logged and never keeps the digest from showing."""
+    try:
+        with conn:
+            record.catch_up(conn, repo)
+    except Exception:
+        with paths.error_log().open("a", encoding="utf-8") as log:
+            log.write(f"{now()} catch-up {repo['path']}\n{traceback.format_exc()}\n")
 
 
 def scan(conn, repo) -> int:

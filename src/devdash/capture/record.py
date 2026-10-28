@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
-from devdash import git, paths
+from devdash import git, paths, prompts
 from devdash.capture import install
 from devdash.store import connect, now
 
@@ -208,7 +208,14 @@ def _prompt(conn, repos, payload, cwd: Path, tool: str = "claude", prompt: str |
     if stale is not None:
         # Without its Stop there's no telling when it ended, so only its Edit and Write count.
         _finish_turn(conn, stale, watch=False)
-    turn = _new_turn(conn, _repo_for(repos, cwd), session_id, prompt or payload.get("prompt") or UNKNOWN_PROMPT, tool)
+    text = prompt or payload.get("prompt") or UNKNOWN_PROMPT
+    if prompts.is_task_notification(text):
+        # Claude Code saying a background command finished: nobody typed it, so the work
+        # that follows is still for the session's last request.
+        previous = conn.execute("SELECT prompt FROM turns WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                                (session_id,)).fetchone()
+        text = previous["prompt"] if previous else text
+    turn = _new_turn(conn, _repo_for(repos, cwd), session_id, text, tool)
     folders = [Path(w).resolve() for w in payload.get("workspaces") or []] or [cwd]
     _start_watch(conn, turn["id"], repos, folders)
 
@@ -415,6 +422,9 @@ def _finish_turn(conn, turn, watch: bool) -> None:
             recorded += 1
     if recorded:
         _link_commits_made_during(conn, turn["id"])
+        if turn["branch"] is None:
+            _set_branch(conn, turn["id"])
+    _record_commits_made_during(conn, turn["id"])
     conn.execute("DELETE FROM turn_files WHERE turn_id = ?", (turn["id"],))
     conn.execute("DELETE FROM turn_repos WHERE turn_id = ?", (turn["id"],))
     session = conn.execute(
@@ -505,6 +515,52 @@ def _link_commits_made_during(conn, turn_id: int) -> None:
             )
 
 
+def _set_branch(conn, turn_id: int) -> None:
+    """A prompt started outside any project (their parent folder, say) has no branch until
+    it changes something: it takes the branch of the project it changed."""
+    for row in conn.execute(
+        "SELECT DISTINCT r.path FROM changes c JOIN repos r ON r.id = c.repo_id WHERE c.turn_id = ? ORDER BY c.id",
+        (turn_id,),
+    ).fetchall():
+        branch = git.branch(Path(row["path"]))
+        if branch:
+            conn.execute("UPDATE turns SET branch = ? WHERE id = ?", (branch, turn_id))
+            return
+
+
+def _record_commits_made_during(conn, turn_id: int) -> None:
+    """The post-commit hook leaves a commit's files to the prompt watching the project (see
+    _commit). The files of it the prompt didn't record (its Stop never came, or it never
+    changed them) are recorded here from the commit, so no commit ends up with no files."""
+    for row in conn.execute(
+        "SELECT w.repo_id, w.head, r.path FROM turn_repos w JOIN repos r ON r.id = w.repo_id WHERE w.turn_id = ?",
+        (turn_id,),
+    ).fetchall():
+        root = Path(row["path"])
+        try:
+            shas = git.run(root, "rev-list", f"{row['head']}..HEAD" if row["head"] else "HEAD").split()
+        except git.GitError:
+            continue
+        for sha in shas:
+            commit = conn.execute("SELECT message FROM commits WHERE sha = ?", (sha,)).fetchone()
+            if commit is None:
+                continue
+            source = "ai" if AI_TRAILER.search(commit["message"]) else "human"
+            for file_path in git.commit_files(root, sha):
+                if _ignored(file_path) or conn.execute(
+                    "SELECT 1 FROM changes WHERE repo_id = ? AND file_path = ? AND (commit_sha = ? OR turn_id = ?)",
+                    (row["repo_id"], file_path, sha, turn_id),
+                ).fetchone():
+                    continue
+                diff = git.commit_file_diff(root, sha, file_path)
+                if diff:
+                    conn.execute(
+                        "INSERT INTO changes (repo_id, commit_sha, file_path, diff, source, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (row["repo_id"], sha, file_path, diff, source, now()),
+                    )
+
+
 def _changed_since_start(conn, turn_id: int, known: set) -> list[dict]:
     """Files that differ from how they were when the prompt started and that no snapshot
     covers: they were the same as the commit then, so that commit has their before copy."""
@@ -550,9 +606,10 @@ def _at_commit(root: Path, head: str | None, path: str) -> tuple[bool, str | Non
         return True, None
 
 
-def _commit(conn, repo) -> None:
+def _commit(conn, repo, sha: str = "HEAD", at: str | None = None) -> None:
+    """Records a commit as it's made, or later (`at` its time) when its hook didn't run."""
     root = Path(repo["path"])
-    info = git.commit_info(root)
+    info = git.commit_info(root, sha)
     sha = info["sha"]
     if conn.execute("SELECT 1 FROM commits WHERE sha = ?", (sha,)).fetchone():
         return
@@ -560,13 +617,14 @@ def _commit(conn, repo) -> None:
         "INSERT INTO commits (sha, repo_id, branch, message, authored_at) VALUES (?, ?, ?, ?, ?)",
         (sha, repo["id"], git.branch(root), info["message"], info["authored_at"]),
     )
-    prompt_turn = _take_prompt_file(conn, repo)
+    # A prompt file waiting now was written for the next commit, not for one made earlier.
+    prompt_turn = _take_prompt_file(conn, repo) if at is None else None
     source = "ai" if prompt_turn or AI_TRAILER.search(info["message"]) else "human"
     # A Claude prompt is running and watching this project: its Stop records these files
     # and links them to this commit (see _link_commits_made_during), so they aren't added here.
     # A prompt open for hours lost its Stop, and is no reason to leave a commit unrecorded.
     recent = (datetime.now(timezone.utc) - WATCH_HOURS).isoformat(timespec="seconds")
-    watched = conn.execute(
+    watched = at is None and conn.execute(
         "SELECT 1 FROM turn_repos w JOIN turns t ON t.id = w.turn_id"
         " WHERE w.repo_id = ? AND t.ended_at IS NULL AND t.started_at >= ?",
         (repo["id"], recent),
@@ -576,8 +634,10 @@ def _commit(conn, repo) -> None:
             "UPDATE changes SET commit_sha = ?"
             " WHERE repo_id = ? AND file_path = ? AND commit_sha IS NULL AND source = 'ai'"
             # An undone change didn't land in this commit, even if its file did.
-            " AND (turn_id IS NULL OR turn_id NOT IN (SELECT turn_id FROM undone WHERE turn_id IS NOT NULL))",
-            (sha, repo["id"], file_path),
+            " AND (turn_id IS NULL OR turn_id NOT IN (SELECT turn_id FROM undone WHERE turn_id IS NOT NULL))"
+            # Recorded late, a commit can't hold changes made after it.
+            " AND (? IS NULL OR created_at <= ?)",
+            (sha, repo["id"], file_path, at, at),
         ).rowcount
         if linked or watched or _ignored(file_path):
             continue
@@ -586,8 +646,44 @@ def _commit(conn, repo) -> None:
             conn.execute(
                 "INSERT INTO changes (repo_id, turn_id, commit_sha, file_path, diff, source, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (repo["id"], prompt_turn, sha, file_path, diff, source, now()),
+                (repo["id"], prompt_turn, sha, file_path, diff, source, at or now()),
             )
+
+
+def catch_up(conn, repo) -> int:
+    """Records commits made on this branch while the project's post-commit hook was missing
+    (the project was cloned again, say), and puts the hook back. Only commits by this
+    machine's git user, made after the project's first recorded commit, so neither old
+    history nor work pulled from others counts. Returns how many were recorded."""
+    root = Path(repo["path"])
+    # Times keep the offset they were made with, so they're compared as times, not text.
+    first = min((datetime.fromisoformat(row[0]) for row in
+                 conn.execute("SELECT authored_at FROM commits WHERE repo_id = ?", (repo["id"],))), default=None)
+    if first is None:
+        return 0
+    if not install.git_hook_installed(root):
+        try:
+            install.install_git_hook(root)
+        except (install.InitError, OSError):
+            pass
+    me = git.run(root, "config", "user.email", ok=(0, 1)).strip().lower()
+    if not me:
+        return 0
+    out = git.run(root, "log", "HEAD", "--no-merges", f"--since={first.isoformat()}",
+                  "--format=%H%x00%ae%x00%ce%x00%cI%x00%aI")
+    found = 0
+    for line in reversed(out.splitlines()):  # oldest first, as they were made
+        sha, author, committer, committed, authored = line.split("\x00")
+        if author.lower() != me or committer.lower() == "noreply@github.com" or datetime.fromisoformat(authored) <= first:
+            continue
+        if conn.execute("SELECT 1 FROM commits WHERE sha = ?", (sha,)).fetchone() or conn.execute(
+            "SELECT 1 FROM commits WHERE repo_id = ? AND authored_at = ? AND message = ?",
+            (repo["id"], authored, git.commit_info(root, sha)["message"]),
+        ).fetchone():
+            continue  # recorded, or a rebased copy of one that was
+        _commit(conn, repo, sha, at=datetime.fromisoformat(committed).astimezone(timezone.utc).isoformat(timespec="seconds"))
+        found += 1
+    return found
 
 
 def _take_prompt_file(conn, repo) -> int | None:

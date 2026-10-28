@@ -681,13 +681,6 @@ class DigestClaude(BaseModel):
     watched_files: int  # changed during a prompt but not by its Edit or Write
 
 
-class DigestYou(BaseModel):
-    files: int
-    additions: int
-    deletions: int
-    commits: int
-
-
 class ChangeRef(BaseModel):
     change: str  # a digest change's id
 
@@ -723,7 +716,6 @@ class ExplainUnitRequest(BaseModel):
 class Digest(BaseModel):
     date: str
     claude: DigestClaude
-    you: DigestYou
     changes: list[DigestChange]
 
 
@@ -811,9 +803,21 @@ class AuthStatus(BaseModel):
     username: str | None = None  # only for a signed-in browser
 
 
+class HomeWidget(BaseModel):
+    id: str
+    type: str  # what it shows: greeting, ai-today, total-changes, … (preferences.WIDGETS)
+    x: int  # its column (0 to 11) and row on Home's 12-column grid, and its size in columns and rows
+    y: int
+    w: int
+    h: int
+    style: str = "glass"  # glass, solid, outline, tinted or bare
+    accent: str = ""  # the colour its highlights take; "" is the theme's
+    title: str = ""  # the person's own title; "" is the widget's usual one
+    options: dict[str, bool | int | float | str] = {}  # the widget's own settings
+
+
 class HomeLayout(BaseModel):
-    order: list[str]  # every widget, in the order Home shows them
-    hidden: list[str]
+    widgets: list[HomeWidget]
 
 
 class Preferences(BaseModel):
@@ -821,7 +825,7 @@ class Preferences(BaseModel):
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
     ai: ExplainerChoice  # which AI writes explanations, and with which model
-    home: HomeLayout  # the Home widgets in order, and the ones hidden
+    home: HomeLayout  # Home's widgets, each placed on the grid with its style and settings
 
 
 class PreferenceChange(BaseModel):

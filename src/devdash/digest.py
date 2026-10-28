@@ -84,16 +84,10 @@ def digest(day: date | None = None) -> dict:
     conn.close()
 
     groups: dict[tuple, dict] = {}
-    human = {"files": set(), "additions": 0, "deletions": 0, "commits": set()}
     for row in rows:
-        item = _file(row)
         if row["source"] == "human":
-            human["files"].add((row["repo_id"], row["file_path"]))
-            human["additions"] += item["additions"]
-            human["deletions"] += item["deletions"]
-            if row["commit_sha"]:
-                human["commits"].add(row["commit_sha"])
-            continue
+            continue  # the digest is the AI's changes; yours are in Changes and Commits
+        item = _file(row)
         # A prompt, or an AI-co-authored commit nobody's prompt was recorded for.
         # One prompt can edit several projects when Claude Code starts in their parent folder.
         key = ("turn", row["turn_id"], row["repo_id"]) if row["turn_id"] else ("commit", row["commit_sha"], row["repo_id"])
@@ -127,12 +121,6 @@ def digest(day: date | None = None) -> dict:
             # Files changed while a prompt ran but not through its Edit or Write (a shell
             # command, or possibly the person at the same time): counted, but less certain.
             "watched_files": len({(g["repo"]["id"], f["path"]) for g in live for f in g["files"] if f["watched"]}),
-        },
-        "you": {
-            "files": len(human["files"]),
-            "additions": human["additions"],
-            "deletions": human["deletions"],
-            "commits": len(human["commits"]),
         },
         "changes": changes,
     }
