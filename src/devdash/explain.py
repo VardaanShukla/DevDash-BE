@@ -235,8 +235,13 @@ UNIT_WORDS = {"style": "Style rule", "section": "Section", "file": "Whole file"}
 
 
 def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
-    what = {"added": "It is new on this branch.", "deleted": "This branch removes it.",
-            "modified": "This branch changes it."}[subject["change"]]
+    if subject.get("scope") == "prompt":
+        # One prompt's change, from the AI changes page, rather than a whole branch's.
+        what = {"added": "One prompt to an AI coding tool added it.", "deleted": "One prompt to an AI coding tool removed it.",
+                "modified": "One prompt to an AI coding tool changed it."}[subject["change"]]
+    else:
+        what = {"added": "It is new on this branch.", "deleted": "This branch removes it.",
+                "modified": "This branch changes it."}[subject["change"]]
     kind = subject["kind"]
     parts = [
         "You explain code changes to people who don't write code: product managers, designers and testers.",
@@ -247,6 +252,8 @@ def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHAR
     if kind == "file":
         parts.append("It is not split into functions (settings, styles, a page, data, docs or a script): "
                      "explain what the file is for and what its change does.")
+    if context.get("prompt"):
+        parts += ["What the AI was asked:", _clip(context["prompt"], 1_500)]
     if context.get("commits"):
         parts += ["Commit titles on this branch:", *[f"- {c}" for c in context["commits"][:12]]]
     if context.get("used_by"):
@@ -547,3 +554,134 @@ def _pairs(items: list, first: str, second: str) -> list[dict]:
 def _complete(kind: str, result: dict) -> bool:
     main = result.get(MAIN_FIELD[kind])
     return isinstance(main, str) and bool(main.strip())
+
+
+# Questions about the project, from the Ask screen. The answer is built from what DevDash
+# already knows (the project's description, the KT's file-by-file notes) plus the code of the
+# few files the question is about, and never saved: each question is asked as it comes.
+# It only explains: asked to write or change code, it says so and explains in words.
+MAX_QUESTION = 2_000
+MAX_HISTORY = 6
+MAX_READ = 3
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-/]{2,}")
+# Words in nearly every question, which would match every file.
+_COMMON = {"the", "and", "for", "does", "what", "how", "why", "where", "which", "who", "this", "that", "with",
+           "file", "files", "function", "functions", "project", "code", "work", "works", "used", "use", "into",
+           "from", "about", "explain", "there", "when", "are", "is", "can", "you", "our", "its", "it's", "part",
+           "parts", "app", "make", "makes", "doing", "do", "does", "have", "has", "between", "fit", "together", "write",
+           "writes", "change", "changes", "add", "adds", "new", "should", "would", "could", "please"}
+
+
+def pick_files(text: str, files: list[dict], limit: int = MAX_READ) -> list[str]:
+    """The files a question is most likely about, best first: named by path or file name,
+    then by a function in them, then by words in their KT note. None when nothing matches,
+    for a question about the whole project."""
+    words = {w.lower().strip(".-/") for w in _WORD.findall(text)} - _COMMON
+    words.discard("")
+    if not words:
+        return []
+    scored = []
+    for file in files:
+        path = file["path"].lower()
+        name = path.rsplit("/", 1)[-1]
+        stem = name.split(".", 1)[0]
+        note = file.get("explanation") or {}
+        functions = {f["name"].lower().rsplit(".", 1)[-1] for f in note.get("functions", [])}
+        score = 0
+        for word in words:
+            if word == path or word == name:
+                score += 10
+            elif word == stem or ("/" in word and path.endswith(word)):
+                score += 6
+            elif word in functions:
+                score += 4
+            elif len(word) > 3 and word in path:
+                score += 2
+            elif len(word) > 5 and word in (note.get("purpose") or "").lower():
+                score += 1
+        if score:
+            scored.append((score, file["path"]))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, path in scored[:limit]]
+
+
+def answer(question: str, history: list[dict], context: dict) -> dict:
+    """The AI's answer to a question about the project. `context` holds the project's
+    facts and description, every KT file with its note, and the text of the files picked
+    for the question."""
+    budget = prompt_budget()
+    prompt = _fit(redact(_ask_prompt(question, history, context, budget)), budget)
+    text = _run(prompt)
+    known = {f["path"] for f in context.get("files", [])}
+    try:
+        data = _parse(text)
+    except ExplainError:
+        # A small model that answered in plain words: the words are the answer.
+        data = {"answer": text}
+    reply = data.get("answer")
+    if isinstance(reply, list) and all(isinstance(r, str) for r in reply):
+        reply = "\n\n".join(reply)
+    if not isinstance(reply, str) or not reply.strip():
+        raise ExplainError("The AI didn't answer. Ask again, or pick another model in Settings.")
+    cited = [p for p in data.get("files", []) if isinstance(p, str) and p in known] if isinstance(data.get("files"), list) else []
+    return {"answer": reply.strip(), "files": list(dict.fromkeys(cited))[:8]}
+
+
+def _ask_prompt(question: str, history: list[dict], context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    project = context.get("project") or {}
+    about = context.get("explanation") or {}
+    parts = [
+        "You answer questions about one software project for someone learning it: a new team member, a "
+        "product manager or a tester. You explain how the project works. You never write, fix or change code, "
+        "and you don't give code to copy. If you are asked to write or change code, say in one sentence that "
+        "you only explain the project, then explain in words which files and functions such a change would touch.",
+        "",
+        f"Project: {project.get('name') or 'unnamed'}" + (f". {project['description']}" if project.get("description") else ""),
+    ]
+    if about.get("overview"):
+        parts += ["What it is:", about["overview"]]
+        if about.get("how_it_works"):
+            parts += ["How it works:", *[f"- {s}" for s in about["how_it_works"]]]
+        if about.get("parts"):
+            parts += ["Its parts:", *[f"- {p['name']}: {p['what']}" for p in about["parts"]]]
+    elif project.get("tech"):
+        parts += ["Built with:", *[f"- {t}" for t in project["tech"][:12]]]
+
+    reading = context.get("reading") or []
+    # Room for the code of the files the question is about; the file list gets what's left.
+    code_room = max(1_500, (budget - 4_000) // 2)
+    files = context.get("files") or []
+    listed, room = [], max(1_000, budget - code_room - 4_000 - sum(len(p) for p in parts))
+    for file in files:
+        note = file.get("explanation")
+        line = f"- {file['path']}" + (f": {note['purpose']}" if note else "")
+        if room - len(line) < 0:
+            listed.append(f"- … and {len(files) - len(listed)} more files")
+            break
+        listed.append(line)
+        room -= len(line) + 1
+    if listed:
+        parts += ["", "The project's files" + (", with what each is for where it's known:" if any(f.get("explanation") for f in files) else ":"),
+                  *listed]
+
+    for file in reading:
+        note = file.get("explanation") or {}
+        parts += ["", f"The file {file['path']}:"]
+        if note.get("functions"):
+            parts += ["Its functions:", *[f"- {f['name']}: {f['what']}" for f in note["functions"][:30]]]
+        parts += ["```", _clip(file.get("text", ""), code_room // max(1, len(reading))), "```"]
+
+    turns = [t for t in history if t.get("role") in ("user", "assistant") and isinstance(t.get("text"), str)][-MAX_HISTORY:]
+    if turns:
+        parts += ["", "The conversation so far:"]
+        parts += [f"{'Them' if t['role'] == 'user' else 'You'}: {_clip(t['text'], 800)}" for t in turns]
+    parts += [
+        "", "Their question:", _clip(question, MAX_QUESTION), "",
+        "Reply with only a JSON object and no other text, with these keys:",
+        '"answer": your answer in plain words, a few short paragraphs at most. Name files by their path and '
+        "functions by their name in `backticks`. Lines starting with \"- \" make a list.",
+        '"files": a list of the file paths, exactly as given above, that your answer is about. An empty list if none.',
+        "Say only what the facts and code above show. When they don't show the answer, say so, and name the "
+        "files that are most likely to have it.",
+    ]
+    return "\n".join(parts)

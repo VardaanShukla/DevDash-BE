@@ -93,6 +93,34 @@ function Assert-Ready {
     }
 }
 
+# git, and GitHub's gh tool, which Sign in with GitHub on the dashboard uses. gh is optional:
+# without it the dashboard asks for a pasted token instead. gh older than 2.17 can't sign in
+# from the dashboard, so an old one is upgraded.
+function Test-GhOld {
+    $line = (gh --version 2>$null | Select-Object -First 1)
+    if ($line -notmatch "gh version (\d+)\.(\d+)") { return $true }
+    $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+    return ($major -lt 2) -or ($major -eq 2 -and $minor -lt 17)
+}
+
+function Assert-GitTools {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Install-WithWinget "Git" "Git.Git" }
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh -and -not (Test-GhOld)) { return }
+    if ($gh) { Say "Your gh is too old to sign in from the dashboard ($(gh --version | Select-Object -First 1))." }
+    else { Say "GitHub's gh tool isn't installed. Sign in with GitHub on the dashboard uses it." }
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "Install it from https://cli.github.com, or connect GitHub on the dashboard by pasting a token."
+        return
+    }
+    $verb = if ($gh) { "upgrade" } else { "install" }
+    Write-Host "This runs: winget $verb -e --id GitHub.cli"
+    if (-not (YesNo "Do it now?" "y")) { Write-Host "Skipped. You can still connect GitHub on the dashboard by pasting a token."; return }
+    winget $verb -e --id GitHub.cli --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Host "winget couldn't $verb gh; connect GitHub on the dashboard by pasting a token instead." }
+    Update-Path
+}
+
 function Build-Page {
     if (-not (Test-Path $FE)) { return }
     Say "Building the page from DevDash-FE..."
@@ -123,6 +151,7 @@ function After-Install {
 function Install-DevDash {
     if (Test-Installed) { Say "DevDash is already installed. Choose Repair to reinstall it."; return }
     Assert-Ready
+    Assert-GitTools
     Build-Page
     Say "Installing DevDash..."
     Pipx install $BE
@@ -133,6 +162,7 @@ function Install-DevDash {
 # Reinstalls over whatever is there, broken or not. Your data stays.
 function Repair-DevDash {
     Assert-Ready
+    Assert-GitTools
     Build-Page
     Say "Reinstalling DevDash..."
     Stop-Running

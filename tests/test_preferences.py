@@ -50,7 +50,8 @@ def test_number_keys_follow_the_menu_and_old_saved_defaults_move_with_them():
     prefs = client().get("/api/preferences").json()
     keys = prefs["shortcuts"]
     assert prefs["theme"] == "light" and prefs["uncommitted"] is True
-    assert keys["view:changes"] == "4" and keys["view:commits"] == "5" and keys["view:project"] == "6"
+    assert keys["view:ask"] == "4"
+    assert keys["view:changes"] == "5" and keys["view:commits"] == "6" and keys["view:project"] == "7"
     assert keys["view:overview"] == "" and keys["view:map"] == ""  # sections of Home now
     assert "view:constellation" not in keys and "view:planner" not in keys  # screens since removed
 
@@ -79,3 +80,19 @@ def test_a_home_layout_from_before_the_redesign_goes_back_to_the_default():
 
     old = {"order": ["ai", "projects", "branch", "flow", "map", "calendar"], "hidden": ["map", "calendar"]}
     assert preferences._layout(preferences._since_redesign(old)) == preferences._layout(None)
+
+
+def test_keys_saved_before_ask_joined_the_menu_move_down_one():
+    import json
+
+    from devdash.store import connect
+
+    saved = {"view:changes": "4", "view:commits": "5", "view:project": "6", "sync": "r"}
+    conn = connect()
+    with conn:
+        conn.execute("INSERT INTO settings (name, value) VALUES ('preferences', ?)",
+                     (json.dumps({"shortcuts": saved, "shortcuts_version": 3}),))
+    conn.close()
+    keys = client().get("/api/preferences").json()["shortcuts"]
+    assert (keys["view:ask"], keys["view:changes"], keys["view:project"]) == ("4", "5", "7")
+    assert keys["sync"] == "r"  # picked by the person: kept

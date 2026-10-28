@@ -60,6 +60,18 @@ class DigestError(ValueError):
     pass
 
 
+class NotFound(DigestError):
+    pass
+
+
+_SELECT = ("SELECT c.id, c.repo_id, r.name AS repo_name, r.path AS repo_path, c.turn_id, c.commit_sha,"
+           " c.file_path, c.diff, c.source, c.via, c.created_at, t.prompt, t.branch, t.started_at,"
+           " m.message, m.branch AS commit_branch, m.found_by, s.tool"
+           " FROM changes c JOIN repos r ON r.id = c.repo_id"
+           " LEFT JOIN turns t ON t.id = c.turn_id LEFT JOIN commits m ON m.sha = c.commit_sha"
+           " LEFT JOIN sessions s ON s.id = t.session_id")
+
+
 def digest(day: date | None = None) -> dict:
     day = day or datetime.now().astimezone().date()
     start = datetime.combine(day, time.min).astimezone()
@@ -67,16 +79,8 @@ def digest(day: date | None = None) -> dict:
     # Commits Claude made where no hook saw it, such as a cloud session that pushed.
     scan.scan_all()
     conn = connect()
-    rows = conn.execute(
-        "SELECT c.id, c.repo_id, r.name AS repo_name, r.path AS repo_path, c.turn_id, c.commit_sha,"
-        " c.file_path, c.diff, c.source, c.via, c.created_at, t.prompt, t.branch, t.started_at,"
-        " m.message, m.branch AS commit_branch, m.found_by, s.tool"
-        " FROM changes c JOIN repos r ON r.id = c.repo_id"
-        " LEFT JOIN turns t ON t.id = c.turn_id LEFT JOIN commits m ON m.sha = c.commit_sha"
-        " LEFT JOIN sessions s ON s.id = t.session_id"
-        " WHERE c.created_at >= ? AND c.created_at < ? ORDER BY c.created_at, c.id",
-        (_utc(start), _utc(end)),
-    ).fetchall()
+    rows = conn.execute(_SELECT + " WHERE c.created_at >= ? AND c.created_at < ? ORDER BY c.created_at, c.id",
+                        (_utc(start), _utc(end))).fetchall()
     conn.close()
 
     groups: dict[tuple, dict] = {}
@@ -132,6 +136,72 @@ def digest(day: date | None = None) -> dict:
         },
         "changes": changes,
     }
+
+
+def change(change_key: str) -> dict:
+    """One prompt's change (or one AI commit's) with its lines: each file's hunks and the
+    parts it touched (functions, or the whole file when it has none), each with only its
+    own lines, so the page can show exactly what the prompt changed and explain each part."""
+    match = undo.KEY.match(change_key)
+    if not match:
+        raise NotFound("No such change.")
+    kind, ref, repo_id = match[1], match[2], int(match[3])
+    where = " WHERE c.source = 'ai' AND c.repo_id = ? AND " + (
+        "c.turn_id = ?" if kind == "turn" else "c.turn_id IS NULL AND c.commit_sha = ?")
+    conn = connect()
+    rows = conn.execute(_SELECT + where + " ORDER BY c.created_at, c.id",
+                        (repo_id, int(ref) if kind == "turn" else ref)).fetchall()
+    conn.close()
+    if not rows:
+        raise NotFound("No such change.")
+    group = _group(rows[0])
+    hunks: dict[str, list[dict]] = {}
+    for row in rows:
+        item = _file(row, keep_hunks=True)
+        hunks.setdefault(item["path"], []).extend(item.pop("hunks"))
+        _add(group, row, item)
+    result = _finish(group)
+    result["undone_at"] = undo.undone().get(result["id"])
+    for file in result["files"]:
+        file["hunks"] = hunks.get(file["path"], [])
+        file["units"] = units(file)
+    return result
+
+
+def units(file: dict) -> list[dict]:
+    """The parts of a file one change touched, each with the lines that belong to it: a
+    changed line belongs to the nearest declaration above it, as in compare._functions.
+    A file with no functions (styles, settings, docs) is one part, the whole file."""
+    parts: dict[str, list[str]] = {}
+    for hunk in file["hunks"]:
+        context = hunk["context"]
+        current = (compare._declared(context) or [context])[0] if context else None
+        started: set[str | None] = set()
+        for line in hunk["lines"]:
+            names = compare._declared(line["text"])
+            if names:
+                current = names[0]
+            name = current if any(f["name"] == current for f in file["functions"]) else None
+            if name not in started:
+                started.add(name)
+                parts.setdefault(name, []).append(
+                    f"@@ -{hunk['old_start']},{hunk['old_lines']} +{hunk['new_start']},{hunk['new_lines']} @@")
+            sign = {"add": "+", "delete": "-", "context": " "}[line["kind"]]
+            parts[name].append(sign + line["text"])
+    found = [{"name": fn["name"], "kind": "function", "change": fn["change"], "diff": "\n".join(parts[fn["name"]])}
+             for fn in file["functions"] if fn["name"] in parts]
+    if not found:
+        change = {"added": "added", "deleted": "deleted"}.get(file["status"], "modified")
+        lines = [line for hunk in file["hunks"] for line in hunk["lines"]]
+        diff = "\n".join(sum(parts.values(), [])) if lines else ""
+        found = [{"name": file["path"].rsplit("/", 1)[-1], "kind": "file", "change": change, "diff": diff}]
+    return found
+
+
+def unit_subject(path: str, unit: dict) -> dict:
+    """What a part's explanation depends on, so the same lines are explained once."""
+    return {"path": path, "name": unit["name"], "kind": unit["kind"], "change": unit["change"],
+            "diff": unit["diff"], "scope": "prompt"}
 
 
 def _prompt_of(group: dict) -> str:
@@ -220,7 +290,7 @@ def _risky(flags: list[dict]) -> bool:
     return any(flag["kind"] in RISKY for flag in flags)
 
 
-def _file(row) -> dict:
+def _file(row, keep_hunks: bool = False) -> dict:
     """One recorded diff as a file entry with its line counts, functions and flags."""
     text = row["diff"]
     path = row["file_path"]
@@ -240,6 +310,7 @@ def _file(row) -> dict:
     compare._finish(item)
     flags = _flags(item)
     return {
+        **({"hunks": item["hunks"]} if keep_hunks else {}),
         "path": path,
         "status": item["status"],
         "additions": item["additions"],

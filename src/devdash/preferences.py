@@ -11,7 +11,7 @@ THEMES = ("dark", "light")
 # What a shortcut can do. Going to a screen is "view:<screen>".
 # The side menu's screens in order, numbered 1, 2, … by default; then the screens that are
 # sections of Home (This branch, Branch flow, Project map), which have no key unless set.
-MENU = ("home", "digest", "summary", "changes", "commits", "project")
+MENU = ("home", "digest", "summary", "ask", "changes", "commits", "project")
 VIEWS = (*MENU, "overview", "flow", "map", "help", "settings")
 ACTIONS = (*(f"view:{view}" for view in VIEWS), "theme", "uncommitted", "sync", "next-file", "previous-file")
 DEFAULT_SHORTCUTS = {
@@ -33,8 +33,12 @@ OLD_DEFAULTS = {
     2: {**{f"view:{view}": str(n) for n, view in enumerate(
         ("home", "digest", "summary", "constellation", "changes", "commits", "planner", "project"), start=1)},
         "view:settings": ",", "theme": "t", "uncommitted": "u", "sync": "s", "next-file": "j", "previous-file": "k"},
+    # Before Ask joined the menu, under Summary.
+    3: {**{f"view:{view}": str(n) for n, view in enumerate(
+        ("home", "digest", "summary", "changes", "commits", "project"), start=1)},
+        "view:settings": ",", "theme": "t", "uncommitted": "u", "sync": "s", "next-file": "j", "previous-file": "k"},
 }
-SHORTCUTS_VERSION = 3
+SHORTCUTS_VERSION = 4
 # Home's widgets in their default order, and the ones hidden until the person shows them.
 WIDGETS = ("pulse", "ai", "branch", "keys", "flow", "commits", "map", "calendar")
 DEFAULT_HIDDEN = ("calendar",)

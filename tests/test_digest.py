@@ -359,3 +359,37 @@ def test_ending_the_session_closes_its_prompt(repo):
     send("session-end", repo, reason="prompt_input_exit")
     [change] = client().get("/api/digest").json()["changes"]
     assert change["prompt"] == "quit halfway" and [f["path"] for f in change["files"]] == ["app.py"]
+
+
+def test_a_prompts_change_opens_with_its_lines_and_each_function_explains(repo, monkeypatch):
+    (repo / "app.py").write_text("def hello():\n    return 'hi'\n\n\ndef bye():\n    return 'bye'\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "setup")
+    connect_claude(repo)
+    claude_edits(repo, "Shout and wave", {
+        "app.py": "def hello():\n    return 'HI'\n\n\ndef bye():\n    return 'bye'\n\n\ndef wave():\n    return 'o/'\n",
+        "style.css": "body { color: red; }\n",
+    })
+    change_id = client().get("/api/digest").json()["changes"][0]["id"]
+
+    found = client().get("/api/digest/change", params={"id": change_id}).json()
+    assert found["prompt"] == "Shout and wave"
+    files = {f["path"]: f for f in found["files"]}
+    assert files["app.py"]["hunks"]
+    units = {u["name"]: u for u in files["app.py"]["units"]}
+    assert set(units) == {"hello", "wave"}
+    assert "+    return 'HI'" in units["hello"]["diff"] and "o/" not in units["hello"]["diff"]
+    assert units["wave"]["change"] == "added" and units["wave"]["explanation"] is None
+    assert [u["kind"] for u in files["style.css"]["units"]] == ["file"]
+
+    asked = []
+    monkeypatch.setattr("devdash.explain._run", lambda prompt: asked.append(prompt) or json.dumps(
+        {"summary": "Says hello loudly.", "change": "Now shouts.", "improves": [], "tradeoffs": [], "check": None}))
+    answer = client().post("/api/digest/explain", json={"change": change_id, "path": "app.py", "name": "hello"}).json()
+    assert answer["summary"] == "Says hello loudly."
+    assert "Shout and wave" in asked[0] and "One prompt" in asked[0]
+    # Saved, so opening the change again shows it without asking.
+    again = client().get("/api/digest/change", params={"id": change_id}).json()
+    hello = next(u for f in again["files"] for u in f["units"] if u["name"] == "hello")
+    assert hello["explanation"]["summary"] == "Says hello loudly."
+    assert client().get("/api/digest/change", params={"id": "turn-999-1"}).status_code == 404
