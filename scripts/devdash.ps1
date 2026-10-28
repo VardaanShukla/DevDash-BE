@@ -93,6 +93,34 @@ function Assert-Ready {
     }
 }
 
+# git, and GitHub's gh tool, which Sign in with GitHub on the dashboard uses. gh is optional:
+# without it the dashboard asks for a pasted token instead. gh older than 2.17 can't sign in
+# from the dashboard, so an old one is upgraded.
+function Test-GhOld {
+    $line = (gh --version 2>$null | Select-Object -First 1)
+    if ($line -notmatch "gh version (\d+)\.(\d+)") { return $true }
+    $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+    return ($major -lt 2) -or ($major -eq 2 -and $minor -lt 17)
+}
+
+function Assert-GitTools {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Install-WithWinget "Git" "Git.Git" }
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if ($gh -and -not (Test-GhOld)) { return }
+    if ($gh) { Say "Your gh is too old to sign in from the dashboard ($(gh --version | Select-Object -First 1))." }
+    else { Say "GitHub's gh tool isn't installed. Sign in with GitHub on the dashboard uses it." }
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "Install it from https://cli.github.com, or connect GitHub on the dashboard by pasting a token."
+        return
+    }
+    $verb = if ($gh) { "upgrade" } else { "install" }
+    Write-Host "This runs: winget $verb -e --id GitHub.cli"
+    if (-not (YesNo "Do it now?" "y")) { Write-Host "Skipped. You can still connect GitHub on the dashboard by pasting a token."; return }
+    winget $verb -e --id GitHub.cli --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Host "winget couldn't $verb gh; connect GitHub on the dashboard by pasting a token instead." }
+    Update-Path
+}
+
 function Build-Page {
     if (-not (Test-Path $FE)) { return }
     Say "Building the page from DevDash-FE..."
@@ -123,21 +151,68 @@ function After-Install {
 function Install-DevDash {
     if (Test-Installed) { Say "DevDash is already installed. Choose Repair to reinstall it."; return }
     Assert-Ready
+    Assert-GitTools
     Build-Page
     Say "Installing DevDash..."
+    Clear-Build
     Pipx install $BE
     Check "Installing DevDash"
+    Save-Stamp
     After-Install
+}
+
+# The newest change to the code DevDash is installed from: DevDash-BE's code (not its built
+# page, which is made from DevDash-FE) and DevDash-FE's. Start reinstalls when it moves on.
+$Stamp = Join-Path $Data "installed-from"
+function Get-SourceStamp {
+    $files = @()
+    foreach ($root in @((Join-Path $BE "src"), (Join-Path $BE "pyproject.toml"), (Join-Path $FE "src"),
+                        (Join-Path $FE "index.html"), (Join-Path $FE "package.json"))) {
+        if (Test-Path $root) {
+            $files += Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch '[\\/](web|__pycache__|node_modules)[\\/]' }
+        }
+    }
+    if (-not $files) { return "0" }
+    $newest = ($files | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+    return [string]([DateTimeOffset]$newest).ToUnixTimeSeconds()
+}
+
+# pipx builds from DevDash-BE; setuptools' build folder keeps files deleted since, so
+# it's cleared first. Then the stamp notes what this install was made from.
+function Save-Stamp {
+    New-Item -ItemType Directory -Force -Path $Data | Out-Null
+    Set-Content -LiteralPath $Stamp -Value (Get-SourceStamp)
+}
+
+function Clear-Build {
+    $build = Join-Path $BE "build"
+    if (Test-Path $build) { Remove-Item -Recurse -Force -LiteralPath $build }
+}
+
+# Start runs the installed copy, so edits to the code show only after reinstalling it.
+function Update-IfChanged {
+    if ((Test-Path $Stamp) -and ((Get-Content -LiteralPath $Stamp -Raw).Trim() -eq (Get-SourceStamp))) { return }
+    Say "DevDash's code changed since it was installed. Updating..."
+    Build-Page
+    Stop-Running
+    Clear-Build
+    Pipx install --force $BE
+    Check "Updating DevDash"
+    Save-Stamp
 }
 
 # Reinstalls over whatever is there, broken or not. Your data stays.
 function Repair-DevDash {
     Assert-Ready
+    Assert-GitTools
     Build-Page
     Say "Reinstalling DevDash..."
     Stop-Running
+    Clear-Build
     Pipx install --force $BE
     Check "Reinstalling DevDash"
+    Save-Stamp
     After-Install
 }
 
@@ -165,6 +240,8 @@ function Uninstall-DevDash {
 function Start-DevDash {
     $exe = Get-Command devdash -ErrorAction SilentlyContinue
     if (-not $exe) { Fail "DevDash isn't installed. Choose Install first." }
+    Update-IfChanged
+    $exe = Get-Command devdash -ErrorAction SilentlyContinue
     if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*devdash*serve*" }) {
         Write-Host "DevDash is already running."
         Start-Process $Url

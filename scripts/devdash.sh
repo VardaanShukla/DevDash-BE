@@ -102,6 +102,58 @@ needs() {
   fi
 }
 
+# git, and GitHub's gh tool, which Sign in with GitHub on the dashboard uses. gh is optional:
+# without it the dashboard asks for a pasted token instead. Distributions often ship an old gh
+# (older ones can't sign in from the dashboard), so on apt systems it comes from GitHub's own
+# package list, as cli.github.com says.
+GH_MIN_MINOR=17  # gh 2.17 or newer
+gh_old() {
+  local major minor
+  read -r major minor < <(gh --version 2>/dev/null | head -n1 | sed -E 's/^gh version ([0-9]+)\.([0-9]+).*/\1 \2/')
+  [ -z "${major:-}" ] || [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "${minor:-0}" -lt "$GH_MIN_MINOR" ]; }
+}
+
+install_gh() {
+  if command -v apt-get >/dev/null; then
+    echo "This adds GitHub's package list (cli.github.com/packages) and runs: sudo apt-get install gh"
+    echo "Your password goes to sudo; this script never sees it."
+    yes_no "Go ahead?" y || return 1
+    command -v curl >/dev/null || system_install "curl" curl curl curl curl curl
+    local key
+    key="$(mktemp)"
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$key" || return 1
+    sudo mkdir -p -m 755 /etc/apt/keyrings
+    sudo install -m 644 "$key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    rm -f "$key"
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
+      sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    sudo apt-get update && sudo apt-get install -y gh
+  elif command -v brew >/dev/null; then
+    if command -v gh >/dev/null; then brew upgrade gh; else brew install gh; fi
+  elif command -v dnf >/dev/null; then
+    yes_no "This runs: sudo dnf install gh. Go ahead?" y && sudo dnf install -y gh
+  elif command -v pacman >/dev/null; then
+    yes_no "This runs: sudo pacman -S github-cli. Go ahead?" y && sudo pacman -S --needed --noconfirm github-cli
+  elif command -v zypper >/dev/null; then
+    yes_no "This runs: sudo zypper install gh. Go ahead?" y && sudo zypper install -y gh
+  else
+    return 1
+  fi
+}
+
+git_tools() {
+  command -v git >/dev/null || system_install "git" git git git git git
+  if command -v gh >/dev/null && ! gh_old; then return 0; fi
+  if command -v gh >/dev/null; then
+    say "Your gh is too old to sign in from the dashboard ($(gh --version | head -n1))."
+  else
+    say "GitHub's gh tool isn't installed. Sign in with GitHub on the dashboard uses it."
+  fi
+  if ! yes_no "Install the current gh?" y || ! install_gh; then
+    echo "Skipped. You can still connect GitHub on the dashboard by pasting a token."
+  fi
+}
+
 build_page() {
   [ -d "$FE" ] || return 0
   say "Building the page from DevDash-FE…"
@@ -128,19 +180,63 @@ do_install() {
     return
   fi
   needs
+  git_tools
   build_page
   say "Installing DevDash…"
+  rm -rf "$BE/build"
   pipx install "$BE"
+  mkdir -p "$DATA"
+  source_stamp > "$STAMP"
   after_install
+}
+
+# The newest change to the code DevDash is installed from: DevDash-BE's code (not its built
+# page, which is made from DevDash-FE) and DevDash-FE's. Start reinstalls when it moves on.
+STAMP="$DATA/installed-from"
+source_stamp() {
+  python3 - "$BE" "$FE" <<'PY'
+import os, sys
+be, fe = sys.argv[1:3]
+roots = [os.path.join(be, "src"), os.path.join(be, "pyproject.toml"), os.path.join(fe, "src"),
+         os.path.join(fe, "index.html"), os.path.join(fe, "package.json")]
+newest = 0.0
+for root in roots:
+    if os.path.isfile(root):
+        newest = max(newest, os.path.getmtime(root))
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("web", "__pycache__", "node_modules")]
+        for name in files:
+            newest = max(newest, os.path.getmtime(os.path.join(folder, name)))
+print(int(newest))
+PY
+}
+
+# pipx builds from DevDash-BE; setuptools' build/ folder keeps files deleted since, so
+# it's cleared first. Then the stamp notes what this install was made from.
+reinstall() {
+  rm -rf "$BE/build"
+  pipx install --force "$BE"
+  mkdir -p "$DATA"
+  source_stamp > "$STAMP"
+}
+
+# Start runs the installed copy, so edits to the code show only after reinstalling it.
+update_if_changed() {
+  [ -f "$STAMP" ] && [ "$(source_stamp)" = "$(cat "$STAMP")" ] && return 0
+  say "DevDash's code changed since it was installed. Updating…"
+  build_page
+  stop_running
+  reinstall
 }
 
 # Reinstalls over whatever is there, broken or not. Your data stays.
 repair() {
   needs
+  git_tools
   build_page
   say "Reinstalling DevDash…"
   stop_running
-  pipx install --force "$BE"
+  reinstall
   after_install
 }
 
@@ -177,6 +273,7 @@ uninstall() {
 
 start() {
   command -v devdash >/dev/null || fail "DevDash isn't installed. Choose Install first."
+  update_if_changed
   if pgrep -f 'devdash serve' >/dev/null; then
     echo "DevDash is already running."
   else

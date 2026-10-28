@@ -23,6 +23,7 @@ from devdash import flow as flow_module
 from devdash import functions as functions_module
 from devdash import preferences as preferences_module
 from devdash import git
+from devdash import github
 from devdash import home as home_module
 from devdash import projectmap
 from devdash import providers
@@ -520,6 +521,83 @@ class ExplainProjectRequest(BaseModel):
     fresh: bool = False
 
 
+class GitHubStatus(BaseModel):
+    configured: bool  # DevDash's GitHub App is set up (its client ID is known)
+    gh: bool  # GitHub's gh tool is installed, to sign in through
+    connected: bool
+    via: Literal["app", "gh", "token"] | None  # how the account was connected
+    login: str | None
+    name: str | None
+    avatar: str | None
+    install_url: str | None  # where to pick the repositories DevDash may read
+    # While signing in: the code to enter at verify_url, and when it runs out (Unix time).
+    code: str | None
+    verify_url: str | None
+    expires_at: int | None
+
+
+class GitHubRepo(BaseModel):
+    full_name: str
+    private: bool
+    description: str | None
+    default_branch: str | None
+    url: str | None
+    clone_url: str | None
+    updated_at: str | None
+    tracked: str | None  # the folder of the DevDash project cloned from it
+
+
+class GitHubConnect(BaseModel):
+    method: Literal["app", "gh"] = "app"
+
+
+class GitHubToken(BaseModel):
+    token: str
+
+
+class CloneRequest(BaseModel):
+    full_name: str
+    folder: str  # the folder to clone into; the clone gets its own folder inside it
+
+
+class PullRequest(BaseModel):
+    number: int
+    title: str
+    author: str | None
+    branch: str | None
+    base: str | None
+    draft: bool
+    url: str
+    updated_at: str | None
+
+
+class PullRequests(BaseModel):
+    repo: str | None  # owner/name on GitHub; None when the project has no GitHub remote
+    connected: bool
+    pulls: list[PullRequest]
+    error: str | None
+
+
+class AskTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+
+class AskRequest(BaseModel):
+    question: str
+    # The conversation so far, oldest first; only the last few turns are sent to the AI.
+    history: list[AskTurn] = []
+    head: str | None = None
+
+
+class AskAnswer(BaseModel):
+    answer: str
+    files: list[str]  # the files the answer is about
+    read: list[str]  # the files whose code the AI read for it
+    explained: int  # KT files with a note, which the AI also read
+    total: int
+
+
 class LastCommit(BaseModel):
     subject: str
     author: str
@@ -619,6 +697,29 @@ class Undone(BaseModel):
     undone_at: str | None
 
 
+class DigestUnit(BaseModel):
+    name: str
+    kind: Literal["function", "file"]  # file: the whole file, when it has no functions
+    change: Literal["added", "deleted", "modified"]
+    diff: str  # only this part's lines, as a unified diff
+    explanation: FunctionExplanation | None
+
+
+class DigestChangeFile(DigestFile):
+    hunks: list[Hunk]
+    units: list[DigestUnit]
+
+
+class DigestChangeDetail(DigestChange):
+    files: list[DigestChangeFile]
+
+
+class ExplainUnitRequest(BaseModel):
+    change: str  # a digest change's id
+    path: str
+    name: str
+
+
 class Digest(BaseModel):
     date: str
     claude: DigestClaude
@@ -710,9 +811,21 @@ class AuthStatus(BaseModel):
     username: str | None = None  # only for a signed-in browser
 
 
+class HomeWidget(BaseModel):
+    id: str
+    type: str  # what it shows: greeting, ai-today, total-changes, … (preferences.WIDGETS)
+    x: int  # its column (0 to 11) and row on Home's 12-column grid, and its size in columns and rows
+    y: int
+    w: int
+    h: int
+    style: str = "glass"  # glass, solid, outline, tinted or bare
+    accent: str = ""  # the colour its highlights take; "" is the theme's
+    title: str = ""  # the person's own title; "" is the widget's usual one
+    options: dict[str, bool | int | float | str] = {}  # the widget's own settings
+
+
 class HomeLayout(BaseModel):
-    order: list[str]  # every widget, in the order Home shows them
-    hidden: list[str]
+    widgets: list[HomeWidget]
 
 
 class Preferences(BaseModel):
@@ -720,7 +833,7 @@ class Preferences(BaseModel):
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
     ai: ExplainerChoice  # which AI writes explanations, and with which model
-    home: HomeLayout  # the Home widgets in order, and the ones hidden
+    home: HomeLayout  # Home's widgets, each placed on the grid with its style and settings
 
 
 class PreferenceChange(BaseModel):
@@ -1160,6 +1273,111 @@ def create_app() -> FastAPI:
         except explain_module.ExplainError as error:
             raise _explain_failed(error)
 
+    @app.post("/api/repos/{repo_id}/ask", response_model=AskAnswer)
+    def ask(repo_id: int, request: AskRequest):
+        """Answers a question about the project in plain words, from its description, the
+        KT's notes on each file and the code of the few files the question is about. It
+        explains only: it never writes code."""
+        question = request.question.strip()
+        if not question:
+            raise HTTPException(400, "ask a question")
+        if len(question) > explain_module.MAX_QUESTION:
+            raise HTTPException(400, f"keep the question under {explain_module.MAX_QUESTION:,} characters")
+        repo = _repo_path(repo_id)
+        revision = request.head or "HEAD"
+        try:
+            facts = summary_module.summary(repo, revision)
+            files = _kt_files(repo, request.head)
+            history = [turn.model_dump() for turn in request.history]
+            # A follow-up such as "and what calls it?" is about the files of the turn before.
+            recent = " ".join(t["text"] for t in history[-2:] if t["role"] == "user")
+            picked = explain_module.pick_files(question, files) or explain_module.pick_files(recent, files)
+            notes = {f["path"]: f["explanation"] for f in files}
+            reading = []
+            for path in picked:
+                file = summary_module.kt_file(repo, revision, path)
+                if file:
+                    reading.append({"path": path, "text": file["text"], "explanation": notes.get(path)})
+            context = {"project": _project_subject(facts), "files": files, "reading": reading,
+                       "explanation": explain_module.cached("project", _project_subject(facts))}
+            found = explain_module.answer(question, history, context)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        except explain_module.ExplainError as error:
+            raise _explain_failed(error)
+        return AskAnswer(**found, read=[f["path"] for f in reading],
+                         explained=sum(1 for f in files if f["explanation"]), total=len(files))
+
+    @app.get("/api/github", response_model=GitHubStatus)
+    def github_status():
+        return github.status()
+
+    @app.post("/api/github/connect", response_model=GitHubStatus)
+    def github_connect(body: GitHubConnect | None = None):
+        """Starts signing in to GitHub, through DevDash's app or the gh tool: the answer has
+        the code to enter on GitHub, or the account when gh was already signed in."""
+        try:
+            return github.start(body.method if body else "app")
+        except github.GitHubError as error:
+            raise HTTPException(502, str(error))
+
+    @app.post("/api/github/token", response_model=GitHubStatus)
+    def github_token(body: GitHubToken):
+        """Connects with a token pasted from github.com/settings/tokens."""
+        try:
+            return github.use_token(body.token)
+        except github.GitHubError as error:
+            raise HTTPException(400, str(error))
+
+    @app.post("/api/github/poll", response_model=GitHubStatus)
+    def github_poll():
+        """Whether the code has been entered on GitHub yet; connected once it has."""
+        try:
+            return github.poll()
+        except github.GitHubError as error:
+            raise HTTPException(400, str(error))
+
+    @app.delete("/api/github", response_model=GitHubStatus)
+    def github_disconnect():
+        return github.disconnect()
+
+    @app.get("/api/github/repos", response_model=list[GitHubRepo])
+    def github_repos():
+        """Your repositories that DevDash's GitHub App may read, with the project each is cloned as."""
+        conn = connect()
+        rows = conn.execute("SELECT path FROM repos").fetchall()
+        conn.close()
+        tracked = {}
+        for row in rows:
+            name = github.remote_name(Path(row["path"])) if Path(row["path"]).is_dir() else None
+            if name:
+                tracked[name] = row["path"]
+        try:
+            return github.repos(tracked)
+        except github.GitHubError as error:
+            raise HTTPException(409 if error.signed_out else 502, str(error))
+
+    @app.post("/api/github/clone", response_model=Repo, status_code=201)
+    def github_clone(body: CloneRequest):
+        """Clones one of your repositories into a folder and adds it as a project."""
+        try:
+            target = github.clone(body.full_name, _folder(body.folder))
+        except github.GitHubError as error:
+            raise HTTPException(409 if error.signed_out else 400, str(error))
+        return _repo(_row_for(_install(install.init, target)))
+
+    @app.get("/api/repos/{repo_id}/pulls", response_model=PullRequests)
+    def pull_requests(repo_id: int):
+        """The project's open pull requests on GitHub, when it has a GitHub remote and an
+        account is connected."""
+        name = github.remote_name(_repo_path(repo_id))
+        if name is None or not github.status()["connected"]:
+            return PullRequests(repo=name, connected=github.status()["connected"], pulls=[], error=None)
+        try:
+            return PullRequests(repo=name, connected=True, pulls=github.pulls(name), error=None)
+        except github.GitHubError as error:
+            return PullRequests(repo=name, connected=github.status()["connected"], pulls=[], error=str(error))
+
     @app.get("/api/home", response_model=list[ProjectCard])
     def home():
         """Every project at a glance, for the home page."""
@@ -1178,6 +1396,37 @@ def create_app() -> FastAPI:
             return digest_module.digest(digest_module.parse_day(day))
         except digest_module.DigestError as error:
             raise HTTPException(400, str(error))
+
+    @app.get("/api/digest/change", response_model=DigestChangeDetail)
+    def digest_change(id: str):
+        """One prompt's change with its lines, file by file, and each function (or whole
+        file) it touched with only its own lines and any explanation written earlier."""
+        try:
+            found = digest_module.change(id)
+        except digest_module.NotFound as error:
+            raise HTTPException(404, str(error))
+        for file in found["files"]:
+            for unit in file["units"]:
+                unit["explanation"] = explain_module.cached("function", digest_module.unit_subject(file["path"], unit))
+        return found
+
+    @app.post("/api/digest/explain", response_model=FunctionExplanation)
+    def explain_unit(body: ExplainUnitRequest):
+        """Asks the AI picked in Settings what one function (or file) of a prompt's change
+        does now and what the prompt changed about it."""
+        try:
+            found = digest_module.change(body.change)
+        except digest_module.NotFound as error:
+            raise HTTPException(404, str(error))
+        file = next((f for f in found["files"] if f["path"] == body.path), None)
+        unit = next((u for u in file["units"] if u["name"] == body.name), None) if file else None
+        if unit is None:
+            raise HTTPException(404, f"{body.name} didn't change in {body.path} in that prompt")
+        context = {"prompt": found["prompt"]} if found["prompt"] else {}
+        try:
+            return explain_module.explain("function", digest_module.unit_subject(body.path, unit), context)
+        except explain_module.ExplainError as error:
+            raise _explain_failed(error)
 
     @app.post("/api/digest/undo", response_model=Undone)
     def undo_change(body: ChangeRef):

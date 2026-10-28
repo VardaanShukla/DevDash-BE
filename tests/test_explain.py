@@ -468,3 +468,55 @@ def test_project_kt_reads_the_file_notes(repo, tmp_path, monkeypatch):
     assert prompts.read_text().count("What each file is for") == 1
     client().post(f"/api/repos/{listed['id']}/explain/project", json={"fresh": True})
     assert prompts.read_text().count("What each file is for") == 2
+
+
+def test_asking_about_the_project_reads_the_notes_and_the_files_it_names(repo, tmp_path, monkeypatch):
+    init(repo)
+    (repo / "billing.py").write_text("def charge(card, amount):\n    return card.pay(amount)\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "billing")
+    [listed] = client().get("/api/repos").json()
+    fake_claude(tmp_path, monkeypatch, {"purpose": "Takes payments.", "functions": [{"name": "charge", "what": "Charges a card."}],
+                                       "connects": "", "notes": []})
+    client().post(f"/api/repos/{listed['id']}/explain/file", json={"path": "billing.py"})
+
+    prompts = tmp_path / "prompts"
+    folder = tmp_path / "bin"
+    reply = json.dumps({"type": "result", "is_error": False, "result": json.dumps({
+        "answer": "`charge` takes the payment.", "files": ["billing.py", "not/a/file.py"]})})
+    (folder / "claude").write_text(f"#!/bin/sh\ncat >> {prompts}\ncat <<'EOF'\n{reply}\nEOF\n")
+    asked = client().post(f"/api/repos/{listed['id']}/ask", json={
+        "question": "What does charge do?", "history": [{"role": "user", "text": "Hi"}, {"role": "assistant", "text": "Hello"}]})
+    assert asked.status_code == 200
+    assert asked.json() == {"answer": "`charge` takes the payment.", "files": ["billing.py"], "read": ["billing.py"],
+                            "explained": 1, "total": 2}
+    prompt = prompts.read_text()
+    # The note on each file, the named file's code, the conversation, and never writing code.
+    assert "- billing.py: Takes payments." in prompt and "return card.pay(amount)" in prompt
+    assert "Them: Hi" in prompt and "You never write, fix or change code" in prompt
+    # Nothing is saved: asking again asks again.
+    client().post(f"/api/repos/{listed['id']}/ask", json={"question": "What does charge do?"})
+    assert prompt.count("Their question") == 1 and prompts.read_text().count("Their question") == 2
+
+    # A follow-up that names no file is about the file of the question before.
+    client().post(f"/api/repos/{listed['id']}/ask", json={
+        "question": "And who calls it?", "history": [{"role": "user", "text": "What is billing.py for?"}]})
+    assert prompts.read_text().split("Their question")[-2].count("return card.pay(amount)") == 1
+
+    assert client().post(f"/api/repos/{listed['id']}/ask", json={"question": "  "}).status_code == 400
+
+
+def test_a_plain_words_answer_is_kept_and_files_are_picked_by_name(monkeypatch):
+    from devdash import explain
+
+    files = [{"path": "src/api/client.ts", "explanation": None},
+             {"path": "src/App.tsx", "explanation": {"purpose": "The page.", "functions": [{"name": "App.render", "what": ""}]}},
+             {"path": "README.md", "explanation": None}]
+    assert explain.pick_files("What does client.ts do?", files) == ["src/api/client.ts"]
+    assert explain.pick_files("where is render called", files) == ["src/App.tsx"]
+    assert explain.pick_files("How does the project work?", files) == []
+
+    # A small model that ignores the JSON it was asked for.
+    monkeypatch.setattr(explain, "_run", lambda prompt: "It reads git and shows the changes.")
+    assert explain.answer("What is it?", [], {"files": files}) == {"answer": "It reads git and shows the changes.",
+                                                                    "files": []}
