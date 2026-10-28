@@ -681,6 +681,13 @@ class DigestClaude(BaseModel):
     watched_files: int  # changed during a prompt but not by its Edit or Write
 
 
+class DigestYou(BaseModel):
+    files: int
+    additions: int
+    deletions: int
+    commits: int
+
+
 class ChangeRef(BaseModel):
     change: str  # a digest change's id
 
@@ -716,6 +723,7 @@ class ExplainUnitRequest(BaseModel):
 class Digest(BaseModel):
     date: str
     claude: DigestClaude
+    you: DigestYou
     changes: list[DigestChange]
 
 
