@@ -22,6 +22,7 @@ from devdash import explain as explain_module
 from devdash import flow as flow_module
 from devdash import functions as functions_module
 from devdash import preferences as preferences_module
+from devdash import codecommit
 from devdash import git
 from devdash import github
 from devdash import home as home_module
@@ -571,8 +572,45 @@ class PullRequest(BaseModel):
     updated_at: str | None
 
 
+class CodeCommitProfile(BaseModel):
+    name: str
+    region: str | None  # the region the profile is set to, if any
+
+
+class CodeCommitStatus(BaseModel):
+    cli: bool  # the AWS CLI is installed, to sign requests with
+    connected: bool
+    profile: str | None
+    region: str | None
+    account: str | None  # the AWS account the profile is in
+    arn: str | None  # who the profile is, as AWS names it
+    profiles: list[CodeCommitProfile]  # the profiles on this computer, to pick from
+
+
+class CodeCommitConnect(BaseModel):
+    profile: str
+    region: str
+
+
+class CodeCommitRepo(BaseModel):
+    name: str
+    description: str | None
+    default_branch: str | None
+    url: str | None  # the repository in the AWS console
+    clone_url: str | None
+    updated_at: str | None
+    tracked: str | None  # the folder of the DevDash project cloned from it
+
+
+class CodeCommitClone(BaseModel):
+    name: str
+    folder: str  # the folder to clone into; the clone gets its own folder inside it
+
+
 class PullRequests(BaseModel):
-    repo: str | None  # owner/name on GitHub; None when the project has no GitHub remote
+    repo: str | None  # owner/name on GitHub or the name on CodeCommit; None when the project has neither remote
+    # Where the pull requests live; None when the project has neither remote.
+    host: Literal["github", "codecommit"] | None = None
     connected: bool
     pulls: list[PullRequest]
     error: str | None
@@ -1368,15 +1406,77 @@ def create_app() -> FastAPI:
 
     @app.get("/api/repos/{repo_id}/pulls", response_model=PullRequests)
     def pull_requests(repo_id: int):
-        """The project's open pull requests on GitHub, when it has a GitHub remote and an
-        account is connected."""
-        name = github.remote_name(_repo_path(repo_id))
+        """The project's open pull requests on GitHub or CodeCommit, when it has a remote
+        there and that account is connected."""
+        path = _repo_path(repo_id)
+        name = github.remote_name(path)
+        if name is None:
+            found = codecommit.remote_name(path)
+            if found is not None:
+                return _codecommit_pulls(*found)
         if name is None or not github.status()["connected"]:
-            return PullRequests(repo=name, connected=github.status()["connected"], pulls=[], error=None)
+            return PullRequests(repo=name, host="github" if name else None, connected=github.status()["connected"],
+                                pulls=[], error=None)
         try:
-            return PullRequests(repo=name, connected=True, pulls=github.pulls(name), error=None)
+            return PullRequests(repo=name, host="github", connected=True, pulls=github.pulls(name), error=None)
         except github.GitHubError as error:
-            return PullRequests(repo=name, connected=github.status()["connected"], pulls=[], error=str(error))
+            return PullRequests(repo=name, host="github", connected=github.status()["connected"], pulls=[], error=str(error))
+
+    def _codecommit_pulls(region: str | None, name: str) -> PullRequests:
+        connected = codecommit.region()
+        if connected is None:
+            return PullRequests(repo=name, host="codecommit", connected=False, pulls=[], error=None)
+        if region and region != connected:
+            return PullRequests(repo=name, host="codecommit", connected=True, pulls=[],
+                                error=f"This repository is in {region}, but CodeCommit is connected in {connected}. "
+                                      "Change the region in Settings → CodeCommit to see its pull requests.")
+        try:
+            return PullRequests(repo=name, host="codecommit", connected=True, pulls=codecommit.pulls(name), error=None)
+        except codecommit.CodeCommitError as error:
+            return PullRequests(repo=name, host="codecommit", connected=codecommit.region() is not None, pulls=[],
+                                error=str(error))
+
+    @app.get("/api/codecommit", response_model=CodeCommitStatus)
+    def codecommit_status():
+        return codecommit.status()
+
+    @app.post("/api/codecommit/connect", response_model=CodeCommitStatus)
+    def codecommit_connect(body: CodeCommitConnect):
+        """Connects with one of this computer's AWS profiles, once AWS accepts it."""
+        try:
+            return codecommit.use_profile(body.profile, body.region)
+        except codecommit.CodeCommitError as error:
+            raise HTTPException(400, str(error))
+
+    @app.delete("/api/codecommit", response_model=CodeCommitStatus)
+    def codecommit_disconnect():
+        return codecommit.disconnect()
+
+    @app.get("/api/codecommit/repos", response_model=list[CodeCommitRepo])
+    def codecommit_repos():
+        """The repositories in the connected region, with the project each is cloned as."""
+        conn = connect()
+        rows = conn.execute("SELECT path FROM repos").fetchall()
+        conn.close()
+        tracked = {}
+        connected = codecommit.region()
+        for row in rows:
+            found = codecommit.remote_name(Path(row["path"])) if Path(row["path"]).is_dir() else None
+            if found and found[0] in (None, connected):
+                tracked[found[1]] = row["path"]
+        try:
+            return codecommit.repos(tracked)
+        except codecommit.CodeCommitError as error:
+            raise HTTPException(409 if error.signed_out else 502, str(error))
+
+    @app.post("/api/codecommit/clone", response_model=Repo, status_code=201)
+    def codecommit_clone(body: CodeCommitClone):
+        """Clones one of the region's repositories into a folder and adds it as a project."""
+        try:
+            target = codecommit.clone(body.name, _folder(body.folder))
+        except codecommit.CodeCommitError as error:
+            raise HTTPException(409 if error.signed_out else 400, str(error))
+        return _repo(_row_for(_install(install.init, target)))
 
     @app.get("/api/home", response_model=list[ProjectCard])
     def home():
