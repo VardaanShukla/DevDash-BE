@@ -4,8 +4,8 @@ own guard (localhost only, signed in) covers these like every other route."""
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from devdash.team import client, host
@@ -26,6 +26,22 @@ class LinkRequest(BaseModel):
 
 class RootCertificate(BaseModel):
     pem: str = Field(max_length=20_000)
+
+
+class AccountRequest(BaseModel):
+    url: str = Field(max_length=300)
+    username: str = Field(max_length=32)
+    password: str = Field(max_length=200)
+    name: str | None = Field(default=None, max_length=60)
+    org_name: str | None = Field(default=None, max_length=60)
+    org_code: str | None = Field(default=None, max_length=20)
+    org_id: int | None = None
+    # True: a new account; False: one that exists.
+    new: bool = True
+
+
+class ModeRequest(BaseModel):
+    mode: Literal["individual", "org"] | None
 
 
 class ShareRequest(BaseModel):
@@ -109,6 +125,49 @@ def link_project(repo_id: int):
 @router.delete("/api/repos/{repo_id}/team")
 def unlink_project(repo_id: int):
     return _team(client.unlink, repo_id)
+
+
+@router.post("/api/team/check")
+def check_server(body: LinkRequest):
+    """Whether the team server answers, and whether this computer trusts its certificate."""
+    return _team(client.check, body.url)
+
+
+@router.post("/api/team/account")
+def account(body: AccountRequest):
+    """Makes an account (and an organisation, or joins one) or signs in, from DevDash's own
+    screens, and links this DevDash. The password goes to the team server only."""
+    try:
+        if body.new:
+            return client.register(body.url, body.username, body.name or "", body.password, body.org_name, body.org_code)
+        return client.login(body.url, body.username, body.password, body.org_code, body.org_id)
+    except client.TeamError as error:
+        if error.orgs:
+            return JSONResponse({"detail": str(error), "orgs": error.orgs}, status_code=409)
+        raise HTTPException(409 if error.signed_out else 400, str(error))
+
+
+@router.put("/api/team/mode")
+def set_mode(body: ModeRequest):
+    """Individual, in an organisation, or not picked yet (None shows the choice again)."""
+    return _team(client.set_mode, body.mode)
+
+
+@router.api_route("/api/team/org", methods=["GET", "PUT", "DELETE"])
+@router.api_route("/api/team/org/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def organisation(request: Request, path: str = ""):
+    """The linked organisation, managed from DevDash's own screens: passed on to the team
+    server as the person who linked this DevDash (their role there decides what's allowed)."""
+    body = None
+    if request.method in ("POST", "PUT"):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+    from starlette.concurrency import run_in_threadpool
+
+    query = f"?{request.url.query}" if request.url.query else ""
+    return await run_in_threadpool(_team, client.org_call, request.method, (f"/{path}" if path else "") + query, body)
 
 
 @router.post("/api/team/share")

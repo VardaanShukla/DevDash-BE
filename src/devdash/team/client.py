@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from devdash.store import connect
 
@@ -32,9 +33,11 @@ _pending: dict = {}
 
 
 class TeamError(RuntimeError):
-    def __init__(self, message: str, signed_out: bool = False):
+    def __init__(self, message: str, signed_out: bool = False, orgs: list | None = None):
         super().__init__(message)
         self.signed_out = signed_out
+        # Someone in several organisations signing in: the ones to pick from.
+        self.orgs = orgs
 
 
 def clean_url(text: str) -> str:
@@ -142,7 +145,8 @@ def fetch_root_certificate(url: str) -> dict:
     return {"pem": found.group(0), "fingerprint": fingerprint(found.group(0))}
 
 
-def _call(url: str, path: str, body: dict | None = None, token: str | None = None) -> tuple[int, dict]:
+def _call(url: str, path: str, body: dict | None = None, token: str | None = None,
+          method: str | None = None) -> tuple[int, dict]:
     headers = {"Accept": "application/json", "User-Agent": "DevDash"}
     data = None
     if body is not None:
@@ -150,7 +154,8 @@ def _call(url: str, path: str, body: dict | None = None, token: str | None = Non
         data = json.dumps(body).encode()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url + path, data=data, headers=headers, method="POST" if body is not None else "GET")
+    request = urllib.request.Request(url + path, data=data, headers=headers,
+                                     method=method or ("POST" if body is not None else "GET"))
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT, context=_tls()) as response:
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
@@ -165,7 +170,8 @@ def _call(url: str, path: str, body: dict | None = None, token: str | None = Non
             raise TeamError("The team server no longer accepts this DevDash. Link it again.", signed_out=True)
         if error.code in (410,):
             return error.code, found
-        raise TeamError(detail if isinstance(detail, str) else f"The team server answered {error.code}.")
+        raise TeamError(detail if isinstance(detail, str) else f"The team server answered {error.code}.",
+                        orgs=found.get("orgs") if isinstance(found, dict) else None)
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         reason = getattr(error, "reason", error)
         if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
@@ -181,9 +187,9 @@ def status() -> dict:
     # Whether a team server's root certificate was added here.
     root = _setting(CA_SETTING) is not None
     if saved is None:
-        return {"connected": False, "pending": pending, "root_certificate": root}
+        return {"connected": False, "pending": pending, "root_certificate": root, "mode": mode()}
     return {"connected": True, "url": saved["url"], "org": saved.get("org"), "person": saved.get("person"),
-            "projects": saved.get("projects", {}), "pending": None, "root_certificate": root}
+            "projects": saved.get("projects", {}), "pending": None, "root_certificate": root, "mode": mode()}
 
 
 def start(url: str) -> dict:
@@ -213,6 +219,41 @@ def poll() -> dict:
                "org": found.get("org"), "org_id": found.get("org_id"), "projects": {}})
         _pending.clear()
     return status()
+
+
+def check(url: str) -> dict:
+    """Whether the team server answers, and trusts: its name and whether it takes new accounts."""
+    url = clean_url(url)
+    _, found = _call(url, "/api/state")
+    return {"url": url, "server": found.get("server"), "signup": found.get("signup")}
+
+
+def _linked_now(url: str, found: dict) -> dict:
+    _pending.clear()
+    _save({"url": url, "token": found["token"], "person": found.get("person"), "org": found.get("org"),
+           "org_id": found.get("org_id"), "projects": {}})
+    return set_mode("org")
+
+
+def register(url: str, username: str, name: str, password: str, org_name: str | None = None,
+             org_code: str | None = None) -> dict:
+    """Makes an account on the team server from DevDash, which makes an organisation (org_name)
+    or joins one (org_code), and links this DevDash to it."""
+    url = clean_url(url)
+    _, found = _call(url, "/api/agent/register", {
+        "username": username, "name": name or None, "password": password, "org_name": org_name or None,
+        "org_code": org_code or None, "device": (platform.node() or "DevDash")[:60]})
+    return _linked_now(url, found)
+
+
+def login(url: str, username: str, password: str, org_code: str | None = None, org_id: int | None = None) -> dict:
+    """Signs in to the team server from DevDash (joining with a code, if given) and links this
+    DevDash. Someone in several organisations gets TeamError.orgs to pick from."""
+    url = clean_url(url)
+    _, found = _call(url, "/api/agent/login", {
+        "username": username, "password": password, "org_code": org_code or None, "org_id": org_id,
+        "device": (platform.node() or "DevDash")[:60]})
+    return _linked_now(url, found)
 
 
 def cancel() -> dict:
@@ -247,20 +288,72 @@ def project_key(root_commit: str) -> str:
     return hashlib.sha256(f"devdash-project:{root_commit}".encode()).hexdigest()
 
 
+def repo_name(path: Path) -> str | None:
+    """The clone's remote as the team server names repos: github:owner/name or codecommit:name,
+    so a project an admin imported from that repo is found."""
+    from devdash import codecommit, github
+
+    found = github.remote_name(path)
+    if found:
+        return f"github:{found.lower()}"
+    found = codecommit.remote_name(path)
+    return f"codecommit:{found[1]}" if found else None
+
+
 def link(repo_id: int) -> dict:
     saved = _linked()
     conn = connect()
-    row = conn.execute("SELECT name, root_commit FROM repos WHERE id = ?", (repo_id,)).fetchone()
+    row = conn.execute("SELECT name, path, root_commit FROM repos WHERE id = ?", (repo_id,)).fetchone()
     conn.close()
     if row is None:
         raise TeamError("No such project.")
     if not row["root_commit"]:
         raise TeamError("Commit something in this project first: the team server matches projects by their first commit.")
-    _, found = _call(saved["url"], "/api/agent/projects", {"key": project_key(row["root_commit"]), "name": row["name"][:80]},
-                     token=saved["token"])
+    body = {"key": project_key(row["root_commit"]), "name": row["name"][:80]}
+    repo = repo_name(Path(row["path"]))
+    if repo:
+        body["repo"] = repo
+    _, found = _call(saved["url"], "/api/agent/projects", body, token=saved["token"])
     projects = {**saved.get("projects", {}), str(repo_id): {"id": found["id"], "name": found["name"]}}
     _save({**saved, "projects": projects})
     return status()
+
+
+MODE_SETTING = "team_mode"
+MODES = ("individual", "org")
+
+
+def mode() -> str | None:
+    """How this DevDash is used: 'individual', 'org' (in an organisation), or None before the
+    person has picked."""
+    value = _setting(MODE_SETTING)
+    return value if value in MODES else None
+
+
+def set_mode(value: str | None) -> dict:
+    conn = connect()
+    with conn:
+        if value is None:
+            conn.execute("DELETE FROM settings WHERE name = ?", (MODE_SETTING,))
+        else:
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?, ?)", (MODE_SETTING, value))
+    conn.close()
+    return status()
+
+
+def org_call(method: str, path: str, body: dict | None = None):
+    """The linked organisation's part of the team server's API, as the person who linked this
+    DevDash: what its admins manage it with from DevDash's own screens."""
+    saved = _linked()
+    org_id = saved.get("org_id")
+    if org_id is None:
+        _, found = _call(saved["url"], "/api/agent/me", token=saved["token"])
+        org_id = found["org_id"]
+        _save({**saved, "org_id": org_id})
+    if body is None and method in ("POST", "PUT"):
+        body = {}
+    _, found = _call(saved["url"], f"/api/orgs/{org_id}{path}", body, token=saved["token"], method=method)
+    return found
 
 
 def unlink(repo_id: int) -> dict:

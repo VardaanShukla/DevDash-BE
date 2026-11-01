@@ -165,6 +165,7 @@ async function render() {
 
   if (!state.me) {
     tabs.hidden = true;
+    if (name === "join-org" && value) return signupView("", value);
     if (name === "join" && value) return signupView(value);
     if (name === "signup") return signupView("");
     const params = new URLSearchParams(location.hash.slice(1));
@@ -180,6 +181,7 @@ async function render() {
   }
   const invite = new URLSearchParams(location.hash.slice(1)).get("join");
   if (invite) return acceptView(invite);
+  if (name === "join-org" && value) return joinOrgView(value);
   if (name === "account") return accountView();
   if (!org) return firstOrgView();
   if (name === "link") return linkView(value);
@@ -208,9 +210,16 @@ async function signOut() {
 
 // ------------------------------------------------------------------ signing up and in
 
-async function signupView(invite) {
+async function signupView(invite, orgCode = "") {
   let about = null;
-  if (invite) {
+  if (orgCode) {
+    try {
+      about = { ...(await api("/api/orgs/check", "POST", { code: orgCode })), role: "member" };
+    } catch (e) {
+      return show(card(h("h2", {}, "This organisation link doesn't work"), h("p", {}, e.message),
+        h("a", { href: "#login" }, "Sign in instead")));
+    }
+  } else if (invite) {
     try {
       about = await api("/api/invites/check", "POST", { invite });
     } catch (e) {
@@ -230,13 +239,14 @@ async function signupView(invite) {
       field("Your name", "name", "text", { autocomplete: "name", maxlength: 60 }),
       field("Password (10 or more characters)", "password", "password", { autocomplete: "new-password", minlength: 10 }),
     ], about ? "Join" : "Make account", async (values) => {
-      await api("/api/signup", "POST", { ...values, invite: invite || null });
+      await api("/api/signup", "POST", { ...values, invite: invite || null, org_code: orgCode || null });
       // The invite is spent: take it out of the address and the history.
       history.replaceState(null, "", location.pathname + "#projects");
       render();
     }),
     h("p", { class: "muted" }, "Have an account? ",
-      h("a", { href: invite ? `#login&join=${encodeURIComponent(invite)}` : "#login" }, "Sign in")),
+      h("a", { href: orgCode ? `#login&join-org=${encodeURIComponent(orgCode)}`
+        : invite ? `#login&join=${encodeURIComponent(invite)}` : "#login" }, "Sign in")),
     certificateHint(),
   ));
 }
@@ -259,6 +269,8 @@ function loginView(linkCode, invite) {
       field("Password", "password", "password", { autocomplete: "current-password" }),
     ], "Sign in", async (values) => {
       await api("/api/login", "POST", values);
+      const orgCode = new URLSearchParams(location.hash.slice(1)).get("join-org");
+      if (orgCode) history.replaceState(null, "", location.pathname + `#join-org=${encodeURIComponent(orgCode)}`);
       render();
     }),
     state.signup ? h("p", { class: "muted" }, "New here? ", h("a", { href: "#signup" }, "Make an account")) : null,
@@ -286,6 +298,35 @@ async function acceptView(invite) {
   ));
 }
 
+async function joinOrgView(code) {
+  let about;
+  try {
+    about = await api("/api/orgs/check", "POST", { code });
+  } catch (e) {
+    return show(card(h("h2", {}, "This organisation link doesn't work"), h("p", {}, e.message), h("a", { href: "#projects" }, "Go on")));
+  }
+  show(card(
+    h("h2", {}, `Join ${about.org}?`),
+    h("p", {}, `You'll join as a member, signed in as ${state.me.name}. An admin gives you its projects.`),
+    h("div", { class: "row" },
+      action("Join", async () => {
+        const joined = await api("/api/orgs/join", "POST", { code });
+        remember(joined.org_id);
+        go(`projects&org=${joined.org_id}`);
+      }, "primary"),
+      h("a", { href: "#projects", class: "button" }, "Not now")),
+  ));
+}
+
+function joinOrgForm() {
+  return form([field("Organisation code", "code", "text", { maxlength: 20, placeholder: "ABCD-EFGH", autocomplete: "off" })],
+    "Join organisation", async (values) => {
+      const joined = await api("/api/orgs/join", "POST", { code: values.code });
+      remember(joined.org_id);
+      go(`projects&org=${joined.org_id}`);
+    });
+}
+
 function newOrgForm() {
   return form([field("Organisation name", "name", "text", { maxlength: 60, placeholder: "Acme Inc" })],
     "Make organisation", async (values) => {
@@ -296,12 +337,18 @@ function newOrgForm() {
 }
 
 function firstOrgView() {
-  show(card(
-    h("h2", {}, "Make your organisation"),
-    h("p", {}, "It holds your teams and projects. You'll be its owner and can invite people."),
-    newOrgForm(),
-    h("p", { class: "muted" }, "Joining someone else's? Open the invite link they sent you."),
-  ));
+  show(
+    card(
+      h("h2", {}, "Join your organisation"),
+      h("p", {}, "Enter the code its admin gave you, or open the organisation link they sent."),
+      joinOrgForm(),
+    ),
+    card(
+      h("h2", {}, "Or make one"),
+      h("p", {}, "It holds your teams and projects. You'll be its owner: you add people, teams and projects."),
+      newOrgForm(),
+    ),
+  );
 }
 
 async function linkView(code) {
@@ -347,29 +394,41 @@ async function linkView(code) {
 
 async function projectsView() {
   const projects = await api(here("/projects"));
+  const admin = isAdmin();
   show(
     h("h1", {}, "Projects"),
+    admin ? card(h("h2", {}, "Add a project"), form([
+      field("Name", "name", "text", { maxlength: 80, placeholder: "shop-app" }),
+      h("label", { class: "field" }, h("span", {}, "Its repo (optional): github:owner/name or codecommit:name"),
+        h("input", { name: "repo", type: "text", maxlength: 200, placeholder: "github:acme/shop-app",
+                     autocapitalize: "off", spellcheck: "false" })),
+    ], "Add project", async (values) => {
+      const made = await api(here("/projects"), "POST", { name: values.name, repo: values.repo.trim() || null });
+      go(`project=${made.id}&org=${org.id}`);
+    })) : null,
     projects.length === 0
       ? card(h("p", {}, "No projects yet."),
-          h("p", { class: "muted" }, "In DevDash on your computer, open Settings → Team server, link it to this server, ",
-            "then link a project. Projects others linked show here once a team of yours is added to them."))
+          h("p", { class: "muted" }, admin
+            ? "Add one above, then give it to a team or a person. Or link one from DevDash on your computer."
+            : "An admin gives you projects. Once they have, link yours from DevDash: Settings → Team server."))
       : h("ul", { class: "list" }, projects.map((p) => h("li", {},
           h("a", { href: `#project=${p.id}&org=${org.id}`, class: "item" },
             h("b", {}, p.name),
+            p.repo ? h("span", { class: "muted" }, p.repo) : null,
             h("span", { class: "muted" }, p.shared ? `${p.shared} shared · last ${when(p.last_shared)}` : "Nothing shared yet"))))),
   );
 }
 
 async function projectView(id) {
-  let project, teams;
+  let project, teams, people;
   try {
-    [project, teams] = await Promise.all([api(here(`/projects/${id}`)), api(here("/teams"))]);
+    [project, teams, people] = await Promise.all([api(here(`/projects/${id}`)), api(here("/teams")), api(here("/people"))]);
   } catch (e) {
     return show(card(h("p", { class: "error" }, e.message), h("a", { href: "#projects" }, "Back to projects")));
   }
   const reload = () => projectView(id);
   const chips = h("div", { class: "chips" }, project.teams.length === 0
-    ? h("span", { class: "muted" }, "No teams yet: only whoever linked it and admins can see it.")
+    ? h("span", { class: "muted" }, "No teams yet.")
     : project.teams.map((t) => h("span", { class: "chip" }, t.name,
         project.manage ? h("button", {
           type: "button", class: "chip__x", "aria-label": `Remove ${t.name}`,
@@ -392,11 +451,37 @@ async function projectView(id) {
       }, h("select", { name: "team", "aria-label": "Team to add" }, free.map((t) => h("option", { value: t.id }, t.name))),
         h("button", { class: "small primary", type: "submit" }, "Add team"))
     : project.manage && teams.length === 0 ? h("p", { class: "muted" }, "Make a team under Teams first.") : null;
+  const one = h("div", { class: "chips" }, project.people.length === 0
+    ? h("span", { class: "muted" }, "Nobody on their own.")
+    : project.people.map((p) => h("span", { class: "chip" }, p.name,
+        project.manage ? h("button", {
+          type: "button", class: "chip__x", "aria-label": `Take ${project.name} from ${p.name}`,
+          onclick: async () => {
+            await api(here(`/projects/${id}/people/${p.id}`), "DELETE");
+            reload();
+          },
+        }, "×") : null)));
+  const others = people.filter((p) => p.role === "member" && !project.people.some((q) => q.id === p.id));
+  const giver = project.manage && others.length
+    ? h("form", {
+        class: "row",
+        onsubmit: async (event) => {
+          event.preventDefault();
+          const person_id = Number(new FormData(event.currentTarget).get("person"));
+          await api(here(`/projects/${id}/people`), "POST", { person_id });
+          reload();
+        },
+      }, h("select", { name: "person", "aria-label": "Person to give it to" }, others.map((p) => h("option", { value: p.id }, p.name))),
+        h("button", { class: "small primary", type: "submit" }, "Give"))
+    : null;
 
   show(
     h("a", { href: "#projects", class: "back" }, "‹ Projects"),
     h("h1", {}, project.name),
-    card(h("h2", {}, "Teams on this project"), chips, adder),
+    project.repo ? h("p", { class: "muted" }, project.repo) : null,
+    card(h("h2", {}, "Who has this project"), h("p", { class: "muted" }, "Admins see every project. Others see it through "
+      + "one of their teams, or on their own."), h("h3", { class: "sub" }, "Teams"), chips, adder,
+      h("h3", { class: "sub" }, "People on their own"), one, giver),
     h("h2", { class: "section" }, "Shared explanations"),
     project.shared.length === 0
       ? card(h("p", { class: "muted" }, "Nothing shared yet. In DevDash, press Share with team on an explanation of a change."))
@@ -511,9 +596,25 @@ async function peopleView() {
     h("button", { class: "primary", type: "submit" }, "Make invite link"),
   ) : null;
 
+  const about = admin ? await api(here("")) : null;
+  const link = about ? `${location.origin}/#join-org=${encodeURIComponent(about.code)}` : "";
+  const codeCard = about ? card(
+    h("h2", {}, "Organisation code"),
+    h("p", {}, "Anyone with this code (or the link) joins as a member. They see no project until you give them one."),
+    h("p", {}, h("b", { class: "code big" }, about.code)),
+    h("input", { class: "copy", readonly: true, value: link, "aria-label": "Organisation link" }),
+    h("div", { class: "row" },
+      action("Copy link", () => navigator.clipboard.writeText(link), "primary"),
+      action("New code", async () => {
+        if (!confirm("Make a new code? The old code and link stop working.")) return;
+        await api(here("/code"), "POST", {});
+        peopleView();
+      }, "quiet")),
+  ) : null;
   show(
     h("h1", {}, "People"),
-    admin ? card(h("h2", {}, `Invite someone to ${org.name}`), inviteForm, made) : null,
+    codeCard,
+    admin ? card(h("h2", {}, `Invite one person to ${org.name}`), inviteForm, made) : null,
     admin && invites.length ? card(h("h2", {}, "Open invites"), h("ul", { class: "list plain" }, invites.map((i) =>
       h("li", { class: "row between" }, h("span", {}, `${i.role}${i.team ? ` · ${i.team}` : ""} · ends ${when(i.expires_at)}`),
         action("Cancel", async () => {
@@ -523,7 +624,7 @@ async function peopleView() {
     card(h("ul", { class: "list plain" }, people.map((p) => h("li", { class: "row between" },
       h("span", {}, h("b", {}, p.name), " ", h("span", { class: "muted" }, `@${p.username} · ${p.role}`)),
       h("span", { class: "row" },
-        owner && p.role !== "owner" ? action(p.role === "admin" ? "Make member" : "Make admin", async () => {
+        admin && p.role !== "owner" && (owner || p.role === "member") ? action(p.role === "admin" ? "Make member" : "Make admin", async () => {
           await api(here(`/people/${p.id}/role`), "PUT", { role: p.role === "admin" ? "member" : "admin" });
           peopleView();
         }, "quiet") : null,
@@ -556,6 +657,7 @@ async function accountView() {
               await api(`/api/orgs/${o.id}/me`, "DELETE");
               go("account");
             }, "quiet")))) : h("p", { class: "muted" }, "None yet."),
+      h("h3", { class: "sub" }, "Join one with its code"), joinOrgForm(),
       h("h3", { class: "sub" }, "Make another"), newOrgForm()),
     card(h("h2", {}, "Linked DevDashes"),
       devices.length === 0 ? h("p", { class: "muted" }, "None yet. Link one from Settings → Team server in DevDash.")

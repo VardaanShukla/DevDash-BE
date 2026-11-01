@@ -1,6 +1,8 @@
-"""The team server: a hosted product anyone can open. People sign up, make an organisation
-(or join one with an invite link), make teams in it, and add teams to the projects their
-DevDash linked; the teams on a project see the explanations of changes shared to it. It
+"""The team server: a hosted product anyone can open. People sign up and make an
+organisation, or join one with its code or an invite link. An organisation's admins run it:
+they make its teams and projects, add and remove people, make others admins, and say who may
+see each project (a whole team, or one person). People see only those projects, and the
+explanations of changes shared to them. It
 works on a phone. `devdash host` runs it behind HTTPS: Caddy for your own domain, or a
 Cloudflare tunnel from your own computer.
 
@@ -186,8 +188,9 @@ class Account(Strict):
     username: str = Field(min_length=2, max_length=32)
     password: str = Field(min_length=1, max_length=200)
     name: str | None = Field(default=None, max_length=60)
-    # Joining an organisation as the account is made.
+    # Joining an organisation as the account is made: a personal invite, or the organisation's code.
     invite: str | None = Field(default=None, max_length=100)
+    org_code: str | None = Field(default=None, max_length=20)
 
     @field_validator("username")
     @classmethod
@@ -238,6 +241,21 @@ class InviteRef(Strict):
     invite: str = Field(max_length=100)
 
 
+class OrgCode(Strict):
+    code: str = Field(min_length=4, max_length=20)
+
+
+class NewProject(Strict):
+    name: str = Field(min_length=1, max_length=80)
+    # github:owner/name or codecommit:region/name, when the project comes from a repo.
+    repo: str | None = Field(default=None, max_length=200, pattern=r"^(github|codecommit):[\w./-]+$")
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value):
+        return _no_control(value)
+
+
 class RoleChange(Strict):
     role: Literal["admin", "member"]
 
@@ -267,6 +285,32 @@ class DeviceStart(Strict):
         return _no_control(value)
 
 
+class Register(Account):
+    """An account made from DevDash's own screens, which also makes or joins an organisation and
+    links that DevDash, in one go."""
+    org_name: str | None = Field(default=None, max_length=60)
+    device: str = Field(min_length=1, max_length=60)
+
+    @field_validator("org_name", "device")
+    @classmethod
+    def _text(cls, value):
+        return _no_control(value)
+
+
+class AgentLogin(Strict):
+    username: str = Field(max_length=32)
+    password: str = Field(max_length=200)
+    # Joining with a code as well; or which organisation, for someone in several.
+    org_code: str | None = Field(default=None, max_length=20)
+    org_id: int | None = None
+    device: str = Field(min_length=1, max_length=60)
+
+    @field_validator("device")
+    @classmethod
+    def _text(cls, value):
+        return _no_control(value)
+
+
 class DeviceToken(Strict):
     device_code: str = Field(max_length=100)
 
@@ -274,6 +318,9 @@ class DeviceToken(Strict):
 class LinkProject(Strict):
     key: str = Field(pattern=r"^[0-9a-f]{64}$")
     name: str = Field(min_length=1, max_length=80)
+    # The clone's remote as github:owner/name or codecommit:region/name, to find a project an
+    # admin imported from that repo.
+    repo: str | None = Field(default=None, max_length=200, pattern=r"^(github|codecommit):[\w./-]+$")
 
     @field_validator("name")
     @classmethod
@@ -294,6 +341,14 @@ class Explanation(Strict):
         if any(len(item) > 500 for item in items):
             raise ValueError("each item is at most 500 characters")
         return [item.strip() for item in items if item.strip()]
+
+
+class ChatText(Strict):
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class ChatRead(Strict):
+    last_id: int
 
 
 class Share(Strict):
@@ -374,6 +429,19 @@ def create_team_app() -> FastAPI:
     # ------------------------------------------------------------ who is asking
 
     def person(request: Request) -> dict:
+        """The signed-in browser's person; or, for a linked DevDash managing its organisation
+        from its own screens, the person it was linked by, kept to that organisation."""
+        header = request.headers.get("authorization", "")
+        if header.startswith("Bearer "):
+            found = device(request)
+            org_path = f"/api/orgs/{found['org_id']}"
+            if request.url.path != org_path and not request.url.path.startswith(org_path + "/"):
+                raise HTTPException(403, "A linked DevDash can only manage its own organisation.")
+            conn = store.connect()
+            row = conn.execute("SELECT admin FROM people WHERE id = ?", (found["id"],)).fetchone()
+            conn.close()
+            return {"id": found["id"], "username": found["username"], "name": found["name"],
+                    "admin": bool(row["admin"]), "device_org": found["org_id"]}
         token = request.cookies.get(COOKIE)
         if token:
             conn = store.connect()
@@ -387,6 +455,8 @@ def create_team_app() -> FastAPI:
 
     def member_of(conn, me: dict, org_id: int) -> dict:
         """The person in one organisation, with their role there; 404 to anyone outside it."""
+        if me.get("device_org") not in (None, org_id):
+            raise HTTPException(404, "No such organisation, or you're not in it.")
         row = conn.execute("SELECT role FROM members WHERE org_id = ? AND person_id = ?", (org_id, me["id"])).fetchone()
         if row is None:
             raise HTTPException(404, "No such organisation, or you're not in it.")
@@ -496,9 +566,10 @@ def create_team_app() -> FastAPI:
     def signup(body: Account, request: Request, response: Response):
         conn = store.connect()
         try:
-            if not signups_open(conn) and not body.invite:
-                raise HTTPException(403, "This server only takes new accounts with an invite link.")
+            if not signups_open(conn) and not body.invite and not body.org_code:
+                raise HTTPException(403, "This server only takes new accounts with an invite link or an organisation's code.")
             invite = open_invite(conn, body.invite) if body.invite else None
+            joining = org_by_code(conn, body.org_code, request) if body.org_code else None
             signups.hit(visitor(request))
             check_new_password(body.password, body.username)
             if conn.execute("SELECT 1 FROM people WHERE username = ?", (body.username,)).fetchone():
@@ -509,6 +580,9 @@ def create_team_app() -> FastAPI:
                     (body.username, body.name or body.username, hash_password(body.password), now())).lastrowid
                 if invite:
                     use_invite(conn, invite, person_id)
+                if joining:
+                    conn.execute("INSERT OR IGNORE INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                                 (joining["id"], person_id, now()))
         finally:
             conn.close()
         sign_in(response, person_id)
@@ -591,13 +665,77 @@ def create_team_app() -> FastAPI:
         try:
             if conn.execute("SELECT COUNT(*) FROM members WHERE person_id = ? AND role = 'owner'", (me["id"],)).fetchone()[0] >= 10:
                 raise HTTPException(400, "You own 10 organisations already.")
+            code = new_org_code(conn)
             with conn:
-                org_id = conn.execute("INSERT INTO orgs (name, created_at) VALUES (?, ?)", (body.name, now())).lastrowid
+                org_id = conn.execute("INSERT INTO orgs (name, code, created_at) VALUES (?, ?, ?)",
+                                      (body.name, code, now())).lastrowid
                 conn.execute("INSERT INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
                              (org_id, me["id"], now()))
         finally:
             conn.close()
-        return {"id": org_id, "name": body.name, "role": "owner"}
+        return {"id": org_id, "name": body.name, "role": "owner", "code": code}
+
+    def new_org_code(conn) -> str:
+        while True:
+            code = new_code()
+            if not conn.execute("SELECT 1 FROM orgs WHERE code = ?", (code,)).fetchone():
+                return code
+
+    def org_by_code(conn, code: str, request: Request):
+        codes.hit(visitor(request))
+        row = conn.execute("SELECT id, name FROM orgs WHERE replace(code, '-', '') = ?", (plain_code(code),)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No organisation has that code. Check it with whoever runs the organisation.")
+        return row
+
+    @app.get("/api/orgs/{org_id}")
+    def org(org_id: int, me: dict = Depends(person)):
+        """The organisation, and its code for admins to share."""
+        conn = store.connect()
+        try:
+            who = member_of(conn, me, org_id)
+            row = conn.execute("SELECT id, name, code FROM orgs WHERE id = ?", (org_id,)).fetchone()
+        finally:
+            conn.close()
+        return {"id": row["id"], "name": row["name"], "role": who["role"],
+                "code": row["code"] if who["role"] in ADMINS else None}
+
+    @app.post("/api/orgs/{org_id}/code")
+    def new_org_code_for(org_id: int, me: dict = Depends(person)):
+        """A new code, when the old one went somewhere it shouldn't. The old one stops working."""
+        conn = store.connect()
+        try:
+            org_admin(conn, me, org_id)
+            code = new_org_code(conn)
+            with conn:
+                conn.execute("UPDATE orgs SET code = ? WHERE id = ?", (code, org_id))
+        finally:
+            conn.close()
+        return {"code": code}
+
+    @app.post("/api/orgs/check")
+    def check_org_code(body: OrgCode, request: Request):
+        """The organisation a code belongs to, before someone signs up or joins."""
+        conn = store.connect()
+        try:
+            row = org_by_code(conn, body.code, request)
+        finally:
+            conn.close()
+        return {"org": row["name"]}
+
+    @app.post("/api/orgs/join")
+    def join_org(body: OrgCode, request: Request, me: dict = Depends(person)):
+        """Joins an organisation with its code, as a member who sees no project until an admin
+        gives them one."""
+        conn = store.connect()
+        try:
+            row = org_by_code(conn, body.code, request)
+            with conn:
+                conn.execute("INSERT OR IGNORE INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                             (row["id"], me["id"], now()))
+        finally:
+            conn.close()
+        return {"org_id": row["id"], "org": row["name"]}
 
     @app.put("/api/orgs/{org_id}")
     def rename_org(org_id: int, body: Named, me: dict = Depends(person)):
@@ -641,6 +779,8 @@ def create_team_app() -> FastAPI:
         conn.execute("DELETE FROM team_people WHERE person_id = ? AND team_id IN (SELECT id FROM teams WHERE org_id = ?)",
                      (person_id, org_id))
         conn.execute("DELETE FROM devices WHERE person_id = ? AND org_id = ?", (person_id, org_id))
+        conn.execute("DELETE FROM project_people WHERE person_id = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)",
+                     (person_id, org_id))
         conn.execute("DELETE FROM shared WHERE person_id = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)",
                      (person_id, org_id))
 
@@ -734,8 +874,10 @@ def create_team_app() -> FastAPI:
     def set_role(org_id: int, person_id: int, body: RoleChange, me: dict = Depends(person)):
         conn = store.connect()
         try:
-            if member_of(conn, me, org_id)["role"] != "owner":
-                raise HTTPException(403, "Only the owner can change roles.")
+            found = org_admin(conn, me, org_id)
+            current = conn.execute("SELECT role FROM members WHERE org_id = ? AND person_id = ?", (org_id, person_id)).fetchone()
+            if current is not None and current["role"] == "admin" and found["role"] != "owner":
+                raise HTTPException(403, "Only the owner can turn an admin back into a member.")
             with conn:
                 changed = conn.execute("UPDATE members SET role = ? WHERE org_id = ? AND person_id = ? AND role != 'owner'",
                                        (body.role, org_id, person_id)).rowcount
@@ -839,17 +981,18 @@ def create_team_app() -> FastAPI:
         if who["role"] in ADMINS:
             return [row["id"] for row in conn.execute("SELECT id FROM projects WHERE org_id = ?", (who["org_id"],))]
         return [row["id"] for row in conn.execute(
-            "SELECT id FROM projects WHERE org_id = ? AND created_by = ? UNION SELECT pt.project_id FROM project_teams pt"
+            "SELECT pp.project_id AS id FROM project_people pp JOIN projects p ON p.id = pp.project_id"
+            " WHERE pp.person_id = ? AND p.org_id = ? UNION SELECT pt.project_id FROM project_teams pt"
             " JOIN team_people tp ON tp.team_id = pt.team_id JOIN projects p ON p.id = pt.project_id"
-            " WHERE tp.person_id = ? AND p.org_id = ?", (who["org_id"], who["id"], who["id"], who["org_id"]))]
+            " WHERE tp.person_id = ? AND p.org_id = ?", (who["id"], who["org_id"], who["id"], who["org_id"]))]
 
     def project_or_404(conn, who: dict, project_id: int):
         if project_id not in visible(conn, who):
             raise HTTPException(404, "No such project, or you don't have access to it.")
         return conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
 
-    def can_manage(who: dict, project) -> bool:
-        return who["role"] in ADMINS or project["created_by"] == who["id"]
+    def can_manage(who: dict, project=None) -> bool:
+        return who["role"] in ADMINS
 
     def project_list(conn, who: dict) -> list[dict]:
         ids = visible(conn, who)
@@ -857,7 +1000,7 @@ def create_team_app() -> FastAPI:
             return []
         marks = ",".join("?" * len(ids))
         rows = conn.execute(
-            f"SELECT p.id, p.name, p.created_by, p.created_at, (SELECT COUNT(*) FROM shared s WHERE s.project_id = p.id)"
+            f"SELECT p.id, p.name, p.repo, p.created_by, p.created_at, (SELECT COUNT(*) FROM shared s WHERE s.project_id = p.id)"
             f" AS shared, (SELECT MAX(shared_at) FROM shared s WHERE s.project_id = p.id) AS last_shared"
             f" FROM projects p WHERE p.id IN ({marks}) ORDER BY p.name", ids).fetchall()
         return [{**dict(row), "manage": can_manage(who, row)} for row in rows]
@@ -879,6 +1022,8 @@ def create_team_app() -> FastAPI:
             row = project_or_404(conn, who, project_id)
             teams = conn.execute("SELECT t.id, t.name FROM project_teams pt JOIN teams t ON t.id = pt.team_id"
                                  " WHERE pt.project_id = ? ORDER BY t.name", (project_id,)).fetchall()
+            people = conn.execute("SELECT p.id, p.name FROM project_people pp JOIN people p ON p.id = pp.person_id"
+                                  " WHERE pp.project_id = ? ORDER BY p.name", (project_id,)).fetchall()
             items = conn.execute(
                 "SELECT s.id, s.subject, s.explanation, s.shared_at, s.person_id, p.name AS person FROM shared s"
                 " JOIN people p ON p.id = s.person_id WHERE s.project_id = ? ORDER BY s.shared_at DESC LIMIT 200",
@@ -886,8 +1031,9 @@ def create_team_app() -> FastAPI:
         finally:
             conn.close()
         return {
-            "id": row["id"], "name": row["name"], "manage": can_manage(who, row),
+            "id": row["id"], "name": row["name"], "repo": row["repo"], "manage": can_manage(who, row),
             "teams": [dict(team) for team in teams],
+            "people": [dict(one) for one in people],
             "shared": [{**{k: item[k] for k in ("id", "subject", "shared_at", "person")},
                         "explanation": json.loads(item["explanation"]),
                         "mine": item["person_id"] == me["id"],
@@ -898,8 +1044,252 @@ def create_team_app() -> FastAPI:
         who = member_of(conn, me, org_id)
         row = project_or_404(conn, who, project_id)
         if not can_manage(who, row):
-            raise HTTPException(403, "Only the person who linked this project, or an admin, can do that.")
+            raise HTTPException(403, "Only an admin of the organisation can do that.")
         return row
+
+    @app.post("/api/orgs/{org_id}/projects")
+    def new_project(org_id: int, body: NewProject, me: dict = Depends(person)):
+        """An admin adds a project: by name, or from a repo (then people's clones of that repo
+        find it). Nobody but admins sees it until it's given to a team or a person."""
+        conn = store.connect()
+        try:
+            org_admin(conn, me, org_id)
+            try:
+                with conn:
+                    project_id = conn.execute(
+                        "INSERT INTO projects (org_id, repo, name, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (org_id, body.repo, body.name, me["id"], now())).lastrowid
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "That repo is already a project here.")
+        finally:
+            conn.close()
+        return {"id": project_id, "name": body.name, "repo": body.repo}
+
+    @app.post("/api/orgs/{org_id}/projects/{project_id}/people")
+    def give_person(org_id: int, project_id: int, body: PersonRef, me: dict = Depends(person)):
+        """Gives one person a project, without their whole team."""
+        conn = store.connect()
+        try:
+            managed_project(conn, me, org_id, project_id)
+            if not conn.execute("SELECT 1 FROM members WHERE org_id = ? AND person_id = ?", (org_id, body.person_id)).fetchone():
+                raise HTTPException(404, "They're not in this organisation.")
+            with conn:
+                conn.execute("INSERT OR IGNORE INTO project_people (project_id, person_id) VALUES (?, ?)",
+                             (project_id, body.person_id))
+        finally:
+            conn.close()
+        return {"ok": True}
+
+    @app.delete("/api/orgs/{org_id}/projects/{project_id}/people/{person_id}")
+    def take_person(org_id: int, project_id: int, person_id: int, me: dict = Depends(person)):
+        conn = store.connect()
+        try:
+            managed_project(conn, me, org_id, project_id)
+            with conn:
+                conn.execute("DELETE FROM project_people WHERE project_id = ? AND person_id = ?", (project_id, person_id))
+        finally:
+            conn.close()
+        return {"ok": True}
+
+    @app.get("/api/orgs/{org_id}/overview")
+    def overview(org_id: int, me: dict = Depends(person)):
+        """The team as one person sees it, for DevDash's Team screen and Home: their teams and
+        teammates, the projects they can see with who has each, and what was shared lately."""
+        conn = store.connect()
+        try:
+            who = member_of(conn, me, org_id)
+            org_row = conn.execute("SELECT name FROM orgs WHERE id = ?", (org_id,)).fetchone()
+            teams = conn.execute("SELECT id, name FROM teams WHERE org_id = ? ORDER BY name", (org_id,)).fetchall()
+            team_people = conn.execute(
+                "SELECT tp.team_id, p.id, p.name, m.role FROM team_people tp JOIN people p ON p.id = tp.person_id"
+                " JOIN teams t ON t.id = tp.team_id JOIN members m ON m.person_id = p.id AND m.org_id = t.org_id"
+                " WHERE t.org_id = ? ORDER BY p.name", (org_id,)).fetchall()
+            ids = visible(conn, who)
+            marks = ",".join("?" * len(ids)) or "NULL"
+            projects = conn.execute(f"SELECT id, name, repo, key FROM projects WHERE id IN ({marks}) ORDER BY name", ids).fetchall()
+            given_teams = conn.execute(f"SELECT project_id, team_id FROM project_teams WHERE project_id IN ({marks})", ids).fetchall()
+            given_people = conn.execute(
+                f"SELECT pp.project_id, p.id, p.name FROM project_people pp JOIN people p ON p.id = pp.person_id"
+                f" WHERE pp.project_id IN ({marks})", ids).fetchall()
+            recent = conn.execute(
+                f"SELECT s.id, s.project_id, s.subject, s.explanation, s.shared_at, s.person_id, p.name AS person"
+                f" FROM shared s JOIN people p ON p.id = s.person_id WHERE s.project_id IN ({marks})"
+                f" ORDER BY s.shared_at DESC LIMIT 50", ids).fetchall()
+        finally:
+            conn.close()
+        names = {t["id"]: t["name"] for t in teams}
+        people_of = {t["id"]: [{"id": r["id"], "name": r["name"], "role": r["role"]} for r in team_people
+                               if r["team_id"] == t["id"]] for t in teams}
+        mine = [t["id"] for t in teams if any(p["id"] == me["id"] for p in people_of[t["id"]])]
+        return {
+            "org": {"id": org_id, "name": org_row["name"], "role": who["role"]},
+            "me": {"id": me["id"], "name": me["name"]},
+            "teams": [{"id": t["id"], "name": t["name"], "mine": t["id"] in mine, "people": people_of[t["id"]]} for t in teams],
+            "projects": [{
+                "id": p["id"], "name": p["name"], "repo": p["repo"], "key": p["key"],
+                "teams": [{"id": g["team_id"], "name": names.get(g["team_id"], "")} for g in given_teams if g["project_id"] == p["id"]],
+                "people": [{"id": g["id"], "name": g["name"]} for g in given_people if g["project_id"] == p["id"]],
+            } for p in projects],
+            "shared": [{**{k: r[k] for k in ("id", "project_id", "subject", "shared_at", "person")},
+                        "explanation": json.loads(r["explanation"]), "mine": r["person_id"] == me["id"]} for r in recent],
+        }
+
+    # ------------------------------------------------------------ chat
+
+    chatting = Limiter(30, 10)  # messages per person
+
+    def channel_name(conn, row, me_id: int) -> str:
+        if row["kind"] == "org":
+            return "Everyone"
+        if row["kind"] == "team":
+            team = conn.execute("SELECT name FROM teams WHERE id = ?", (row["team_id"],)).fetchone()
+            return team["name"] if team else "Team"
+        other = row["person_b"] if row["person_a"] == me_id else row["person_a"]
+        found = conn.execute("SELECT name FROM people WHERE id = ?", (other,)).fetchone()
+        return found["name"] if found else "Someone"
+
+    def chat_channels(conn, who: dict) -> list:
+        """The channels someone may read in their organisation, made the first time: everyone's,
+        their teams' (every team's, for admins), and their direct ones."""
+        org_id = who["org_id"]
+        if not conn.execute("SELECT 1 FROM chat_channels WHERE org_id = ? AND kind = 'org'", (org_id,)).fetchone():
+            with conn:
+                conn.execute("INSERT INTO chat_channels (org_id, kind, created_at) VALUES (?, 'org', ?)", (org_id, now()))
+        teams = conn.execute(
+            "SELECT id FROM teams WHERE org_id = ?" if who["role"] in ADMINS else
+            "SELECT t.id FROM teams t JOIN team_people tp ON tp.team_id = t.id WHERE t.org_id = ? AND tp.person_id = ?",
+            (org_id,) if who["role"] in ADMINS else (org_id, who["id"])).fetchall()
+        for team in teams:
+            if not conn.execute("SELECT 1 FROM chat_channels WHERE kind = 'team' AND team_id = ?", (team["id"],)).fetchone():
+                with conn:
+                    conn.execute("INSERT INTO chat_channels (org_id, kind, team_id, created_at) VALUES (?, 'team', ?, ?)",
+                                 (org_id, team["id"], now()))
+        team_ids = [t["id"] for t in teams]
+        marks = ",".join("?" * len(team_ids)) or "NULL"
+        return conn.execute(
+            f"SELECT * FROM chat_channels WHERE org_id = ? AND (kind = 'org' OR (kind = 'team' AND team_id IN ({marks}))"
+            f" OR (kind = 'direct' AND ? IN (person_a, person_b)))"
+            f" ORDER BY CASE kind WHEN 'org' THEN 0 WHEN 'team' THEN 1 ELSE 2 END, id",
+            (org_id, *team_ids, who["id"])).fetchall()
+
+    def chat_channel(conn, who: dict, channel_id: int):
+        row = next((c for c in chat_channels(conn, who) if c["id"] == channel_id), None)
+        if row is None:
+            raise HTTPException(404, "No such chat, or you're not in it.")
+        return row
+
+    def message_out(row) -> dict:
+        return {"id": row["id"], "person_id": row["person_id"], "person": row["person"] or "Someone",
+                "text": "" if row["deleted"] else row["text"], "deleted": bool(row["deleted"]), "at": row["created_at"]}
+
+    @app.get("/api/orgs/{org_id}/chat")
+    def chats(org_id: int, me: dict = Depends(person)):
+        conn = store.connect()
+        try:
+            who = member_of(conn, me, org_id)
+            result = []
+            for row in chat_channels(conn, who):
+                read = conn.execute("SELECT last_id FROM chat_reads WHERE channel_id = ? AND person_id = ?",
+                                    (row["id"], me["id"])).fetchone()
+                last = conn.execute(
+                    "SELECT m.*, p.name AS person FROM chat_messages m LEFT JOIN people p ON p.id = m.person_id"
+                    " WHERE m.channel_id = ? ORDER BY m.id DESC LIMIT 1", (row["id"],)).fetchone()
+                unread = conn.execute(
+                    "SELECT COUNT(*) FROM chat_messages WHERE channel_id = ? AND id > ? AND deleted = 0"
+                    " AND (person_id IS NULL OR person_id != ?)", (row["id"], read["last_id"] if read else 0, me["id"])).fetchone()[0]
+                result.append({"id": row["id"], "kind": row["kind"], "name": channel_name(conn, row, me["id"]),
+                               "unread": unread, "last": message_out(last) if last else None})
+        finally:
+            conn.close()
+        return result
+
+    @app.post("/api/orgs/{org_id}/chat/direct")
+    def direct_chat(org_id: int, body: PersonRef, me: dict = Depends(person)):
+        """The direct chat with one person in the organisation, made the first time."""
+        conn = store.connect()
+        try:
+            member_of(conn, me, org_id)
+            if body.person_id == me["id"]:
+                raise HTTPException(400, "Pick someone else.")
+            if not conn.execute("SELECT 1 FROM members WHERE org_id = ? AND person_id = ?", (org_id, body.person_id)).fetchone():
+                raise HTTPException(404, "They're not in this organisation.")
+            a, b = sorted((me["id"], body.person_id))
+            row = conn.execute("SELECT id FROM chat_channels WHERE org_id = ? AND kind = 'direct' AND person_a = ? AND person_b = ?",
+                               (org_id, a, b)).fetchone()
+            if row is None:
+                with conn:
+                    channel_id = conn.execute(
+                        "INSERT INTO chat_channels (org_id, kind, person_a, person_b, created_at) VALUES (?, 'direct', ?, ?, ?)",
+                        (org_id, a, b, now())).lastrowid
+            else:
+                channel_id = row["id"]
+        finally:
+            conn.close()
+        return {"id": channel_id}
+
+    @app.get("/api/orgs/{org_id}/chat/{channel_id}/messages")
+    def chat_messages(org_id: int, channel_id: int, after: int = 0, me: dict = Depends(person)):
+        """Messages after a given one (for the next poll), or the latest 100."""
+        conn = store.connect()
+        try:
+            chat_channel(conn, member_of(conn, me, org_id), channel_id)
+            select = ("SELECT m.*, p.name AS person FROM chat_messages m LEFT JOIN people p ON p.id = m.person_id"
+                      " WHERE m.channel_id = ?")
+            rows = conn.execute(select + " AND m.id > ? ORDER BY m.id LIMIT 200", (channel_id, after)).fetchall() if after else \
+                list(reversed(conn.execute(select + " ORDER BY m.id DESC LIMIT 100", (channel_id,)).fetchall()))
+        finally:
+            conn.close()
+        return [message_out(row) for row in rows]
+
+    @app.post("/api/orgs/{org_id}/chat/{channel_id}/messages")
+    def send_message(org_id: int, channel_id: int, body: ChatText, me: dict = Depends(person)):
+        chatting.hit(str(me["id"]))
+        text = CONTROL.sub("", body.text).strip()
+        if not text:
+            raise HTTPException(400, "Write something first.")
+        conn = store.connect()
+        try:
+            chat_channel(conn, member_of(conn, me, org_id), channel_id)
+            with conn:
+                message_id = conn.execute("INSERT INTO chat_messages (channel_id, person_id, text, created_at) VALUES (?, ?, ?, ?)",
+                                          (channel_id, me["id"], text, now())).lastrowid
+                conn.execute("INSERT OR REPLACE INTO chat_reads (channel_id, person_id, last_id) VALUES (?, ?, ?)",
+                             (channel_id, me["id"], message_id))
+            row = conn.execute("SELECT m.*, p.name AS person FROM chat_messages m LEFT JOIN people p ON p.id = m.person_id"
+                               " WHERE m.id = ?", (message_id,)).fetchone()
+        finally:
+            conn.close()
+        return message_out(row)
+
+    @app.post("/api/orgs/{org_id}/chat/{channel_id}/read")
+    def read_chat(org_id: int, channel_id: int, body: ChatRead, me: dict = Depends(person)):
+        conn = store.connect()
+        try:
+            chat_channel(conn, member_of(conn, me, org_id), channel_id)
+            with conn:
+                conn.execute("INSERT INTO chat_reads (channel_id, person_id, last_id) VALUES (?, ?, ?) ON CONFLICT"
+                             " (channel_id, person_id) DO UPDATE SET last_id = max(last_id, excluded.last_id)",
+                             (channel_id, me["id"], body.last_id))
+        finally:
+            conn.close()
+        return {"ok": True}
+
+    @app.delete("/api/orgs/{org_id}/chat/{channel_id}/messages/{message_id}")
+    def delete_message(org_id: int, channel_id: int, message_id: int, me: dict = Depends(person)):
+        conn = store.connect()
+        try:
+            who = member_of(conn, me, org_id)
+            chat_channel(conn, who, channel_id)
+            row = conn.execute("SELECT person_id FROM chat_messages WHERE id = ? AND channel_id = ?", (message_id, channel_id)).fetchone()
+            if row is None:
+                raise HTTPException(404, "No such message.")
+            if row["person_id"] != me["id"] and who["role"] not in ADMINS:
+                raise HTTPException(403, "Only whoever wrote it, or an admin, can delete it.")
+            with conn:
+                conn.execute("UPDATE chat_messages SET deleted = 1, text = '' WHERE id = ?", (message_id,))
+        finally:
+            conn.close()
+        return {"ok": True}
 
     @app.post("/api/orgs/{org_id}/projects/{project_id}/teams")
     def add_team(org_id: int, project_id: int, body: TeamRef, me: dict = Depends(person)):
@@ -1035,6 +1425,82 @@ def create_team_app() -> FastAPI:
             conn.close()
         return {"token": token, "person": dict(me), "org": org["name"], "org_id": row["org_id"]}
 
+    def link_new_device(conn, person_id: int, org_id: int, name: str) -> dict:
+        token = "ddt_" + secrets.token_urlsafe(32)
+        with conn:
+            conn.execute("INSERT INTO devices (person_id, org_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (person_id, org_id, name, token_hash(token), now()))
+        me = conn.execute("SELECT name, username FROM people WHERE id = ?", (person_id,)).fetchone()
+        org = conn.execute("SELECT name, code FROM orgs WHERE id = ?", (org_id,)).fetchone()
+        role = conn.execute("SELECT role FROM members WHERE org_id = ? AND person_id = ?", (org_id, person_id)).fetchone()
+        return {"token": token, "person": {**dict(me), "role": role["role"]}, "org": org["name"], "org_id": org_id}
+
+    @app.post("/api/agent/register")
+    def agent_register(body: Register, request: Request):
+        """From DevDash: a new account that makes an organisation (org_name) or joins one
+        (org_code), and links that DevDash to it. Sign-ups being closed still lets people with
+        a code in."""
+        if not body.org_name and not body.org_code:
+            raise HTTPException(400, "Name a new organisation, or give the code of one to join.")
+        conn = store.connect()
+        try:
+            joining = org_by_code(conn, body.org_code, request) if body.org_code else None
+            if not joining and not signups_open(conn):
+                raise HTTPException(403, "This server only takes new accounts with an organisation's code.")
+            signups.hit(visitor(request))
+            check_new_password(body.password, body.username)
+            if conn.execute("SELECT 1 FROM people WHERE username = ?", (body.username,)).fetchone():
+                raise HTTPException(409, "That username is taken. If it's yours, sign in instead.")
+            with conn:
+                person_id = conn.execute(
+                    "INSERT INTO people (username, name, password, created_at) VALUES (?, ?, ?, ?)",
+                    (body.username, body.name or body.username, hash_password(body.password), now())).lastrowid
+                if joining:
+                    org_id = joining["id"]
+                    conn.execute("INSERT INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                                 (org_id, person_id, now()))
+                else:
+                    org_id = conn.execute("INSERT INTO orgs (name, code, created_at) VALUES (?, ?, ?)",
+                                          (body.org_name, new_org_code(conn), now())).lastrowid
+                    conn.execute("INSERT INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
+                                 (org_id, person_id, now()))
+            return link_new_device(conn, person_id, org_id, body.device)
+        finally:
+            conn.close()
+
+    @app.post("/api/agent/login")
+    def agent_login(body: AgentLogin, request: Request):
+        """From DevDash: signs in with an existing account (joining with a code, if given) and
+        links that DevDash to the organisation."""
+        wrong_by_name.hit(body.username.lower())
+        wrong_by_visitor.hit(visitor(request))
+        conn = store.connect()
+        try:
+            row = conn.execute("SELECT id, password FROM people WHERE username = ?", (body.username,)).fetchone()
+            if not (check_password(body.password, row["password"] if row else _DUMMY) and row is not None):
+                raise HTTPException(401, "That username or password isn't right.")
+            if body.org_code:
+                joined = org_by_code(conn, body.org_code, request)
+                with conn:
+                    conn.execute("INSERT OR IGNORE INTO members (org_id, person_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                                 (joined["id"], row["id"], now()))
+                org_id = joined["id"]
+            else:
+                orgs = conn.execute("SELECT o.id, o.name FROM members m JOIN orgs o ON o.id = m.org_id WHERE m.person_id = ?",
+                                    (row["id"],)).fetchall()
+                ids = [o["id"] for o in orgs]
+                if body.org_id in ids:
+                    org_id = body.org_id
+                elif len(ids) == 1:
+                    org_id = ids[0]
+                elif not ids:
+                    raise HTTPException(404, "You're not in an organisation yet. Join one with its code, or make one.")
+                else:
+                    return JSONResponse({"detail": "Pick the organisation.", "orgs": [dict(o) for o in orgs]}, status_code=409)
+            return link_new_device(conn, row["id"], org_id, body.device)
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------ for a linked DevDash
 
     @app.get("/api/agent/me")
@@ -1048,25 +1514,34 @@ def create_team_app() -> FastAPI:
 
     @app.post("/api/agent/projects")
     def agent_link(body: LinkProject, me: dict = Depends(device)):
-        """Links a project on the person's computer to their organisation: the one everyone's
-        clone shares, made the first time. Someone who isn't in one of its teams is told to
-        ask for access."""
+        """Links a project on the person's computer to its project in their organisation,
+        found by its repo (an admin imported) or its first commit (someone linked a clone
+        before). Only an admin adds a project that isn't there yet; anyone else needs it
+        given to them first."""
         conn = store.connect()
         try:
             row = conn.execute("SELECT * FROM projects WHERE org_id = ? AND key = ?", (me["org_id"], body.key)).fetchone()
+            if row is None and body.repo:
+                row = conn.execute("SELECT * FROM projects WHERE org_id = ? AND repo = ?", (me["org_id"], body.repo)).fetchone()
             if row is None:
+                if me["role"] not in ADMINS:
+                    raise HTTPException(403, "This project isn't in your organisation. Ask an admin to add it and give it "
+                                             "to you or your team.")
                 with conn:
                     project_id = conn.execute(
-                        "INSERT INTO projects (org_id, key, name, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (me["org_id"], body.key, body.name, me["id"], now())).lastrowid
-            elif row["id"] in visible(conn, me):
-                project_id = row["id"]
-            else:
-                raise HTTPException(403, "This project is already in your organisation. Ask whoever linked it, or an "
-                                         "admin, to add one of your teams to it.")
+                        "INSERT INTO projects (org_id, key, repo, name, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (me["org_id"], body.key, body.repo, body.name, me["id"], now())).lastrowid
+                return {"id": project_id, "name": body.name}
+            if row["id"] not in visible(conn, me):
+                raise HTTPException(403, "You don't have access to this project yet. Ask an admin to give it to you or "
+                                         "your team.")
+            if row["key"] is None:
+                # The first clone linked to a project an admin imported: its first commit finds it from now on.
+                with conn:
+                    conn.execute("UPDATE projects SET key = ? WHERE id = ? AND key IS NULL", (body.key, row["id"]))
+            return {"id": row["id"], "name": row["name"]}
         finally:
             conn.close()
-        return {"id": project_id, "name": body.name if row is None else row["name"]}
 
     @app.post("/api/agent/share")
     def agent_share(body: Share, me: dict = Depends(device)):

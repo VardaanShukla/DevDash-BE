@@ -243,10 +243,16 @@ def test_someone_elses_project_needs_their_team():
     sam_agent = link_device(app, sam, org_id)
     # Knowing the first commit isn't enough to get in.
     assert sam_agent.post("/api/agent/projects", json={"key": "b" * 64, "name": "Secret"}).status_code == 403
-    mine = sam_agent.post("/api/agent/projects", json={"key": "c" * 64, "name": "Mine"}).json()
-    # Whoever linked a project can add their organisation's teams to it.
-    team = ana.post(f"/api/orgs/{org_id}/teams", json={"name": "Ops"}).json()
-    assert sam.post(f"/api/orgs/{org_id}/projects/{mine['id']}/teams", json={"team_id": team["id"]}).status_code == 200
+    # Only admins add projects.
+    assert sam_agent.post("/api/agent/projects", json={"key": "c" * 64, "name": "Mine"}).status_code == 403
+    secret = ana.get(f"/api/orgs/{org_id}/projects").json()[0]
+    sam_id = next(p["id"] for p in ana.get(f"/api/orgs/{org_id}/people").json() if p["username"] == "sam")
+    # Given to one person, without a team.
+    assert ana.post(f"/api/orgs/{org_id}/projects/{secret['id']}/people", json={"person_id": sam_id}).status_code == 200
+    assert sam_agent.post("/api/agent/projects", json={"key": "b" * 64, "name": "Secret"}).json()["id"] == secret["id"]
+    assert sam.post(f"/api/orgs/{org_id}/projects/{secret['id']}/teams", json={"team_id": 1}).status_code == 403
+    assert ana.delete(f"/api/orgs/{org_id}/projects/{secret['id']}/people/{sam_id}").status_code == 200
+    assert sam.get(f"/api/orgs/{org_id}/projects").json() == []
     # The same first commit in another organisation is a separate project.
     bo = signup(app, "bo", ip="4.4.4.4")
     other = new_org(bo, "Other")
@@ -440,3 +446,142 @@ def test_a_company_network_server_offers_its_root_certificate(monkeypatch, tmp_p
     assert browser(app).get("/api/state").json()["root_certificate"] is True
     # Fingerprints are short enough to compare by eye.
     assert len(host.fingerprint(pem).split()) == 6
+
+
+
+def test_people_join_an_organisation_with_its_code():
+    app = create_team_app()
+    ana = signup(app, "ana")
+    made = ana.post("/api/orgs", json={"name": "Acme"}).json()
+    code = made["code"]
+    assert ana.get(f"/api/orgs/{made['id']}").json()["code"] == code
+    assert browser(app).post("/api/orgs/check", json={"code": code.lower()}).json() == {"org": "Acme"}
+    # Signing up with the code joins as a member, who sees no project yet and not the code.
+    sam = browser(app, ip="2.2.2.2")
+    assert sam.post("/api/signup", json={"username": "sam", "password": PASSWORD, "org_code": code}).status_code == 200
+    assert sam.get("/api/state").json()["orgs"] == [{"id": made["id"], "name": "Acme", "role": "member"}]
+    assert sam.get(f"/api/orgs/{made['id']}").json()["code"] is None
+    assert sam.post(f"/api/orgs/{made['id']}/projects", json={"name": "P"}).status_code == 403
+    # Someone with an account joins with it too.
+    bo = signup(app, "bo", ip="3.3.3.3")
+    assert bo.post("/api/orgs/join", json={"code": code}).json()["org"] == "Acme"
+    # A new code stops the old one.
+    new = ana.post(f"/api/orgs/{made['id']}/code", json={}).json()["code"]
+    assert new != code
+    assert signup(app, "cy", ip="4.4.4.4").post("/api/orgs/join", json={"code": code}).status_code == 404
+
+
+def test_admins_make_projects_from_repos_and_make_other_admins():
+    app = create_team_app()
+    ana = signup(app, "ana")
+    org_id = new_org(ana)
+    sam = signup(app, "sam", invite=invite(ana, org_id), ip="2.2.2.2")
+    bo = signup(app, "bo", invite=invite(ana, org_id), ip="3.3.3.3")
+    people = {p["username"]: p["id"] for p in ana.get(f"/api/orgs/{org_id}/people").json()}
+    # The owner makes sam an admin; sam can then make bo one, but can't turn an admin back.
+    assert ana.put(f"/api/orgs/{org_id}/people/{people['sam']}/role", json={"role": "admin"}).status_code == 200
+    assert sam.put(f"/api/orgs/{org_id}/people/{people['bo']}/role", json={"role": "admin"}).status_code == 200
+    assert sam.put(f"/api/orgs/{org_id}/people/{people['bo']}/role", json={"role": "member"}).status_code == 403
+    made = sam.post(f"/api/orgs/{org_id}/projects", json={"name": "shop", "repo": "github:acme/shop"}).json()
+    assert sam.post(f"/api/orgs/{org_id}/projects", json={"name": "dup", "repo": "github:acme/shop"}).status_code == 409
+    # A clone of that repo finds it, and from then on its first commit does too.
+    agent = link_device(app, bo, org_id)
+    found = agent.post("/api/agent/projects", json={"key": "e" * 64, "name": "shop-clone", "repo": "github:acme/shop"}).json()
+    assert found == {"id": made["id"], "name": "shop"}
+    assert agent.post("/api/agent/projects", json={"key": "e" * 64, "name": "x"}).json()["id"] == made["id"]
+
+
+def test_a_linked_devdash_manages_only_its_own_organisation():
+    app = create_team_app()
+    ana = signup(app, "ana")
+    org_id = new_org(ana)
+    other = new_org(ana, "Other")
+    agent = link_device(app, ana, org_id)
+    # From DevDash's own screens: the admin makes a team and an invite in the linked organisation.
+    assert agent.post(f"/api/orgs/{org_id}/teams", json={"name": "Web"}).status_code == 200
+    assert agent.post(f"/api/orgs/{org_id}/invites", json={}).status_code == 200
+    assert agent.get(f"/api/orgs/{org_id}").json()["code"]
+    # Not another organisation of the same person, and not their account.
+    assert agent.get(f"/api/orgs/{other}/teams").status_code == 403
+    assert agent.put("/api/password", json={"current": PASSWORD, "new": "another long one"}).status_code == 403
+    sam = signup(app, "sam", invite=invite(ana, org_id), ip="2.2.2.2")
+    sam_agent = link_device(app, sam, org_id)
+    # A member's DevDash has a member's rights.
+    assert sam_agent.post(f"/api/orgs/{org_id}/teams", json={"name": "Mine"}).status_code == 403
+    assert sam_agent.get(f"/api/orgs/{org_id}/teams").status_code == 200
+
+
+def test_devdash_makes_an_account_and_an_organisation_in_one_go():
+    app = create_team_app()
+    made = browser(app).post("/api/agent/register", json={
+        "username": "ana", "password": PASSWORD, "org_name": "Acme", "device": "laptop"}).json()
+    assert made["org"] == "Acme" and made["person"]["role"] == "owner" and made["token"].startswith("ddt_")
+    agent = browser(app)
+    agent.headers["Authorization"] = f"Bearer {made['token']}"
+    code = agent.get(f"/api/orgs/{made['org_id']}").json()["code"]
+    # A teammate joins with the code, from their own DevDash.
+    joined = browser(app, ip="2.2.2.2").post("/api/agent/register", json={
+        "username": "sam", "password": PASSWORD, "org_code": code, "device": "pc"}).json()
+    assert joined["org_id"] == made["org_id"] and joined["person"]["role"] == "member"
+    # Signing in again links another DevDash; wrong passwords don't.
+    login = browser(app).post("/api/agent/login", json={"username": "sam", "password": PASSWORD, "device": "pc2"})
+    assert login.status_code == 200 and login.json()["org_id"] == made["org_id"]
+    assert browser(app).post("/api/agent/login", json={"username": "sam", "password": "nope", "device": "x"}).status_code == 401
+    # Someone in two organisations is asked which.
+    ana = browser(app)
+    ana.post("/api/login", json={"username": "ana", "password": PASSWORD})
+    new_org(ana, "Other")
+    both = browser(app).post("/api/agent/login", json={"username": "ana", "password": PASSWORD, "device": "y"})
+    assert both.status_code == 409 and len(both.json()["orgs"]) == 2
+
+
+def test_the_team_overview_shows_only_what_a_person_may_see():
+    app = create_team_app()
+    ana = signup(app, "ana")
+    org_id = new_org(ana)
+    web = ana.post(f"/api/orgs/{org_id}/teams", json={"name": "Web"}).json()
+    sam = signup(app, "sam", invite=invite(ana, org_id, team_id=web["id"]), ip="2.2.2.2")
+    shop = ana.post(f"/api/orgs/{org_id}/projects", json={"name": "shop"}).json()
+    ana.post(f"/api/orgs/{org_id}/projects", json={"name": "secret"})
+    ana.post(f"/api/orgs/{org_id}/projects/{shop['id']}/teams", json={"team_id": web["id"]})
+    seen = sam.get(f"/api/orgs/{org_id}/overview").json()
+    assert [p["name"] for p in seen["projects"]] == ["shop"]
+    assert seen["projects"][0]["teams"] == [{"id": web["id"], "name": "Web"}]
+    assert seen["teams"][0]["mine"] is True and [p["name"] for p in seen["teams"][0]["people"]] == ["sam"]
+    assert len(ana.get(f"/api/orgs/{org_id}/overview").json()["projects"]) == 2
+
+
+def test_team_chat_keeps_each_conversation_to_its_people():
+    app = create_team_app()
+    ana = signup(app, "ana")
+    org_id = new_org(ana)
+    web = ana.post(f"/api/orgs/{org_id}/teams", json={"name": "Web"}).json()
+    sam = signup(app, "sam", invite=invite(ana, org_id, team_id=web["id"]), ip="2.2.2.2")
+    ria = signup(app, "ria", invite=invite(ana, org_id), ip="3.3.3.3")
+    chats = {c["name"]: c for c in sam.get(f"/api/orgs/{org_id}/chat").json()}
+    assert set(chats) == {"Everyone", "Web"}
+    # Ria isn't in Web, so she can't read or write there.
+    assert {c["name"] for c in ria.get(f"/api/orgs/{org_id}/chat").json()} == {"Everyone"}
+    web_chat = chats["Web"]["id"]
+    sent = sam.post(f"/api/orgs/{org_id}/chat/{web_chat}/messages", json={"text": "  shipping the coupon fix today  "}).json()
+    assert sent["text"] == "shipping the coupon fix today"
+    assert ria.get(f"/api/orgs/{org_id}/chat/{web_chat}/messages").status_code == 404
+    assert ria.post(f"/api/orgs/{org_id}/chat/{web_chat}/messages", json={"text": "hi"}).status_code == 404
+    # The admin sees every team's chat, with what's unread.
+    unread = {c["name"]: c["unread"] for c in ana.get(f"/api/orgs/{org_id}/chat").json()}
+    assert unread["Web"] == 1
+    ana.post(f"/api/orgs/{org_id}/chat/{web_chat}/read", json={"last_id": sent["id"]})
+    assert {c["name"]: c["unread"] for c in ana.get(f"/api/orgs/{org_id}/chat").json()}["Web"] == 0
+    # Polling gets only what's new.
+    later_one = ana.post(f"/api/orgs/{org_id}/chat/{web_chat}/messages", json={"text": "nice"}).json()
+    assert [m["text"] for m in sam.get(f"/api/orgs/{org_id}/chat/{web_chat}/messages?after={sent['id']}").json()] == ["nice"]
+    # Direct chats are for two people only.
+    people = {p["username"]: p["id"] for p in ana.get(f"/api/orgs/{org_id}/people").json()}
+    dm = sam.post(f"/api/orgs/{org_id}/chat/direct", json={"person_id": people["ria"]}).json()["id"]
+    assert ria.post(f"/api/orgs/{org_id}/chat/direct", json={"person_id": people["sam"]}).json()["id"] == dm
+    assert ana.get(f"/api/orgs/{org_id}/chat/{dm}/messages").status_code == 404
+    # Only the writer (or an admin) deletes a message.
+    assert ria.delete(f"/api/orgs/{org_id}/chat/{web_chat}/messages/{sent['id']}").status_code == 404
+    assert ana.delete(f"/api/orgs/{org_id}/chat/{web_chat}/messages/{later_one['id']}").status_code == 200
+    assert sam.get(f"/api/orgs/{org_id}/chat/{web_chat}/messages").json()[-1]["deleted"] is True
+    assert sam.post(f"/api/orgs/{org_id}/chat/{web_chat}/messages", json={"text": "x" * 5000}).status_code == 422

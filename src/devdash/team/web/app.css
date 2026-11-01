@@ -100,6 +100,7 @@ a { color: var(--accent); }
 .error:empty { display: none; }
 .back { display: inline-block; margin-top: 8px; text-decoration: none; font-weight: 600; }
 .code { font-family: ui-monospace, monospace; letter-spacing: 0.08em; }
+.code.big { font-size: 26px; color: var(--accent); }
 
 .card {
   background: var(--card);
