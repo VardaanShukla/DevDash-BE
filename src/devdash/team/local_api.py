@@ -90,6 +90,12 @@ def add_root_certificate(body: RootCertificate):
     return _team(client.add_root_certificate, body.pem)
 
 
+@router.post("/api/team/root-certificate/fetch")
+def fetch_root_certificate(body: LinkRequest):
+    """A company network server's root certificate and fingerprint, to show before trusting it."""
+    return _team(client.fetch_root_certificate, body.url)
+
+
 @router.get("/api/team/remote")
 def remote():
     return _team(client.remote)

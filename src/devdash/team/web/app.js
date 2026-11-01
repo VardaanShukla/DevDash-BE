@@ -237,7 +237,16 @@ async function signupView(invite) {
     }),
     h("p", { class: "muted" }, "Have an account? ",
       h("a", { href: invite ? `#login&join=${encodeURIComponent(invite)}` : "#login" }, "Sign in")),
+    certificateHint(),
   ));
+}
+
+// On a company network: the server's own root certificate, for a phone or browser to trust once.
+function certificateHint() {
+  if (!state.root_certificate) return null;
+  return h("p", { class: "muted" }, "Browser warned about this site? ",
+    h("a", { href: "/root.crt", download: "devdash-team-root.crt" }, "Get this server's certificate"),
+    " and install it once (Android: Settings → Security → Install a certificate → CA certificate).");
 }
 
 function loginView(linkCode, invite) {
@@ -253,6 +262,7 @@ function loginView(linkCode, invite) {
       render();
     }),
     state.signup ? h("p", { class: "muted" }, "New here? ", h("a", { href: "#signup" }, "Make an account")) : null,
+    certificateHint(),
   ));
 }
 

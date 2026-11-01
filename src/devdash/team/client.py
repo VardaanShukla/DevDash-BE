@@ -114,6 +114,34 @@ def add_root_certificate(text: str) -> dict:
     return status()
 
 
+def fetch_root_certificate(url: str) -> dict:
+    """The root certificate a company network team server offers at /root.crt, with its
+    fingerprint for the person to compare with the host's Settings before trusting it. It's
+    fetched without checking the server's certificate (that's what isn't trusted yet); a
+    wrong one only means linking still fails, since the server must still prove itself."""
+    from devdash.team.host import fingerprint
+
+    url = clean_url(url)
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url + "/root.crt", headers={"User-Agent": "DevDash"}),
+                                    timeout=TIMEOUT, context=context) as response:
+            text = response.read(20_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise TeamError("This team server doesn't offer a certificate of its own. Ask its host for the right one.")
+        raise TeamError(f"The team server answered {error.code}.")
+    except (OSError, urllib.error.URLError) as error:
+        raise TeamError(f"Couldn't reach the team server ({getattr(error, 'reason', error)}). Is it running, and are you "
+                        "on its network?")
+    found = PEM.search(text)
+    if found is None:
+        raise TeamError("The team server didn't send a certificate.")
+    return {"pem": found.group(0), "fingerprint": fingerprint(found.group(0))}
+
+
 def _call(url: str, path: str, body: dict | None = None, token: str | None = None) -> tuple[int, dict]:
     headers = {"Accept": "application/json", "User-Agent": "DevDash"}
     data = None

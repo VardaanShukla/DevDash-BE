@@ -420,3 +420,23 @@ def test_company_network_hosting_refuses_another_computers_ip(monkeypatch):
     host.check_own_addresses(["192.168.31.141", "devdash.corp"])
     with pytest.raises(host.HostError, match="isn't this computer's address"):
         host.check_own_addresses(["192.168.31.50"])
+
+
+def test_a_company_network_server_offers_its_root_certificate(monkeypatch, tmp_path):
+    import glob
+
+    found = sorted(glob.glob("/etc/ssl/certs/*.pem"))
+    if not found:
+        pytest.skip("no system certificate to try with")
+    pem = open(found[0]).read()
+    app = create_team_app()
+    assert browser(app).get("/root.crt").status_code == 404
+    assert browser(app).get("/api/state").json()["root_certificate"] is False
+    path = tmp_path / "root.crt"
+    path.write_text(pem)
+    monkeypatch.setattr(host, "root_certificate", lambda: path)
+    response = browser(app).get("/root.crt")
+    assert response.status_code == 200 and "BEGIN CERTIFICATE" in response.text
+    assert browser(app).get("/api/state").json()["root_certificate"] is True
+    # Fingerprints are short enough to compare by eye.
+    assert len(host.fingerprint(pem).split()) == 6

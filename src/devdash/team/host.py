@@ -109,6 +109,16 @@ def check_own_addresses(addresses: list[str]) -> None:
                             "phones that open it just need to be on the same network.")
 
 
+def fingerprint(pem: str) -> str:
+    """A short fingerprint of a certificate, for people to compare by eye: the start of its
+    SHA-256, in groups of four."""
+    import hashlib
+    import ssl
+
+    digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest().upper()[:24]
+    return " ".join(digest[i:i + 4] for i in range(0, 24, 4))
+
+
 def root_certificate() -> Path | None:
     """The root certificate of Caddy's own authority, which devices trust once to open the
     server without a warning; None until Caddy has made it."""
@@ -345,6 +355,8 @@ def status() -> dict:
         "setup_code": code,
         # Shown while hosting on the company network with Caddy's own certificate.
         "root_certificate": str(root_certificate()) if state and state.get("tunnel") == "network" and root_certificate() else None,
+        "root_fingerprint": fingerprint(root_certificate().read_text())
+        if state and state.get("tunnel") == "network" and root_certificate() else None,
         "tools": tools(),
     }
 

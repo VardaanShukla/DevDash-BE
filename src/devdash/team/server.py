@@ -461,13 +461,27 @@ def create_team_app() -> FastAPI:
     def styles():
         return FileResponse(WEB / "app.css", media_type="text/css")
 
+    @app.get("/root.crt", include_in_schema=False)
+    def root_certificate():
+        """On a company network, the root certificate of the server's own authority, for phones,
+        browsers and DevDash to trust once. It's public: it holds no key."""
+        from devdash.team import host
+
+        path = host.root_certificate()
+        if path is None:
+            raise HTTPException(404, "This server doesn't use its own certificate.")
+        return FileResponse(path, media_type="application/x-x509-ca-cert", filename="devdash-team-root.crt")
+
     # ------------------------------------------------------------ accounts
 
     @app.get("/api/state")
     def state(request: Request):
         conn = store.connect()
         claimed = conn.execute("SELECT 1 FROM people WHERE admin = 1").fetchone() is not None
-        result = {"server": server_name(conn), "claimed": claimed, "signup": signups_open(conn), "me": None, "orgs": []}
+        from devdash.team import host
+
+        result = {"server": server_name(conn), "claimed": claimed, "signup": signups_open(conn), "me": None, "orgs": [],
+                  "root_certificate": host.root_certificate() is not None}
         try:
             me = person(request)
         except HTTPException:
