@@ -74,7 +74,10 @@ DEFAULTS = {
     # None until the person picks: the dashboard asks once.
     "uncommitted": None,
     "shortcuts": DEFAULT_SHORTCUTS,
+    # Days a change's lines are kept; older ones keep their prompt and counts. 0: for good.
+    "keep_diffs_days": 10,
 }
+MAX_KEEP_DAYS = 3650
 MAX_KEY = 20
 # The AIs that can write explanations (see providers.py), and the longest model name taken.
 AI_PROVIDERS = ("claude", "codex", "ollama", "antigravity", "hosted")
@@ -100,7 +103,9 @@ def get() -> dict:
         key = DEFAULT_SHORTCUTS.get(action, "")
         defaults[action] = "" if key in taken else key
     ai = saved.get("ai") or {}
+    keep = saved.get("keep_diffs_days")
     return {"theme": saved.get("theme", DEFAULTS["theme"]), "uncommitted": saved.get("uncommitted"),
+            "keep_diffs_days": keep if _days(keep) else DEFAULTS["keep_diffs_days"],
             "shortcuts": {**defaults, **chosen}, "home": _layout(saved.get("home")),
             "ai": {"provider": ai.get("provider") if ai.get("provider") in AI_PROVIDERS else "claude",
                    "models": {k: v for k, v in (ai.get("models") or {}).items() if k in AI_PROVIDERS and isinstance(v, str)}}}
@@ -119,6 +124,10 @@ def update(changes: dict) -> dict:
             if not isinstance(value, bool):
                 raise PreferenceError("uncommitted is true or false")
             current["uncommitted"] = value
+        elif name == "keep_diffs_days":
+            if not _days(value):
+                raise PreferenceError(f"keep_diffs_days is a whole number of days from 0 (keep for good) to {MAX_KEEP_DAYS}")
+            current["keep_diffs_days"] = value
         elif name == "shortcuts":
             current["shortcuts"] = _shortcuts({**current["shortcuts"], **_checked(value)})
         elif name == "home":
@@ -129,6 +138,10 @@ def update(changes: dict) -> dict:
             raise PreferenceError(f"no setting called {name!r}")
     _save(current)
     return current
+
+
+def _days(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_KEEP_DAYS
 
 
 def reset_shortcuts() -> dict:

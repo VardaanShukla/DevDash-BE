@@ -43,7 +43,11 @@ IGNORED = [
     "*.lock", "package-lock.json", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map",
     "node_modules/*", "*/node_modules/*", "dist/*", "build/*", "*/__pycache__/*", "__pycache__/*",
     ".git/*", ".venv/*", "venv/*",
+    # Build output inside a project, such as a UI bundled into a Python package.
+    "*/dist/*", "*/build/*", "web/assets/*", "*/web/assets/*", "*.bundle.js", "*.chunk.js",
 ]
+# A changed line this long is minified or generated code: its diff is skipped.
+MINIFIED_LINE = 2000
 UNKNOWN_PROMPT = "(prompt not captured)"
 # Where Claude writes the request behind its changes before committing, for tools whose
 # edits never pass through Claude Code (the Claude app). Kept out of git by `devdash init`.
@@ -406,7 +410,7 @@ def _finish_turn(conn, turn, watch: bool) -> None:
             if after is None:
                 continue  # became binary or too large
         diff = unified_diff(row["file_path"], row["before_content"], after)
-        if diff:
+        if diff and not minified(diff):
             conn.execute(
                 "INSERT INTO changes (repo_id, turn_id, file_path, diff, source, via, created_at)"
                 " VALUES (?, ?, ?, ?, 'ai', ?, ?)",
@@ -582,7 +586,7 @@ def _commit(conn, repo) -> None:
         if linked or watched or _ignored(file_path):
             continue
         diff = git.commit_file_diff(root, sha, file_path)
-        if diff:
+        if diff and not minified(diff):
             conn.execute(
                 "INSERT INTO changes (repo_id, turn_id, commit_sha, file_path, diff, source, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -605,6 +609,15 @@ def _take_prompt_file(conn, repo) -> int | None:
     conn.execute("UPDATE turns SET ended_at = started_at WHERE id = ?", (turn["id"],))
     path.unlink()
     return turn["id"]
+
+
+def minified(diff: str) -> bool:
+    """True when a changed line is too long to be hand-written: a bundle or minified file."""
+    return any(len(line) > MINIFIED_LINE for line in diff.splitlines() if line[:1] in "+-")
+
+
+def ignored(relative: str) -> bool:
+    return _ignored(relative)
 
 
 def unified_diff(file_path: str, before: str | None, after: str | None) -> str:

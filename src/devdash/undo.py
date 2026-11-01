@@ -89,6 +89,8 @@ def _change(change_key: str):
     conn.close()
     if not rows:
         raise NotFound("No such change.")
+    if any(not row["diff"] for row in rows):
+        raise UndoError("This change is older than Settings keeps lines for, so it can't be undone from here.")
     root = Path(rows[0]["path"])
     if git.toplevel(root) != root.resolve():
         raise UndoError(f"The project's folder isn't there any more: {root}")

@@ -1,0 +1,36 @@
+# The team server behind Caddy, which gets and renews the HTTPS certificate for DOMAIN.
+# Set DOMAIN in deploy/.env (DOMAIN=teams.example.com), point its DNS at this machine, open
+# ports 80 and 443, then from the DevDash-BE folder:
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml logs devdash     (shows the setup code)
+services:
+  devdash:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in deploy/.env, like DOMAIN=teams.example.com}
+    volumes:
+      - devdash-data:/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - devdash
+    restart: unless-stopped
+
+volumes:
+  devdash-data:
+  caddy-data:
+  caddy-config:

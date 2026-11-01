@@ -38,7 +38,48 @@ def main(argv: list[str] | None = None) -> int:
     serve_cmd = commands.add_parser("serve", help="run the local API the UI talks to")
     serve_cmd.add_argument("--port", type=int, default=8765)
 
+    host_cmd = commands.add_parser("host", help="host a team server anyone can open over HTTPS, where people make "
+                                                "organisations and teams and share explanations of changes")
+    host_cmd.add_argument("--tunnel", choices=["network", "domain", "cloudflare", "none"], default="cloudflare",
+                          help="network: a company server reached by IP or internal names on the office network or "
+                               "VPN (give --address); domain: your own public domain, with Caddy for HTTPS (give "
+                               "--domain); cloudflare: a public address from this computer (default); none: this "
+                               "computer only")
+    host_cmd.add_argument("--address", help="with --tunnel network: the server's IP and internal names, comma-separated, "
+                                            "like 10.0.0.5,devdash.corp")
+    host_cmd.add_argument("--https-port", type=int, default=8443, help="with --tunnel network: the HTTPS port (8443)")
+    host_cmd.add_argument("--cert", help="with --tunnel network: the company's certificate file for those names "
+                                         "(otherwise Caddy makes its own)")
+    host_cmd.add_argument("--key", help="with --cert: the certificate's key file")
+    host_cmd.add_argument("--domain", help="the domain it answers on, like team.example.com (with --tunnel domain)")
+    host_cmd.add_argument("--no-caddy", action="store_true",
+                          help="with --tunnel domain: something else (Docker's Caddy, nginx) provides HTTPS in front")
+    host_cmd.add_argument("--bind", default="127.0.0.1", help="the address to listen on; only change it inside Docker")
+    host_cmd.add_argument("--port", type=int, default=8770)
+
+    team_cmd = commands.add_parser("team", help="link this DevDash to a team server, and link projects to it")
+    team_actions = team_cmd.add_subparsers(dest="action", required=True)
+    connect_server = team_actions.add_parser("connect", help="link to a team server (you approve it in your browser)")
+    connect_server.add_argument("url")
+    team_actions.add_parser("status", help="show the team server this DevDash is linked to")
+    team_actions.add_parser("disconnect", help="forget the team server here")
+    link_cmd = team_actions.add_parser("link", help="link a tracked project to the team server")
+    link_cmd.add_argument("path", nargs="?", default=".")
+
     args = parser.parse_args(argv)
+
+    if args.command == "host":
+        from devdash.team import host
+
+        try:
+            return host.run(args.port, args.tunnel, args.domain, not args.no_caddy, args.bind,
+                            args.address, args.https_port, args.cert, args.key)
+        except host.HostError as error:
+            print(f"devdash: {error}")
+            return 1
+
+    if args.command == "team":
+        return _team(args)
 
     if args.command == "record":
         from devdash.capture.record import run_hook
@@ -109,6 +150,56 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.port)
 
     return 1
+
+
+def _team(args) -> int:
+    import time
+
+    from devdash.team import client
+
+    try:
+        if args.action == "connect":
+            found = client.start(args.url)
+            print(f"Open this on any device where you're signed in to the team server, and approve it:\n\n"
+                  f"  {found['pending']['link']}\n\nThe code shown there should be {found['pending']['user_code']}.")
+            print("Waiting… (Ctrl+C to stop)")
+            while not client.poll()["connected"]:
+                time.sleep(3)
+            now = client.status()
+            print(f"Linked to {now['org']} as {now['person']['name']}.")
+            print("Next: devdash team link (in a project's folder), then Share with team on an explanation.")
+        elif args.action == "status":
+            now = client.status()
+            if not now["connected"]:
+                print("Not linked to a team server. Run: devdash team connect <address>")
+            else:
+                print(f"Linked to {now['org']} ({now['url']}) as {now['person']['name']}.")
+                for linked in now["projects"].values():
+                    print(f"  project: {linked['name']}")
+        elif args.action == "disconnect":
+            client.disconnect()
+            print("Forgot the team server here. Unlink this DevDash on the server too (You → Linked DevDashes).")
+        elif args.action == "link":
+            from devdash.store import connect
+
+            root = git_toplevel(Path(args.path))
+            conn = connect()
+            row = conn.execute("SELECT id FROM repos WHERE path = ?", (str(root),)).fetchone() if root else None
+            conn.close()
+            repo_id = row["id"] if row else None
+            if repo_id is None:
+                print("devdash: this folder isn't a tracked project. Add it first: devdash init")
+                return 1
+            client.link(repo_id)
+            print(f"Linked {root.name} to the team server.")
+    except client.TeamError as error:
+        print(f"devdash: {error}")
+        return 1
+    except KeyboardInterrupt:
+        client.cancel()
+        print("\nStopped linking.")
+        return 1
+    return 0
 
 
 def _serve(port: int) -> int:

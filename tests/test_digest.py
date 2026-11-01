@@ -393,3 +393,109 @@ def test_a_prompts_change_opens_with_its_lines_and_each_function_explains(repo, 
     hello = next(u for f in again["files"] for u in f["units"] if u["name"] == "hello")
     assert hello["explanation"]["summary"] == "Says hello loudly."
     assert client().get("/api/digest/change", params={"id": "turn-999-1"}).status_code == 404
+
+
+def test_digest_can_show_one_projects_prompts(repo, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    connect_claude(repo)
+    connect_claude(other)
+    claude_edits(repo, "change this one", {"app.py": "v = 1\n"})
+    claude_edits(other, "change the other", {"b.py": "v = 2\n"})
+    ids = {r["name"]: r["id"] for r in client().get("/api/repos").json()}
+    every = client().get("/api/digest").json()
+    assert {c["prompt"] for c in every["changes"]} == {"change this one", "change the other"}
+    mine = client().get(f"/api/digest?repo={ids[repo.name]}").json()
+    assert [c["prompt"] for c in mine["changes"]] == ["change this one"]
+    assert mine["claude"]["prompts"] == 1
+
+
+def test_built_files_and_minified_lines_are_not_recorded(repo):
+    connect_claude(repo)
+    claude_edits(repo, "rebuild the ui", {
+        "src/pkg/web/assets/index-abc.js": "var a=1;\n",
+        "app.min2.js": "x" * 3000 + "\n",
+        "app.py": "v = 3\n",
+    })
+    files = [f["path"] for c in client().get("/api/digest").json()["changes"] for f in c["files"]]
+    assert files == ["app.py"]
+
+
+def test_old_lines_are_cleared_but_the_prompt_and_counts_stay(repo):
+    from devdash import retention
+    from devdash.store import connect
+
+    connect_claude(repo)
+    claude_edits(repo, "old work", {"app.py": "a = 1\nb = 2\n"})
+    conn = connect()
+    with conn:
+        conn.execute("UPDATE changes SET created_at = '2020-01-01T00:00:00+00:00'")
+        conn.execute("INSERT INTO changes (repo_id, file_path, diff, source, created_at)"
+                     " SELECT repo_id, 'web/assets/index-x.js', 'big', 'human', created_at FROM changes")
+    conn.close()
+    before = client().get("/api/digest?day=2020-01-01").json()
+
+    assert retention.prune(10)["cleared"] == 1
+    after = client().get("/api/digest?day=2020-01-01").json()
+    assert after["changes"][0]["prompt"] == "old work"
+    assert after["claude"]["additions"] == before["claude"]["additions"] > 0
+    assert [f["path"] for f in after["changes"][0]["files"]] == ["app.py"]
+    assert client().post("/api/digest/undo", json={"change": after["changes"][0]["id"]}).status_code == 409
+    conn = connect()
+    assert conn.execute("SELECT count(*) FROM changes WHERE file_path LIKE 'web/assets/%'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_zero_days_keeps_lines_for_good(repo):
+    from devdash import retention
+
+    connect_claude(repo)
+    claude_edits(repo, "old work", {"app.py": "a = 1\n"})
+    assert retention.prune(0)["cleared"] == 0
+
+
+def test_an_app_chats_note_records_its_change_without_a_commit(repo):
+    connect_claude(repo)
+    (repo / "app.py").write_text("v = 1\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "start")
+    (repo / "app.py").write_text("v = 2\n")
+    (repo / "new.py").write_text("x = 1\n")
+    inbox = repo / ".devdash" / "turns"
+    inbox.mkdir(parents=True)
+    (inbox / "20261031T183000Z.json").write_text(json.dumps({
+        "prompt": "bump v and add x",
+        "files": [{"path": "app.py", "before": "v = 1\n"}, {"path": "new.py", "before": None},
+                  {"path": "../outside.py", "before": None}],
+    }))
+    (inbox / "broken.json").write_text("{")
+
+    changes = client().get("/api/digest").json()["changes"]
+    assert [c["prompt"] for c in changes] == ["bump v and add x"]
+    assert sorted(f["path"] for f in changes[0]["files"]) == ["app.py", "new.py"]
+    assert changes[0]["tool"] == "Claude"
+    assert not (inbox / "20261031T183000Z.json").exists() and (inbox / "broken.json.bad").exists()
+    # Read once: loading the page again doesn't record it twice.
+    assert len(client().get("/api/digest").json()["changes"]) == 1
+
+
+def test_an_app_chats_note_keeps_the_time_of_its_request(repo):
+    connect_claude(repo)
+    (repo / "app.py").write_text("v = 2\n")
+    inbox = repo / ".devdash" / "turns"
+    inbox.mkdir(parents=True)
+    (inbox / "a.json").write_text(json.dumps({"prompt": "yesterday's work", "at": "2020-01-01T10:00:00Z",
+                                              "files": [{"path": "app.py", "before": "v = 1\n"}]}))
+    assert client().get("/api/digest").json()["changes"] == []  # read now, but made in 2020
+    old = client().get("/api/digest?day=2020-01-01").json()["changes"]
+    assert [c["prompt"] for c in old] == ["yesterday's work"]
+
+
+def test_a_module_constant_below_a_function_is_not_that_functions_change():
+    from devdash import compare
+
+    hunks = compare.parse_patch(
+        "diff --git a/m.py b/m.py\n--- a/m.py\n+++ b/m.py\n@@ -1,4 +1,4 @@\n"
+        " def helper():\n     return 1\n \n-NAMES = {}\n+NAMES = {'a': 1}\n")[0]["hunks"]
+    assert compare._functions(hunks) == []

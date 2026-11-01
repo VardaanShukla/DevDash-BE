@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from devdash import agenda as agenda_module
 from devdash import auth
@@ -22,6 +22,7 @@ from devdash import explain as explain_module
 from devdash import flow as flow_module
 from devdash import functions as functions_module
 from devdash import preferences as preferences_module
+from devdash import retention
 from devdash import codecommit
 from devdash import git
 from devdash import github
@@ -869,6 +870,7 @@ class HomeLayout(BaseModel):
 class Preferences(BaseModel):
     theme: Literal["dark", "light"]
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
+    keep_diffs_days: int  # days a change's lines are kept; older ones keep prompt and counts; 0: for good
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
     ai: ExplainerChoice  # which AI writes explanations, and with which model
     home: HomeLayout  # Home's widgets, each placed on the grid with its style and settings
@@ -877,6 +879,7 @@ class Preferences(BaseModel):
 class PreferenceChange(BaseModel):
     theme: Literal["dark", "light"] | None = None
     uncommitted: bool | None = None
+    keep_diffs_days: int | None = Field(None, ge=0, le=3650)
     shortcuts: dict[str, str] | None = None  # only the actions to change; "" turns one off
     ai: ExplainerChoiceChange | None = None
     home: HomeLayout | None = None
@@ -1488,12 +1491,14 @@ def create_app() -> FastAPI:
                  **home_module.project(Path(row["path"]))} for row in rows]
 
     @app.get("/api/digest", response_model=Digest)
-    def daily_digest(day: str | None = None):
+    def daily_digest(day: str | None = None,
+                     repo: int | None = Query(None, description="Only this project's changes; every project when left out")):
         """What Claude changed on one day (today unless `day` is YYYY-MM-DD), prompt by
         prompt, newest first, with the functions touched and rule-based risk flags. Only
         projects connected to Claude are recorded."""
+        threading.Thread(target=retention.maybe_prune, daemon=True).start()
         try:
-            return digest_module.digest(digest_module.parse_day(day))
+            return digest_module.digest(digest_module.parse_day(day), repo)
         except digest_module.DigestError as error:
             raise HTTPException(400, str(error))
 
@@ -1559,9 +1564,13 @@ def create_app() -> FastAPI:
     def change_preferences(body: PreferenceChange):
         """Changes only the settings given; shortcuts merge one action at a time."""
         try:
-            return preferences_module.update(body.model_dump(exclude_none=True))
+            saved = preferences_module.update(body.model_dump(exclude_none=True))
         except preferences_module.PreferenceError as error:
             raise HTTPException(400, str(error))
+        if body.keep_diffs_days is not None:
+            # A shorter time takes effect now, not at the next hourly look.
+            threading.Thread(target=retention.maybe_prune, kwargs={"force": True}, daemon=True).start()
+        return saved
 
     @app.post("/api/preferences/reset-shortcuts", response_model=Preferences)
     def reset_shortcuts():
@@ -1590,6 +1599,11 @@ def create_app() -> FastAPI:
     def disconnect_calendar():
         """Forgets the calendar's address."""
         agenda_module.disconnect()
+
+    # Hosting a team server, and linking to one (see devdash.team).
+    from devdash.team.local_api import router as team_router
+
+    app.include_router(team_router)
 
     if (WEB / "index.html").is_file():
         # Last, so every /api route above comes first.

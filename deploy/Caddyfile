@@ -1,0 +1,5 @@
+# HTTPS for the team server: Caddy gets the certificate for {$DOMAIN} by itself.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy devdash:8770
+}

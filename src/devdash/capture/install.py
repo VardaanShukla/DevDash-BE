@@ -660,6 +660,13 @@ When you change files here:
 2. Commit each logical change on its own, and end the message with
    Co-Authored-By: Claude <noreply@anthropic.com>
 3. Never commit .devdash/ (git already ignores it on this machine).
+4. If you leave the change uncommitted, write one file per request instead, once
+   your edits are done: .devdash/turns/<UTC time, like 20261031T183000Z>.json with
+   {"prompt": "<the request, word for word>",
+    "at": "<UTC time the request was made>",
+    "files": [{"path": "<path from the repo root>",
+               "before": "<the whole file before your first edit, or null if you created it>"}]}
+   DevDash records it as the request's change, then removes the file.
 """
 
 

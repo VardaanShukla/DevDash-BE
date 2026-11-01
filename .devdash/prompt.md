@@ -1,1 +1,0 @@
-Add AWS CodeCommit linking in Settings, like the GitHub one: sign in with one of my AWS profiles (no keys stored), list the region's repositories, clone one as a project, and show its open pull requests.
