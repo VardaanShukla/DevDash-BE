@@ -8,6 +8,7 @@ is in an empty folder, read-only where the tool allows it, so nothing touches a 
 Recording changes is separate (capture/): only Claude Code's edits are recorded today."""
 
 import base64
+import functools
 import glob
 import ipaddress
 import json
@@ -39,8 +40,24 @@ IDS = ("claude", "codex", "ollama", "antigravity", "hosted")
 NAMES = {"claude": "Claude", "codex": "ChatGPT Codex", "ollama": "Local model (Ollama)", "antigravity": "Antigravity",
          "hosted": "Your own server"}
 TIMEOUT = 240
-# A small model that runs on most laptops, offered when Ollama has none yet.
+# A small model that runs on most laptops, offered when the computer can't be read.
 SMALL_LOCAL_MODEL = "qwen2.5:3b"
+# Models to suggest, smallest first: name, Ollama's download size in GB, and what it's for.
+LOCAL_MODELS = [
+    ("qwen2.5:1.5b", 1.0, "The smallest. For a computer short on memory."),
+    (SMALL_LOCAL_MODEL, 1.9, "Small and quick. Enough for explanations."),
+    ("qwen2.5-coder:7b", 4.7, "Reads code better."),
+    ("qwen2.5-coder:14b", 9.0, "Reads code better still, and takes a bigger GPU."),
+    ("qwen2.5-coder:32b", 20.0, "The best at code here, for a large GPU."),
+]
+# A model takes about this much more in memory than its download, with the room NUM_CTX asks for.
+MODEL_OVERHEAD_GB = 1.0
+# Left for the system and other programs when a model runs in the computer's own memory.
+SPARE_MEMORY_GB = 3.0
+# Biggest download that still answers before TIMEOUT when it runs on the CPU alone.
+MAX_CPU_MODEL_GB = 2.0
+# Apple's chips share memory with the GPU, and macOS keeps about this much of it for the GPU.
+APPLE_GPU_SHARE = 0.7
 # Codex models when its own list (~/.codex/models_cache.json) isn't there yet, cheapest first.
 CODEX_FALLBACK = [
     {"id": "gpt-6-luna", "label": "GPT-6 Luna", "note": "Most efficient: fewest tokens, good for explanations."},
@@ -223,14 +240,82 @@ def _ollama_status() -> dict:
           "note": " · ".join(x for x in (_size(m.get("size")), (m.get("details") or {}).get("parameter_size")) if x)}
          for m in tags.get("models", []) if isinstance(m, dict) and m.get("name")),
         key=lambda m: m["size"])
-    for m in models:
-        m.pop("size")
+    sizes = {m["id"]: m.pop("size") for m in models}
     if not models:
         return _base("ollama", False, detail="Download a model",
-                     install=[{"shell": "Terminal", "command": f"ollama pull {SMALL_LOCAL_MODEL}"}], login="none")
+                     install=[{"shell": "Terminal", "command": f"ollama pull {ollama_advice()['recommended']}"}], login="none")
     # Local models need no account, and cost no tokens.
     return _base("ollama", True, signed_in=True, account="On this computer", login="none", models=models,
-                 default_model=models[0]["id"])
+                 default_model=_best_installed(sizes))
+
+
+@functools.cache
+def _hardware() -> dict:
+    """The computer's CPU, memory and biggest GPU, in GB. Read once: it doesn't change."""
+    memory = _memory()
+    gpus = _nvidia_gpus() or _amd_gpus()
+    gpu = max(gpus, key=lambda g: g["memory_total"], default=None)
+    found = {"cpu": _cpu_name(), "threads": os.cpu_count() or 1,
+             "memory_gb": round(memory["total"] / 2**30, 1) if memory else None,
+             "gpu": gpu["name"] if gpu else None,
+             "gpu_memory_gb": round(gpu["memory_total"] / 2**30, 1) if gpu else None}
+    if not gpu and platform.system() == "Darwin" and platform.machine() == "arm64" and found["memory_gb"]:
+        found.update(gpu="Apple GPU", gpu_memory_gb=round(found["memory_gb"] * APPLE_GPU_SHARE, 1))
+    return found
+
+
+def _cpu_name() -> str | None:
+    if platform.system() == "Darwin":
+        result = _run(["sysctl", "-n", "machdep.cpu.brand_string"], timeout=5)
+        name = result.stdout.strip() if result and result.returncode == 0 else ""
+    else:
+        try:
+            info = Path("/proc/cpuinfo").read_text()
+            name = re.search(r"^model name\s*:\s*(.+)$", info, re.M).group(1)
+        except (OSError, AttributeError):
+            name = platform.processor()
+    return re.sub(r"\s+", " ", re.sub(r"\((R|TM)\)|\bCPU\b|@.*$", "", name)).strip() or None
+
+
+def _fit(size_gb: float, hardware: dict) -> str:
+    """Where a model of this size runs here: "gpu", "mixed" (part GPU, part CPU, and slow),
+    "cpu", or "too_big" for the computer's memory."""
+    needs = size_gb + MODEL_OVERHEAD_GB
+    if needs <= (hardware["gpu_memory_gb"] or 0):
+        return "gpu"
+    memory = hardware["memory_gb"]
+    if memory is not None and needs > memory - SPARE_MEMORY_GB:
+        return "too_big"
+    return "mixed" if hardware["gpu_memory_gb"] else "cpu"
+
+
+def ollama_advice() -> dict:
+    """What this computer has, the model that suits it best, and how each suggested one
+    would run. Speed comes first: a model wholly on the GPU, else a small one on the CPU."""
+    hardware = _hardware()
+    fits = [(name, size, note, _fit(size, hardware)) for name, size, note in LOCAL_MODELS]
+    on_gpu = [f for f in fits if f[3] == "gpu"]
+    on_cpu = [f for f in fits if f[3] != "too_big" and f[1] <= MAX_CPU_MODEL_GB]
+    best = (on_gpu or on_cpu or fits)[-1 if on_gpu or on_cpu else 0]
+    if on_gpu:
+        reason = f"It fits wholly on your {hardware['gpu']}, so answers come quickly."
+    elif hardware["gpu"]:
+        reason = f"Your {hardware['gpu']} is too small for these models, so this one runs on the CPU at a usable speed."
+    else:
+        reason = "DevDash found no NVIDIA, AMD or Apple GPU, so this one runs on the CPU at a usable speed."
+    return {**hardware, "recommended": best[0], "reason": reason,
+            "models": [{"name": name, "size_gb": size, "note": note, "fit": fit} for name, size, note, fit in fits]}
+
+
+def _best_installed(sizes: dict[str, int]) -> str:
+    """The model to use when none was picked: the suggested one if it's here, else the biggest
+    that fits on the GPU, else the smallest, which is the quickest on a CPU."""
+    hardware = _hardware()
+    recommended = ollama_advice()["recommended"]
+    if recommended in sizes:
+        return recommended
+    on_gpu = [name for name, size in sizes.items() if _fit(size / 1e9, hardware) == "gpu"]
+    return max(on_gpu, key=sizes.get) if on_gpu else min(sizes, key=sizes.get)
 
 
 def _size(count) -> str | None:

@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from devdash import compare, prompts, undo
-from devdash.capture import scan
+from devdash.capture import inbox, scan
 from devdash.store import connect
 
 # Flags that make a change worth a careful look, then ones that are only worth knowing.
@@ -53,7 +53,7 @@ CONFIG = re.compile(r"(^|/)(package\.json|requirements[^/]*\.txt|pyproject\.toml
 
 
 # The AI tool behind a recorded prompt, by sessions.tool ('git': a Claude app chat's prompt file).
-TOOL_NAMES = {"claude-code": "Claude", "git": "Claude", "codex": "Codex", "antigravity": "Antigravity"}
+TOOL_NAMES = {"claude-code": "Claude", "git": "Claude", "claude-app": "Claude", "codex": "Codex", "antigravity": "Antigravity"}
 
 
 class DigestError(ValueError):
@@ -66,21 +66,27 @@ class NotFound(DigestError):
 
 _SELECT = ("SELECT c.id, c.repo_id, r.name AS repo_name, r.path AS repo_path, c.turn_id, c.commit_sha,"
            " c.file_path, c.diff, c.source, c.via, c.created_at, t.prompt, t.branch, t.started_at,"
-           " m.message, m.branch AS commit_branch, m.found_by, s.tool"
+           " m.message, m.branch AS commit_branch, m.found_by, s.tool,"
+           " c.additions AS kept_additions, c.deletions AS kept_deletions, c.pruned_at"
            " FROM changes c JOIN repos r ON r.id = c.repo_id"
            " LEFT JOIN turns t ON t.id = c.turn_id LEFT JOIN commits m ON m.sha = c.commit_sha"
            " LEFT JOIN sessions s ON s.id = t.session_id")
 
 
-def digest(day: date | None = None) -> dict:
+def digest(day: date | None = None, repo_id: int | None = None) -> dict:
+    """One day's changes; only one project's when `repo_id` is given."""
     day = day or datetime.now().astimezone().date()
     start = datetime.combine(day, time.min).astimezone()
     end = start + timedelta(days=1)
     # Commits Claude made where no hook saw it, such as a cloud session that pushed.
     scan.scan_all()
+    # Requests from Claude app chats, which leave a note in the project instead of a hook call.
+    inbox.ingest_all()
     conn = connect()
-    rows = conn.execute(_SELECT + " WHERE c.created_at >= ? AND c.created_at < ? ORDER BY c.created_at, c.id",
-                        (_utc(start), _utc(end))).fetchall()
+    where, params = " WHERE c.created_at >= ? AND c.created_at < ?", [_utc(start), _utc(end)]
+    if repo_id is not None:
+        where, params = where + " AND c.repo_id = ?", params + [repo_id]
+    rows = conn.execute(_SELECT + where + " ORDER BY c.created_at, c.id", params).fetchall()
     conn.close()
 
     groups: dict[tuple, dict] = {}
@@ -179,6 +185,8 @@ def units(file: dict) -> list[dict]:
         started: set[str | None] = set()
         for line in hunk["lines"]:
             names = compare._declared(line["text"])
+            if not names and compare.top_level(line["text"]):
+                current = None
             if names:
                 current = names[0]
             name = current if any(f["name"] == current for f in file["functions"]) else None
@@ -294,6 +302,11 @@ def _file(row, keep_hunks: bool = False) -> dict:
     """One recorded diff as a file entry with its line counts, functions and flags."""
     text = row["diff"]
     path = row["file_path"]
+    if row["pruned_at"]:
+        # Older than Settings keeps lines for: the counts were kept, the lines weren't.
+        return {**({"hunks": []} if keep_hunks else {}), "path": path, "status": "modified",
+                "additions": row["kept_additions"] or 0, "deletions": row["kept_deletions"] or 0,
+                "functions": [], "flags": [], "watched": row["via"] == "watch"}
     if not text.startswith("diff --git "):
         # Diffs taken by the Claude Code hooks are plain unified diffs.
         text = f"diff --git a/{path} b/{path}\n{text}"
@@ -340,6 +353,8 @@ def _name_hunks(hunks: list[dict], current: Path) -> None:
             if compare._declared(line):
                 hunk["context"] = line.strip()
                 break
+            if compare.top_level(line):
+                break  # module-level code above: the hunk starts outside any function
 
 
 def _mask(match: re.Match) -> str:

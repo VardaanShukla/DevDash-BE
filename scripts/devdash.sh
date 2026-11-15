@@ -50,7 +50,12 @@ finish() {
 }
 trap finish EXIT
 
-installed() { command -v pipx >/dev/null && pipx list --short 2>/dev/null | grep -q '^devdash '; }
+# `pipx list --short` is newer than the pipx some systems carry (Ubuntu 22.04's 1.0), so read the long form.
+installed() { command -v pipx >/dev/null && pipx list 2>/dev/null | grep -q 'package devdash '; }
+# Whether a DevDash answers on its address, rather than any process with "devdash serve" in its command line.
+running() { python3 -c "import urllib.request, sys; urllib.request.urlopen(sys.argv[1] + '/api/auth', timeout=2)" "$URL" >/dev/null 2>&1; }
+# The installed DevDash's own server process: its command line starts with the devdash command.
+serve_pids() { pgrep -f '(^|/)devdash serve( |$)' || true; }
 
 # Installs system packages with the computer's package manager, after asking: it takes
 # your password (sudo), except with Homebrew.
@@ -242,7 +247,7 @@ repair() {
 
 stop_running() {
   local pids
-  pids="$(pgrep -f 'devdash serve' || true)"
+  pids="$(serve_pids)"
   [ -z "$pids" ] && return
   echo "Stopping the DevDash that's running…"
   # shellcheck disable=SC2086
@@ -274,7 +279,7 @@ uninstall() {
 start() {
   command -v devdash >/dev/null || fail "DevDash isn't installed. Choose Install first."
   update_if_changed
-  if pgrep -f 'devdash serve' >/dev/null; then
+  if running; then
     echo "DevDash is already running."
   else
     devdash serve &

@@ -113,3 +113,21 @@ def test_keys_saved_before_ask_joined_the_menu_move_down_one():
     keys = client().get("/api/preferences").json()["shortcuts"]
     assert (keys["view:ask"], keys["view:changes"], keys["view:project"]) == ("4", "5", "7")
     assert keys["sync"] == "r"  # picked by the person: kept
+
+
+def test_keep_diffs_days_defaults_to_ten_and_checks_its_value():
+    from fastapi.testclient import TestClient
+    from devdash.api.app import create_app
+
+    api = TestClient(create_app(), base_url="http://127.0.0.1")
+    assert api.get("/api/preferences").json()["keep_diffs_days"] == 10
+    assert api.put("/api/preferences", json={"keep_diffs_days": 30}).json()["keep_diffs_days"] == 30
+    assert api.get("/api/preferences").json()["keep_diffs_days"] == 30
+    assert api.put("/api/preferences", json={"keep_diffs_days": -1}).status_code == 422
+
+
+def test_the_walkthrough_shows_until_it_is_finished_once():
+    api = client()
+    assert api.get("/api/preferences").json()["tour_done"] is False
+    assert api.put("/api/preferences", json={"tour_done": True}).json()["tour_done"] is True
+    assert api.get("/api/preferences").json()["tour_done"] is True

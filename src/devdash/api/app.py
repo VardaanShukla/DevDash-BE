@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from devdash import agenda as agenda_module
 from devdash import auth
@@ -22,6 +22,7 @@ from devdash import explain as explain_module
 from devdash import flow as flow_module
 from devdash import functions as functions_module
 from devdash import preferences as preferences_module
+from devdash import retention
 from devdash import codecommit
 from devdash import git
 from devdash import github
@@ -516,6 +517,58 @@ class Summary(BaseModel):
     explanation: ProjectExplanation | None
 
 
+class CommandStep(BaseModel):
+    step: str
+    detail: str = ""  # what the step does and what to watch for
+    command: str | None
+
+
+class GuideNeed(BaseModel):
+    name: str
+    why: str
+    check: str | None  # the command that shows it's installed
+
+
+class RunCommand(BaseModel):
+    what: str
+    command: str
+
+
+class GuideSetting(BaseModel):
+    name: str
+    what: str
+
+
+class GuideImage(BaseModel):
+    path: str
+    caption: str
+
+
+class GuideFunction(BaseModel):
+    name: str
+    path: str
+    what: str
+    use: str
+    signature: str | None = None
+
+
+class KtGuide(BaseModel):
+    """The short KT: what the project is, how to get it running, and its major functions."""
+    overview: str
+    needs: list[GuideNeed]
+    setup: list[CommandStep]
+    run: list[RunCommand]
+    how_to_use: list[str]
+    settings: list[GuideSetting]
+    start_here: list[StartHere]
+    functions: list[GuideFunction]
+    images: list[GuideImage]
+
+
+class KtGuideSaved(BaseModel):
+    guide: KtGuide | None
+
+
 class ExplainProjectRequest(BaseModel):
     head: str | None = None
     # Write it again, as when the file-by-file notes have filled in since.
@@ -632,6 +685,7 @@ class AskAnswer(BaseModel):
     answer: str
     files: list[str]  # the files the answer is about
     read: list[str]  # the files whose code the AI read for it
+    follow_ups: list[str] = []  # questions to ask next
     explained: int  # KT files with a note, which the AI also read
     total: int
 
@@ -833,6 +887,24 @@ class OllamaUsage(BaseModel):
     note: str | None  # why the CPU is shown instead of a GPU
 
 
+class SuggestedModel(BaseModel):
+    name: str
+    size_gb: float  # Ollama's download size
+    note: str
+    fit: Literal["gpu", "mixed", "cpu", "too_big"]  # where it would run on this computer
+
+
+class OllamaAdvice(BaseModel):
+    cpu: str | None
+    threads: int
+    memory_gb: float | None
+    gpu: str | None  # the biggest one DevDash can read
+    gpu_memory_gb: float | None
+    recommended: str  # the suggested model that suits this computer best
+    reason: str
+    models: list[SuggestedModel]
+
+
 class OllamaSwitch(BaseModel):
     # The person said yes, on the page, to DevDash asking for their password (pkexec) to run
     # systemctl start or stop ollama. Without it, a service is never started or stopped.
@@ -869,6 +941,8 @@ class HomeLayout(BaseModel):
 class Preferences(BaseModel):
     theme: Literal["dark", "light"]
     uncommitted: bool | None  # show uncommitted work from the start; None: not picked yet
+    keep_diffs_days: int  # days a change's lines are kept; older ones keep prompt and counts; 0: for good
+    tour_done: bool  # the first-time walkthrough was finished or skipped
     shortcuts: dict[str, str]  # action (view:<screen>, theme, uncommitted, sync, next-file, previous-file) -> key
     ai: ExplainerChoice  # which AI writes explanations, and with which model
     home: HomeLayout  # Home's widgets, each placed on the grid with its style and settings
@@ -877,6 +951,8 @@ class Preferences(BaseModel):
 class PreferenceChange(BaseModel):
     theme: Literal["dark", "light"] | None = None
     uncommitted: bool | None = None
+    keep_diffs_days: int | None = Field(None, ge=0, le=3650)
+    tour_done: bool | None = None
     shortcuts: dict[str, str] | None = None  # only the actions to change; "" turns one off
     ai: ExplainerChoiceChange | None = None
     home: HomeLayout | None = None
@@ -1208,6 +1284,11 @@ def create_app() -> FastAPI:
         model is on the GPU. Read every couple of seconds by the chart in Settings."""
         return providers.ollama_usage()
 
+    @app.get("/api/ollama/advice", response_model=OllamaAdvice)
+    def ollama_advice():
+        """This computer's CPU, memory and GPU, and the local model that suits them."""
+        return providers.ollama_advice()
+
     @app.post("/api/ollama/start", response_model=OllamaState)
     def ollama_start(body: OllamaSwitch | None = None):
         """Starts Ollama the way it's set up here: its service (with your OK, then your
@@ -1284,6 +1365,44 @@ def create_app() -> FastAPI:
         except explain_module.ExplainError as error:
             raise _explain_failed(error)
 
+    @app.get("/api/repos/{repo_id}/kt/guide", response_model=KtGuideSaved)
+    def kt_guide(repo_id: int, head: str | None = Query(None, description="Defaults to the checked-out branch")):
+        """The short KT, when it's been written for the project as it stands."""
+        repo = _repo_path(repo_id)
+        try:
+            subject = _guide_subject(repo, head)
+            found = explain_module.cached("guide", subject)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        return KtGuideSaved(guide=_only_real(found, subject) if found else None)
+
+    @app.post("/api/repos/{repo_id}/kt/guide", response_model=KtGuide)
+    def write_kt_guide(repo_id: int, request: ExplainProjectRequest):
+        """Writes the short KT with one request to the AI."""
+        repo = _repo_path(repo_id)
+        try:
+            subject = _guide_subject(repo, request.head)
+            guide = explain_module.explain("guide", subject, fresh=request.fresh)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        except explain_module.ExplainError as error:
+            raise _explain_failed(error)
+        return _only_real(guide, subject)
+
+    @app.get("/api/repos/{repo_id}/kt/image")
+    def kt_image(repo_id: int, path: str = Query(...), head: str | None = Query(None)):
+        """One of the project's own pictures, for the short KT."""
+        repo = _repo_path(repo_id)
+        try:
+            found = summary_module.guide_image(repo, head or "HEAD", path)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        if found is None:
+            raise HTTPException(404, "No such picture.")
+        kinds = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+        return Response(found, media_type=kinds.get(Path(path).suffix.lower(), "image/jpeg"),
+                        headers={"X-Content-Type-Options": "nosniff"})
+
     @app.get("/api/repos/{repo_id}/kt", response_model=KnowledgeTransfer)
     def knowledge_transfer(repo_id: int, head: str | None = Query(None, description="Defaults to the checked-out branch")):
         """Every file the project's knowledge transfer explains, with the notes written so far."""
@@ -1329,15 +1448,26 @@ def create_app() -> FastAPI:
             history = [turn.model_dump() for turn in request.history]
             # A follow-up such as "and what calls it?" is about the files of the turn before.
             recent = " ".join(t["text"] for t in history[-2:] if t["role"] == "user")
-            picked = explain_module.pick_files(question, files) or explain_module.pick_files(recent, files)
+            # The KT's facts: its picks of the major functions, read from the code, help find files.
+            subject = _guide_subject(repo, request.head)
+            code = {}
+            for function in subject["functions"]:
+                code.setdefault(function["path"], set()).add(function["name"])
+            picked = (explain_module.pick_files(question, files, functions=code)
+                      or explain_module.pick_files(recent, files, functions=code))
+            if not picked and not history:
+                # A question about the whole project: the files the rest use most show how it works.
+                picked = list(code)[:2]
             notes = {f["path"]: f["explanation"] for f in files}
             reading = []
             for path in picked:
                 file = summary_module.kt_file(repo, revision, path)
                 if file:
                     reading.append({"path": path, "text": file["text"], "explanation": notes.get(path)})
+            guide = explain_module.cached("guide", subject)
             context = {"project": _project_subject(facts), "files": files, "reading": reading,
-                       "explanation": explain_module.cached("project", _project_subject(facts))}
+                       "explanation": explain_module.cached("project", _project_subject(facts)),
+                       "guide": _only_real(guide, subject) if guide else None}
             found = explain_module.answer(question, history, context)
         except git.GitError as error:
             raise HTTPException(400, str(error))
@@ -1488,12 +1618,14 @@ def create_app() -> FastAPI:
                  **home_module.project(Path(row["path"]))} for row in rows]
 
     @app.get("/api/digest", response_model=Digest)
-    def daily_digest(day: str | None = None):
+    def daily_digest(day: str | None = None,
+                     repo: int | None = Query(None, description="Only this project's changes; every project when left out")):
         """What Claude changed on one day (today unless `day` is YYYY-MM-DD), prompt by
         prompt, newest first, with the functions touched and rule-based risk flags. Only
         projects connected to Claude are recorded."""
+        threading.Thread(target=retention.maybe_prune, daemon=True).start()
         try:
-            return digest_module.digest(digest_module.parse_day(day))
+            return digest_module.digest(digest_module.parse_day(day), repo)
         except digest_module.DigestError as error:
             raise HTTPException(400, str(error))
 
@@ -1559,9 +1691,13 @@ def create_app() -> FastAPI:
     def change_preferences(body: PreferenceChange):
         """Changes only the settings given; shortcuts merge one action at a time."""
         try:
-            return preferences_module.update(body.model_dump(exclude_none=True))
+            saved = preferences_module.update(body.model_dump(exclude_none=True))
         except preferences_module.PreferenceError as error:
             raise HTTPException(400, str(error))
+        if body.keep_diffs_days is not None:
+            # A shorter time takes effect now, not at the next hourly look.
+            threading.Thread(target=retention.maybe_prune, kwargs={"force": True}, daemon=True).start()
+        return saved
 
     @app.post("/api/preferences/reset-shortcuts", response_model=Preferences)
     def reset_shortcuts():
@@ -1671,6 +1807,39 @@ def _project_subject(facts: dict) -> dict:
         "parts": [{"name": a["name"], "folder": a["path"] or "(top level)", "guessed_role": a["role"],
                    "languages": [l["name"] for l in a["languages"]]} for a in facts["parts"]],
         "uses": [f"{names[e['source']]} uses {names[e['target']]}" for e in facts["links"]],
+    }
+
+
+def _only_real(guide: dict, subject: dict) -> dict:
+    """Only the pictures and functions the project really has, whatever the AI named."""
+    offered = {image["path"] for image in subject["images"]}
+    code = {(f["path"], f["name"]): f["signature"] for f in subject["functions"]}
+    return {
+        **guide,
+        "images": [image for image in guide["images"] if image["path"] in offered],
+        "functions": [{**f, "signature": _whole_signature(code[(f["path"], f["name"])])}
+                      for f in guide["functions"] if (f["path"], f["name"]) in code and f["what"]],
+    }
+
+
+def _whole_signature(line: str) -> str | None:
+    """The line a function starts on, unless its parameters carry on to the next lines."""
+    line = line.rstrip(" :{")
+    return line if line.count("(") == line.count(")") else None
+
+
+def _guide_subject(repo: Path, head: str | None) -> dict:
+    """What the short KT is written from: when any of it changes, it's written again."""
+    facts = summary_module.summary(repo, head or "HEAD")
+    guide = summary_module.guide_facts(repo, head or "HEAD")
+    return {
+        "name": facts["name"],
+        "description": facts["description"],
+        "built_with": [t["name"] for t in facts["tech"]],
+        "package_commands": [f"{r['name']}: {r['command']} ({r['where']})" for r in facts["run"]],
+        "entry_points": facts["entry_points"],
+        "parts": [a["path"] or "(top level)" for a in facts["parts"]][:12],
+        **guide,
     }
 
 

@@ -424,6 +424,8 @@ def _functions(hunks: list[dict]) -> list[dict]:
         current = (_declared(context) or [context])[0] if context else None
         for line in hunk["lines"]:
             names = _declared(line["text"])
+            if not names and top_level(line["text"]):
+                current = None
             if names:
                 current = names[0]
                 if line["kind"] == "add":
@@ -434,6 +436,17 @@ def _functions(hunks: list[dict]) -> list[dict]:
             elif line["kind"] != "context" and line["text"].strip() and current and current not in found:
                 found[current] = "modified"
     return [{"name": name, "change": change} for name, change in found.items()]
+
+
+# Lines at the left edge that end a block rather than start top-level code.
+_CLOSERS = ("}", ")", "]", "end", "#", "//", "/*", "*", "@", "<", "else", "elif", "except", "finally", "catch")
+
+
+def top_level(text: str) -> bool:
+    """A line of code at the left edge that declares nothing, such as a module constant or
+    an import: it belongs to no function, so the function above it stops there."""
+    return bool(text.strip()) and not text[0].isspace() and not _declared(text) \
+        and not text.lstrip().startswith(_CLOSERS)
 
 
 def _declared(text: str) -> list[str]:

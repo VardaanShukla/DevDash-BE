@@ -4,9 +4,27 @@ Shows what changed in your repos, in a way people who don't read code can follow
 The core works from your git history alone. Recording Claude's changes, with the
 request behind each one, is an optional add-on per repo.
 
-Built so far: repo tracking, the branch compare and its local API, and the optional
-Claude recorder, a project summary, and plain-English explanations of changed
-functions written by Claude Code on request.
+## What it does
+
+- **Home**: a dashboard of widgets you arrange: this branch, today's AI changes, commits,
+  branch flow, the project map and more.
+- **AI changes**: every change your AI coding tool (Claude Code, Codex, Antigravity) made,
+  grouped by the request behind it, with what to check.
+- **Summary**: the whole project on one page, read from its files and git history: what it is,
+  what it's built with, its parts, how to run it and who works on it.
+- **KT**: a knowledge-transfer guide for a new developer, written by the AI in about half a
+  minute. It covers what to install and why, step-by-step setup with commands, how to run and
+  use it, the settings to fill in, and the major functions with their signatures. It includes
+  the project's own screenshots and downloads as a PDF.
+- **Ask**: questions about the project in plain words, answered from the KT, the file notes and
+  the code of the files the question is about. It explains; it never changes code.
+- **Changes and Commits**: every changed file and function, before and after, explained in plain
+  words on request.
+- **Your choice of AI**: Claude (the default, using your own Claude login), ChatGPT Codex,
+  Antigravity, your own server, or a local model with Ollama. For Ollama, DevDash reads your
+  CPU, memory and GPU and suggests the model that fits.
+- **A first-time walkthrough** that points at each screen, and a sign-in that keeps the
+  dashboard to you. Everything stays on your computer, in SQLite under `~/.devdash`.
 
 This repo is the backend, and it serves the dashboard page too. The page's source is in
 its own repo, [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes
@@ -426,3 +444,7 @@ uninstall.
 python3 -m pip install -e '.[dev]'
 python3 -m pytest
 ```
+
+## License
+
+DevDash is created by [Vardaan Shukla](https://github.com/VardaanShukla) and released under the [Apache License 2.0](LICENSE). Copies and forks must keep the [NOTICE](NOTICE) file with that credit.
