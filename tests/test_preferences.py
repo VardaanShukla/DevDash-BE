@@ -122,4 +122,12 @@ def test_keep_diffs_days_defaults_to_ten_and_checks_its_value():
     api = TestClient(create_app(), base_url="http://127.0.0.1")
     assert api.get("/api/preferences").json()["keep_diffs_days"] == 10
     assert api.put("/api/preferences", json={"keep_diffs_days": 30}).json()["keep_diffs_days"] == 30
+    assert api.get("/api/preferences").json()["keep_diffs_days"] == 30
     assert api.put("/api/preferences", json={"keep_diffs_days": -1}).status_code == 422
+
+
+def test_the_walkthrough_shows_until_it_is_finished_once():
+    api = client()
+    assert api.get("/api/preferences").json()["tour_done"] is False
+    assert api.put("/api/preferences", json={"tour_done": True}).json()["tour_done"] is True
+    assert api.get("/api/preferences").json()["tour_done"] is True

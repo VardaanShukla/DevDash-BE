@@ -5,13 +5,15 @@ read from git, so it is the same for everyone and needs no AI."""
 import hashlib
 import json
 import re
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from devdash import functions, git
 from devdash.capture.record import _ignored
-from devdash.projectmap import LANGUAGES, WORKTREE, _area_for, _areas, _files, _name, project_map, readable
+from devdash.projectmap import (LANGUAGES, MAX_BYTES, WORKTREE, _area_for, _areas, _files, _imports, _name, project_map,
+                                readable)
 
 try:
     import tomllib
@@ -140,6 +142,109 @@ def kt_file(repo: Path, revision: str, path: str) -> dict | None:
     outline = [{k: unit[k] for k in ("name", "kind", "start", "signature", "doc")}
                for unit in functions.units(path, text)]
     return {**entry, "text": text, "outline": outline}
+
+
+# The short KT reads what a project says about getting started: its readme, and the files
+# that show how it's set up and run. Never a real .env, only the example ones.
+GUIDE_FILES = {".env.example", ".env.sample", ".env.template", "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+               "compose.yml", "compose.yaml", "makefile", "justfile", "procfile", ".nvmrc", ".python-version",
+               ".tool-versions", "install.md", "setup.md", "contributing.md", "getting-started.md"}
+GUIDE_FOLDERS = ("", "docs/", "doc/", "scripts/")
+MAX_GUIDE_README = 6_000
+MAX_GUIDE_FILE = 1_500
+MAX_GUIDE_SETUP_FILES = 8
+GUIDE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_GUIDE_IMAGES = 6
+MAX_GUIDE_IMAGE_BYTES = 5_000_000
+# The code the KT's major functions are picked from: the files most others use.
+MAX_GUIDE_CODE_FILES = 12
+MAX_GUIDE_FILE_FUNCTIONS = 6
+MAX_GUIDE_DOC = 140
+GUIDE_FUNCTION_KINDS = {"function", "method", "class", "component"}
+_TEST_FILE = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_|[._](test|spec)\.")
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)")
+_HTML_IMAGE = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"']", re.I)
+_SCREENSHOT = re.compile(r"screenshot|screen[-_ ]?shot|preview|demo", re.I)
+
+
+def guide_facts(repo: Path, revision: str) -> dict:
+    """What the short KT is written from: the readme, the files that show the setup, and
+    the project's own screenshots. Read straight from the files, so it takes a moment."""
+    revision = readable(repo, revision)
+    files = _files(repo, revision)
+    sizes = {path: size for path, _, size in files}
+    paths = list(sizes)
+    readmes = sorted((p for p in paths if PurePosixPath(p).name.lower() in README_NAMES and p.count("/") <= 2),
+                     key=lambda p: (p.count("/"), README_NAMES.index(PurePosixPath(p).name.lower()), p))
+    readme_path = readmes[0] if readmes else None
+    readme = _show(repo, revision, readme_path) if readme_path else ""
+    setup = sorted((p for p in paths if PurePosixPath(p).name.lower() in GUIDE_FILES
+                    and (p[:p.rfind("/") + 1] in GUIDE_FOLDERS or p.count("/") == 1)),
+                   key=lambda p: (p.count("/"), p))[:MAX_GUIDE_SETUP_FILES]
+    return {
+        "readme_path": readme_path,
+        "readme": readme[:MAX_GUIDE_README],
+        "setup_files": [{"path": p, "text": _show(repo, revision, p)[:MAX_GUIDE_FILE]} for p in setup],
+        "scripts": sorted(p for p in paths if p.startswith("scripts/") and p.count("/") == 1)[:12],
+        "images": _guide_images(readme, readme_path, sizes),
+        "functions": _guide_functions(repo, revision, files),
+    }
+
+
+def _guide_functions(repo: Path, revision: str, files: list[tuple[str, str, int]]) -> list[dict]:
+    """The longest functions in the files the rest of the project uses most, as read from the
+    code, so the KT can only name real ones."""
+    used = Counter(target for _, target in _imports(repo, files)[0])
+    code = [f for f in files if PurePosixPath(f[0]).suffix in CODE_SUFFIXES and f[2] <= MAX_BYTES
+            and not _ignored(f[0]) and not _TEST_FILE.search(f[0])]
+    found = []
+    for path, _, _ in sorted(code, key=lambda f: (-used[f[0]], -f[2], f[0]))[:MAX_GUIDE_CODE_FILES]:
+        units = [u for u in functions.units(path, _show(repo, revision, path)) if u["kind"] in GUIDE_FUNCTION_KINDS]
+        for unit in sorted(units, key=lambda u: -u["lines"])[:MAX_GUIDE_FILE_FUNCTIONS]:
+            doc = (unit["doc"] or "").split("\n\n")[0].replace("\n", " ")[:MAX_GUIDE_DOC]
+            found.append({"path": path, "name": unit["name"], "signature": unit["signature"], "doc": doc or None})
+    return found
+
+
+def _guide_images(readme: str, readme_path: str | None, sizes: dict[str, int]) -> list[dict]:
+    """The pictures that show the project: those in its readme, then files named like
+    screenshots. Links to other sites are left out; those are mostly badges."""
+    usable = lambda p: PurePosixPath(p).suffix.lower() in GUIDE_IMAGE_SUFFIXES and sizes.get(p, 0) <= MAX_GUIDE_IMAGE_BYTES
+    found = {}
+    folder = PurePosixPath(readme_path).parent if readme_path else PurePosixPath(".")
+    linked = [(alt, src) for alt, src in _MD_IMAGE.findall(readme)] + [("", src) for src in _HTML_IMAGE.findall(readme)]
+    for alt, src in linked:
+        if re.match(r"[a-z]+:|//|#", src, re.I):
+            continue
+        parts = []
+        for part in (folder / src.split("#")[0].split("?")[0].removeprefix("./")).parts:
+            if part == "..":
+                if parts:
+                    parts.pop()
+            elif part != ".":
+                parts.append(part)
+        path = "/".join(parts)
+        if path in sizes and usable(path):
+            found.setdefault(path, alt.strip())
+    for path in sizes:
+        if len(found) >= MAX_GUIDE_IMAGES:
+            break
+        if usable(path) and _SCREENSHOT.search(PurePosixPath(path).name):
+            found.setdefault(path, "")
+    return [{"path": path, "alt": alt} for path, alt in list(found.items())[:MAX_GUIDE_IMAGES]]
+
+
+def guide_image(repo: Path, revision: str, path: str) -> bytes | None:
+    """One of the short KT's pictures. Only those: this is not a way to read any file."""
+    if path not in {image["path"] for image in guide_facts(repo, revision)["images"]}:
+        return None
+    revision = readable(repo, revision)
+    try:
+        if revision == WORKTREE:
+            return (repo / path).read_bytes()
+        return subprocess.run(["git", "show", f"{revision}:{path}"], cwd=repo, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def summary(repo: Path, revision: str) -> dict:

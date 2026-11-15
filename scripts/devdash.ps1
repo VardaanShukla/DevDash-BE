@@ -145,8 +145,6 @@ function After-Install {
         if (Test-Path $folder -PathType Container) { devdash init $folder }
         else { Write-Host "There's no folder $folder. Add projects later under Add project on the dashboard." }
     }
-    Write-Host "`nTo share explanations of changes with a team, choose 5 Team server in this menu any time,"
-    Write-Host "or open Settings > Team server on the dashboard."
     if (YesNo "`nStart DevDash now?" "y") { Start-DevDash }
 }
 
@@ -256,87 +254,6 @@ function Start-DevDash {
     Wait-Process -Id $server.Id
 }
 
-# Hosts a team server here (in this window, until Ctrl+C) that anyone can open over HTTPS,
-# or links this DevDash to one.
-function Team-Server {
-    $exe = Get-Command devdash -ErrorAction SilentlyContinue
-    if (-not $exe) { Fail "DevDash isn't installed. Choose Install first." }
-    Say "Team server"
-    Write-Host @"
-
-  1  Host         run a team server people open in their browser, sign up on and make teams
-  2  Link         link this DevDash to a team server (yours or your team's)
-  3  Back
-"@
-    switch (Read-Host "`nChoose 1-3") {
-        "1" {
-            Write-Host @"
-
-How people reach it:
-  1  Company network      a company server, by its IP or internal names, on office wifi or VPN
-  2  Cloudflare address   a public https address from this computer, new each start (good for a quick try)
-  3  Your domain          a public domain you own, pointed at this machine
-  4  This computer only   for trying it out
-"@
-            switch (Read-Host "`nChoose 1-4") {
-                "1" {
-                    if (-not (Get-Command caddy -ErrorAction SilentlyContinue)) {
-                        if (-not (YesNo "Caddy (it gives the server HTTPS) isn't installed. Install it with winget?" "y")) {
-                            Fail "Install Caddy (https://caddyserver.com/docs/install), then run this again."
-                        }
-                        winget install --id CaddyServer.Caddy -e
-                        Update-Path
-                        if (-not (Get-Command caddy -ErrorAction SilentlyContinue)) {
-                            Fail "Caddy didn't install. Get it from https://caddyserver.com/docs/install, then run this again."
-                        }
-                    }
-                    $suggested = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
-                        Select-Object -First 1).IPAddress
-                    Write-Host "`nGive this server's IP and any names your company's DNS gives it, comma-separated."
-                    $addresses = Read-Host "Addresses [$suggested]"
-                    if (-not $addresses) { $addresses = $suggested }
-                    if (-not $addresses) { Write-Host "Nothing changed."; return }
-                    & $exe.Source host --tunnel network --address $addresses
-                }
-                "2" {
-                    if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-                        if (-not (YesNo "cloudflared isn't installed. Install it with winget?" "y")) { Fail "Install cloudflared, then run this again." }
-                        winget install --id Cloudflare.cloudflared -e
-                        Update-Path
-                    }
-                    & $exe.Source host --tunnel cloudflare
-                }
-                "3" {
-                    Write-Host "`nThis needs a domain you own, pointed (an A record) at this machine, and ports 80 and 443 open to"
-                    Write-Host "the internet. A laptop at home usually isn't reachable that way: use Cloudflare address there."
-                    if (-not (YesNo "Go on?" "y")) { Write-Host "Nothing changed."; return }
-                    if (-not (Get-Command caddy -ErrorAction SilentlyContinue)) {
-                        if (-not (YesNo "Caddy (it gets your domain's HTTPS certificate) isn't installed. Install it with winget?" "y")) {
-                            Fail "Install Caddy (https://caddyserver.com/docs/install), then run this again."
-                        }
-                        winget install --id CaddyServer.Caddy -e
-                        Update-Path
-                        if (-not (Get-Command caddy -ErrorAction SilentlyContinue)) {
-                            Fail "Caddy didn't install. Get it from https://caddyserver.com/docs/install, then run this again."
-                        }
-                    }
-                    $domain = Read-Host "Domain (like teams.example.com)"
-                    if (-not $domain) { Write-Host "Nothing changed."; return }
-                    & $exe.Source host --tunnel domain --domain $domain
-                }
-                "4" { & $exe.Source host --tunnel none }
-                default { Write-Host "Nothing changed." }
-            }
-        }
-        "2" {
-            $address = Read-Host "`nTeam server address (https://...)"
-            if ($address) { & $exe.Source team connect $address } else { Write-Host "Nothing changed." }
-        }
-        default { Write-Host "Nothing changed." }
-    }
-}
-
 $Python = Find-Python
 Say "DevDash"
 if (Test-Installed) { Write-Host "Installed. Data in $Data." } else { Write-Host "Not installed yet." }
@@ -346,14 +263,12 @@ Write-Host @"
   2  Repair       reinstall over the current one; your data stays
   3  Uninstall    remove DevDash and delete its data
   4  Start        run DevDash and open it in the browser
-  5  Team server  host one for your team, or link to one
-  6  Quit
+  5  Quit
 "@
-switch (Read-Host "`nChoose 1-6") {
+switch (Read-Host "`nChoose 1-5") {
     "1" { Install-DevDash }
     "2" { Repair-DevDash }
     "3" { Uninstall-DevDash }
     "4" { Start-DevDash }
-    "5" { Team-Server }
     default { Write-Host "Nothing changed." }
 }

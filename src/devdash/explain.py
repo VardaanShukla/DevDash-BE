@@ -34,7 +34,7 @@ from devdash.store.db import now
 TIMEOUT = 240
 # Bump when a prompt changes, so explanations written for the old one are asked again.
 PROMPT_VERSION = "1"
-VERSIONS = {"project": "2"}
+VERSIONS = {"project": "2", "guide": "3"}
 MAX_PROMPT_CHARS = 30_000
 # Local and self-hosted models are often small, with a short memory (context): their
 # prompts are kept to this many characters, about 3,500 tokens.
@@ -360,21 +360,69 @@ def _file_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -
     return "\n".join(parts)
 
 
+def _guide_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    """The short KT: one request, so it's done in a minute or so, and a page anyone reads in
+    under three minutes."""
+    images = subject.get("images") or []
+    if budget < MAX_PROMPT_CHARS:
+        subject = {**subject, "functions": (subject.get("functions") or [])[:12]}
+    return "\n".join([
+        "You write the knowledge transfer (KT) for a software project: a short guide a developer new to the project "
+        "reads to understand it, get it running and start working with its code.",
+        "Here is what the project says about itself, read from its files:",
+        "```json",
+        json.dumps(subject, indent=1),
+        "```",
+        "",
+        "Reply with only a JSON object and no other text, with these keys:",
+        '"overview": two or three sentences on what the project is, what problem it solves and who uses it.',
+        '"needs": a list of up to eight objects {"name": a thing to install or have first, with the version the '
+        'facts ask for, such as "Node.js 18 or newer", "why": one sentence on what the project uses it for, "check": '
+        'the usual command that shows it is installed and its version, such as "node --version", or null}. Include '
+        "accounts, keys and services it needs, not only programs.",
+        '"setup": a list of up to ten objects {"step": a short title such as "Install the packages", "detail": one '
+        "or two sentences on what this step does, where to run it (which folder), and what to expect or watch out "
+        'for, "command": the exact command, or null}, in order, from getting the code to being ready to run it. '
+        "Don't skip steps a newcomer needs, such as copying an example settings file.",
+        '"run": a list of up to six objects {"what": a few words such as "Start the app" or "Run the tests", '
+        '"command": the exact command}.',
+        '"how_to_use": a list of up to six short sentences on using it once it runs, such as which address to open '
+        "and what to do first. Empty if the facts don't say.",
+        '"settings": a list of up to five objects {"name": a setting or environment variable that must be set, '
+        '"what": a few words on what it\'s for}. Never a real value. Empty if none are shown.',
+        '"start_here": a list of up to three objects {"path": a file path from the facts, "why": a few words}, '
+        "the first files to read.",
+        '"functions": a list of up to twelve objects {"name": a name exactly as listed under "functions" in the facts, '
+        '"path": its path, "what": one sentence on what it does, what it takes and what it gives back, "use": one '
+        "sentence on when another developer would call it or need to change it}, the ones a developer most needs to "
+        "know. Empty if none are listed.",
+        *(['"images": a list of up to three objects {"path": a path exactly as given in "images", "caption": a few '
+           'words}, only the pictures that help someone understand the project, such as screenshots. Skip logos.']
+          if images else []),
+        "Commands must come from the facts, word for word: never make one up. When the facts don't show how to do "
+        'something, leave it out; only the "check" commands may be the usual ones for a tool. Keep the whole answer '
+        "under 900 words. Use plain words.",
+    ])
+
+
 MAX_OUTLINE = 60
 
 
 # The field an explanation can't be without.
-MAIN_FIELD = {"function": "summary", "project": "overview", "file": "purpose"}
-PROMPTS = {"function": _function_prompt, "project": _project_prompt, "file": _file_prompt}
+MAIN_FIELD = {"function": "summary", "project": "overview", "file": "purpose", "guide": "overview"}
+PROMPTS = {"function": _function_prompt, "project": _project_prompt, "file": _file_prompt, "guide": _guide_prompt}
 
 FIELDS = {
     "function": {"summary": str, "change": str, "improves": list, "tradeoffs": list, "check": (str, type(None))},
     "project": {"overview": str, "how_it_works": list, "parts": list, "flows": list, "start_here": list,
                 "state": str},
     "file": {"purpose": str, "functions": list, "connects": str, "notes": list},
+    "guide": {"overview": str, "needs": list, "setup": list, "run": list, "how_to_use": list, "settings": list,
+              "start_here": list, "functions": list, "images": list},
 }
 # The most items kept in each list of an answer.
-LIST_LIMITS = {"functions": MAX_OUTLINE, "parts": 12, "how_it_works": 8}
+LIST_LIMITS = {"functions": MAX_OUTLINE, "parts": 12, "how_it_works": 8, "needs": 8, "setup": 10, "run": 6,
+               "how_to_use": 6, "settings": 5, "start_here": 6, "images": 3}
 
 
 def _run(prompt: str) -> str:
@@ -533,6 +581,22 @@ def _clean(kind: str, data: dict) -> dict:
         result["flows"] = [{"name": f["name"], "steps": [s for s in f["steps"] if isinstance(s, str)][:10]}
                            for f in result["flows"][:4] if isinstance(f, dict) and isinstance(f.get("name"), str)
                            and isinstance(f.get("steps"), list)]
+    elif kind == "guide":
+        # A string is a need from a small model that left out the why.
+        result["needs"] = [{"name": n["name"], "why": n["why"] if isinstance(n.get("why"), str) else "",
+                            "check": n["check"] if isinstance(n.get("check"), str) and n["check"].strip() else None}
+                           if isinstance(n, dict) else {"name": n, "why": "", "check": None}
+                           for n in result["needs"] if isinstance(n, str) or isinstance(n, dict) and isinstance(n.get("name"), str)]
+        result["how_to_use"] = [s for s in result["how_to_use"] if isinstance(s, str)]
+        result["setup"] = [{"step": s["step"], "detail": s["detail"] if isinstance(s.get("detail"), str) else "",
+                            "command": s["command"] if isinstance(s.get("command"), str) and s["command"].strip() else None}
+                           for s in result["setup"] if isinstance(s, dict) and isinstance(s.get("step"), str)]
+        result["run"] = _pairs(result["run"], "what", "command")
+        result["settings"] = _pairs(result["settings"], "name", "what")
+        result["start_here"] = _pairs(result["start_here"], "path", "why")[:3]
+        result["images"] = _pairs(result["images"], "path", "caption")
+        result["functions"] = [{key: f[key] if isinstance(f.get(key), str) else "" for key in ("name", "path", "what", "use")}
+                               for f in result["functions"] if isinstance(f, dict)][:12]
     elif kind == "file":
         result["functions"] = _pairs(result["functions"], "name", "what")
         result["notes"] = [s for s in result["notes"] if isinstance(s, str)][:3]
@@ -572,10 +636,10 @@ _COMMON = {"the", "and", "for", "does", "what", "how", "why", "where", "which", 
            "writes", "change", "changes", "add", "adds", "new", "should", "would", "could", "please"}
 
 
-def pick_files(text: str, files: list[dict], limit: int = MAX_READ) -> list[str]:
+def pick_files(text: str, files: list[dict], limit: int = MAX_READ, functions: dict[str, set[str]] | None = None) -> list[str]:
     """The files a question is most likely about, best first: named by path or file name,
-    then by a function in them, then by words in their KT note. None when nothing matches,
-    for a question about the whole project."""
+    then by a function in them (from its KT note or `functions`, read from the code), then by
+    words in their KT note. None when nothing matches, for a question about the whole project."""
     words = {w.lower().strip(".-/") for w in _WORD.findall(text)} - _COMMON
     words.discard("")
     if not words:
@@ -586,14 +650,15 @@ def pick_files(text: str, files: list[dict], limit: int = MAX_READ) -> list[str]
         name = path.rsplit("/", 1)[-1]
         stem = name.split(".", 1)[0]
         note = file.get("explanation") or {}
-        functions = {f["name"].lower().rsplit(".", 1)[-1] for f in note.get("functions", [])}
+        names = {f["name"].lower().rsplit(".", 1)[-1] for f in note.get("functions", [])}
+        names |= {name.lower().rsplit(".", 1)[-1] for name in (functions or {}).get(file["path"], ())}
         score = 0
         for word in words:
             if word == path or word == name:
                 score += 10
             elif word == stem or ("/" in word and path.endswith(word)):
                 score += 6
-            elif word in functions:
+            elif word in names:
                 score += 4
             elif len(word) > 3 and word in path:
                 score += 2
@@ -624,7 +689,8 @@ def answer(question: str, history: list[dict], context: dict) -> dict:
     if not isinstance(reply, str) or not reply.strip():
         raise ExplainError("The AI didn't answer. Ask again, or pick another model in Settings.")
     cited = [p for p in data.get("files", []) if isinstance(p, str) and p in known] if isinstance(data.get("files"), list) else []
-    return {"answer": reply.strip(), "files": list(dict.fromkeys(cited))[:8]}
+    more = [q.strip() for q in data.get("follow_ups", []) if isinstance(q, str) and q.strip()] if isinstance(data.get("follow_ups"), list) else []
+    return {"answer": reply.strip(), "files": list(dict.fromkeys(cited))[:8], "follow_ups": more[:3]}
 
 
 def _ask_prompt(question: str, history: list[dict], context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
@@ -646,6 +712,16 @@ def _ask_prompt(question: str, history: list[dict], context: dict, budget: int =
             parts += ["Its parts:", *[f"- {p['name']}: {p['what']}" for p in about["parts"]]]
     elif project.get("tech"):
         parts += ["Built with:", *[f"- {t}" for t in project["tech"][:12]]]
+    guide = context.get("guide") or {}
+    if guide:
+        parts += ["From its KT (knowledge transfer):"]
+        if not about.get("overview"):
+            parts += [guide["overview"]]
+        parts += [*[f"- Needs {n['name']}" for n in guide.get("needs", [])],
+                  *[f"- Setup: {s['step']}" + (f" (`{s['command']}`)" if s.get("command") else "") for s in guide.get("setup", [])],
+                  *[f"- {r['what']}: `{r['command']}`" for r in guide.get("run", [])],
+                  *[f"- Using it: {u}" for u in guide.get("how_to_use", [])],
+                  *[f"- `{f['name']}` in {f['path']}: {f['what']}" for f in guide.get("functions", [])]]
 
     reading = context.get("reading") or []
     # Room for the code of the files the question is about; the file list gets what's left.
@@ -678,9 +754,11 @@ def _ask_prompt(question: str, history: list[dict], context: dict, budget: int =
     parts += [
         "", "Their question:", _clip(question, MAX_QUESTION), "",
         "Reply with only a JSON object and no other text, with these keys:",
-        '"answer": your answer in plain words, a few short paragraphs at most. Name files by their path and '
-        "functions by their name in `backticks`. Lines starting with \"- \" make a list.",
+        '"answer": your answer in plain words: start with the direct answer in a sentence or two, then the detail '
+        "that helps, such as the steps a flow goes through in order. Name files by their path and functions by "
+        "their name in `backticks`. Lines starting with \"- \" make a list.",
         '"files": a list of the file paths, exactly as given above, that your answer is about. An empty list if none.',
+        '"follow_ups": up to three short questions the person might ask next about this project, in their words.',
         "Say only what the facts and code above show. When they don't show the answer, say so, and name the "
         "files that are most likely to have it.",
     ]

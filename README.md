@@ -4,9 +4,27 @@ Shows what changed in your repos, in a way people who don't read code can follow
 The core works from your git history alone. Recording Claude's changes, with the
 request behind each one, is an optional add-on per repo.
 
-Built so far: repo tracking, the branch compare and its local API, and the optional
-Claude recorder, a project summary, and plain-English explanations of changed
-functions written by Claude Code on request.
+## What it does
+
+- **Home**: a dashboard of widgets you arrange: this branch, today's AI changes, commits,
+  branch flow, the project map and more.
+- **AI changes**: every change your AI coding tool (Claude Code, Codex, Antigravity) made,
+  grouped by the request behind it, with what to check.
+- **Summary**: the whole project on one page, read from its files and git history: what it is,
+  what it's built with, its parts, how to run it and who works on it.
+- **KT**: a knowledge-transfer guide for a new developer, written by the AI in about half a
+  minute. It covers what to install and why, step-by-step setup with commands, how to run and
+  use it, the settings to fill in, and the major functions with their signatures. It includes
+  the project's own screenshots and downloads as a PDF.
+- **Ask**: questions about the project in plain words, answered from the KT, the file notes and
+  the code of the files the question is about. It explains; it never changes code.
+- **Changes and Commits**: every changed file and function, before and after, explained in plain
+  words on request.
+- **Your choice of AI**: Claude (the default, using your own Claude login), ChatGPT Codex,
+  Antigravity, your own server, or a local model with Ollama. For Ollama, DevDash reads your
+  CPU, memory and GPU and suggests the model that fits.
+- **A first-time walkthrough** that points at each screen, and a sign-in that keeps the
+  dashboard to you. Everything stays on your computer, in SQLite under `~/.devdash`.
 
 This repo is the backend, and it serves the dashboard page too. The page's source is in
 its own repo, [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes
@@ -340,41 +358,6 @@ Every hook call is logged (tool and file, never the prompt) to `~/.devdash/hooks
 
 Lockfiles, `node_modules`, build output and files over 1 MB are skipped.
 
-## Share explanations with a team
-
-Optional. A **team server** is a site anyone can open over HTTPS: people sign up, make an
-organisation (or join one with an invite link), make teams, and add teams to their projects.
-Everyone links their own DevDash to it. The server keeps accounts, organisations, teams and
-the explanations someone pressed **Share with team** on (the function's name and its
-plain-English explanation). Code, diffs, file paths, prompts and commits never leave anyone's
-computer, and the server refuses a share that holds anything else.
-
-**Host one** from Settings → Team server, the installer's **5 Team server**, or a terminal:
-
-```sh
-devdash host --tunnel network --address 10.0.0.5,devdash.corp   # a company server, on office wifi or VPN only
-devdash host --tunnel domain --domain teams.example.com   # your own domain; Caddy gets the HTTPS certificate
-devdash host --tunnel cloudflare                          # a public https://….trycloudflare.com address, new each start
-devdash host --tunnel none                                # this computer only, for trying it out
-```
-
-The server itself only listens on 127.0.0.1 (port 8770), behind Caddy or Cloudflare's tunnel.
-**On a company network** (people reach the server by its IP, or names the company's DNS gives
-it, on office wifi or VPN), Caddy serves HTTPS on port 8443 for each address, with no domain or
-internet needed and no admin rights. Give `--cert` and `--key` to use the company's own
-certificate; otherwise Caddy makes one from its own authority, and each device trusts its root
-certificate once (Settings → Team server has a download link; `devdash host` prints its path).
-For your own domain, point its DNS at the machine and open ports 80 and 443 first; on a rented
-server, [deploy/](deploy/README.md) runs it with Docker. The first start prints a **setup
-code**: make an account on the site and enter it under You → Server to become the server's
-admin, who can close sign-ups so new accounts need an invite. Its data is in
-`~/.devdash/team`, apart from your own recorded history.
-
-**Link to one** from Settings → Team server (or `devdash team connect <address>`): DevDash
-shows a code, you approve it on the site and pick the organisation, then link projects. Projects
-match by their first commit, so everyone's clone lands on the same one, but only the person
-who linked a project, or an admin, decides who sees it, by adding teams to it.
-
 ## Uninstall DevDash safely
 
 DevDash never changes your project files or their git history. What it adds, and takes out
@@ -461,3 +444,7 @@ uninstall.
 python3 -m pip install -e '.[dev]'
 python3 -m pytest
 ```
+
+## License
+
+DevDash is created by [Vardaan Shukla](https://github.com/VardaanShukla) and released under the [Apache License 2.0](LICENSE). Copies and forks must keep the [NOTICE](NOTICE) file with that credit.

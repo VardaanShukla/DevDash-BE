@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from conftest import git
 from devdash.api.app import create_app
 from devdash.capture.install import init
+from devdash import explain as explain_module
+from devdash import summary as summary_module
 from devdash.functions import units
 
 
@@ -489,7 +491,7 @@ def test_asking_about_the_project_reads_the_notes_and_the_files_it_names(repo, t
         "question": "What does charge do?", "history": [{"role": "user", "text": "Hi"}, {"role": "assistant", "text": "Hello"}]})
     assert asked.status_code == 200
     assert asked.json() == {"answer": "`charge` takes the payment.", "files": ["billing.py"], "read": ["billing.py"],
-                            "explained": 1, "total": 2}
+                            "follow_ups": [], "explained": 1, "total": 2}
     prompt = prompts.read_text()
     # The note on each file, the named file's code, the conversation, and never writing code.
     assert "- billing.py: Takes payments." in prompt and "return card.pay(amount)" in prompt
@@ -519,4 +521,56 @@ def test_a_plain_words_answer_is_kept_and_files_are_picked_by_name(monkeypatch):
     # A small model that ignores the JSON it was asked for.
     monkeypatch.setattr(explain, "_run", lambda prompt: "It reads git and shows the changes.")
     assert explain.answer("What is it?", [], {"files": files}) == {"answer": "It reads git and shows the changes.",
-                                                                    "files": []}
+                                                                    "files": [], "follow_ups": []}
+    # A function read from the code finds its file, with no KT note on it.
+    assert explain.pick_files("what does fetchRepos do", files, functions={"src/api/client.ts": {"fetchRepos"}}) == ["src/api/client.ts"]
+
+
+def test_the_short_kt_is_one_request_from_the_readme_and_setup_files(repo, monkeypatch):
+    (repo / "README.md").write_text("# Shop\n\nSells things.\n\n![The cart](docs/cart.png)\n![build](https://img.shields.io/x.png)\n")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "cart.png").write_bytes(b"\x89PNG picture")
+    (repo / ".env.example").write_text("API_URL=\n")
+    (repo / ".env").write_text("API_URL=secret\n")
+    (repo / "cart.py").write_text('def total(items):\n    """Adds up a cart."""\n    return sum(items)\n')
+    (repo / "test_cart.py").write_text("def test_total():\n    assert True\n")
+    git(repo, "add", "README.md", "docs", ".env.example", "cart.py", "test_cart.py")
+    git(repo, "commit", "-q", "-m", "docs")
+    asked = []
+
+    def answer(prompt):
+        asked.append(prompt)
+        return json.dumps({
+            "overview": "A shop.", "needs": ["Python", {"name": "Git", "why": "To get the code.", "check": "git --version"}],
+            "setup": [{"step": "Install it", "detail": "In the shop folder.", "command": "pip install ."},
+                                                                  {"step": "Wait", "command": ""}],
+            "run": [{"what": "Start it", "command": "python app.py"}], "how_to_use": ["Open it"],
+            "settings": [{"name": "API_URL", "what": "the backend"}], "start_here": [{"path": "app.py", "why": "start"}],
+            "functions": [{"name": "total", "path": "cart.py", "what": "Adds up a cart.", "use": "For the checkout."},
+                          {"name": "made_up", "path": "cart.py", "what": "Not real.", "use": ""}],
+            "images": [{"path": "docs/cart.png", "caption": "The cart"}, {"path": "../secret.png", "caption": "Not real"}],
+        })
+
+    monkeypatch.setattr(explain_module, "_run", answer)
+    listed = client().post("/api/repos", json={"path": str(repo)}).json()
+    url = f"/api/repos/{listed['id']}/kt"
+    assert client().get(f"{url}/guide").json() == {"guide": None}
+    written = client().post(f"{url}/guide", json={}).json()
+    assert written["overview"] == "A shop." and written["setup"][1]["command"] is None
+    assert written["needs"] == [{"name": "Python", "why": "", "check": None},
+                                {"name": "Git", "why": "To get the code.", "check": "git --version"}]
+    assert written["setup"][0]["detail"] == "In the shop folder." and written["setup"][1]["detail"] == ""
+    # Only pictures the project has, and only one request however big the project is.
+    assert [image["path"] for image in written["images"]] == ["docs/cart.png"]
+    # Only functions read from the code, never from a test, with the code's own signature.
+    assert [(f["name"], f["signature"]) for f in written["functions"]] == [("total", "def total(items)")]
+    assert "test_total" not in asked[0] and "Adds up a cart" in asked[0]
+    assert len(asked) == 1 and "Sells things" in asked[0] and "API_URL=" in asked[0] and "secret" not in asked[0]
+    assert "shields.io" not in json.dumps(summary_module.guide_facts(repo, "HEAD")["images"])
+    assert client().get(f"{url}/guide").json()["guide"]["overview"] == "A shop."
+    assert len(asked) == 1
+    # Pictures are served, and that's no way to read any other file.
+    image = client().get(f"{url}/image", params={"path": "docs/cart.png"})
+    assert image.status_code == 200 and image.headers["content-type"] == "image/png"
+    assert client().get(f"{url}/image", params={"path": "app.py"}).status_code == 404
+    assert client().get(f"{url}/image", params={"path": ".env"}).status_code == 404

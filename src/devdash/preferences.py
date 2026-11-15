@@ -105,6 +105,7 @@ def get() -> dict:
     ai = saved.get("ai") or {}
     keep = saved.get("keep_diffs_days")
     return {"theme": saved.get("theme", DEFAULTS["theme"]), "uncommitted": saved.get("uncommitted"),
+            "tour_done": saved.get("tour_done") is True,
             "keep_diffs_days": keep if _days(keep) else DEFAULTS["keep_diffs_days"],
             "shortcuts": {**defaults, **chosen}, "home": _layout(saved.get("home")),
             "ai": {"provider": ai.get("provider") if ai.get("provider") in AI_PROVIDERS else "claude",
@@ -124,6 +125,10 @@ def update(changes: dict) -> dict:
             if not isinstance(value, bool):
                 raise PreferenceError("uncommitted is true or false")
             current["uncommitted"] = value
+        elif name == "tour_done":
+            if not isinstance(value, bool):
+                raise PreferenceError("tour_done is true or false")
+            current["tour_done"] = value
         elif name == "keep_diffs_days":
             if not _days(value):
                 raise PreferenceError(f"keep_diffs_days is a whole number of days from 0 (keep for good) to {MAX_KEEP_DAYS}")
@@ -272,7 +277,8 @@ def ai_choice() -> tuple[str, str | None]:
 def _save(preferences: dict) -> None:
     # Only the keys the person changed are stored, so a later version's defaults reach the rest.
     chosen = {action: key for action, key in preferences["shortcuts"].items() if DEFAULT_SHORTCUTS.get(action, "") != key}
-    stored = {"theme": preferences["theme"], "uncommitted": preferences["uncommitted"], "shortcuts": chosen,
+    stored = {"theme": preferences["theme"], "uncommitted": preferences["uncommitted"], "tour_done": preferences["tour_done"],
+              "keep_diffs_days": preferences["keep_diffs_days"], "shortcuts": chosen,
               "shortcuts_version": SHORTCUTS_VERSION, "ai": preferences["ai"], "home": preferences["home"]}
     conn = connect()
     with conn:

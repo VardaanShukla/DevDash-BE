@@ -508,3 +508,34 @@ def test_with_no_gpu_the_usage_chart_shows_the_cpu(tmp_path, monkeypatch):
     usage = client().get("/api/ollama/usage").json()
     assert usage["gpus"] == [] and "shows the CPU" in usage["note"]
     assert 0 <= usage["cpu"] <= 100 and usage["memory"]["total"] > usage["memory"]["used"] > 0
+
+
+def test_the_suggested_model_follows_the_cpu_memory_and_gpu(monkeypatch):
+    from devdash import providers
+    computer = {"cpu": "Core i7", "threads": 8, "memory_gb": 15.5, "gpu": "GTX 1650", "gpu_memory_gb": 4.0}
+
+    def advice(**changes):
+        monkeypatch.setattr(providers, "_hardware", lambda: {**computer, **changes})
+        return providers.ollama_advice()
+
+    # A 4 GB GPU holds the small model; the 7b would spill over to the CPU and crawl.
+    small_gpu = advice()
+    assert small_gpu["recommended"] == "qwen2.5:3b" and "GTX 1650" in small_gpu["reason"]
+    assert {m["name"]: m["fit"] for m in small_gpu["models"]}["qwen2.5-coder:7b"] == "mixed"
+    assert advice(gpu_memory_gb=8.0)["recommended"] == "qwen2.5-coder:7b"
+    assert advice(gpu_memory_gb=24.0)["recommended"] == "qwen2.5-coder:32b"
+    # With no GPU, plenty of memory doesn't make a big model quick enough.
+    assert advice(gpu=None, gpu_memory_gb=None, memory_gb=64.0)["recommended"] == "qwen2.5:3b"
+    assert advice(gpu=None, gpu_memory_gb=None, memory_gb=4.5)["recommended"] == "qwen2.5:1.5b"
+    assert advice(gpu=None, gpu_memory_gb=None, memory_gb=3.0)["recommended"] == "qwen2.5:1.5b"
+    assert advice(gpu=None, gpu_memory_gb=None, memory_gb=None)["recommended"] == "qwen2.5:3b"
+
+
+def test_with_no_model_picked_the_best_one_here_is_used(monkeypatch):
+    from devdash import providers
+    gb = 10**9
+    monkeypatch.setattr(providers, "_hardware", lambda: {"cpu": None, "threads": 8, "memory_gb": 15.5,
+                                                         "gpu": "GTX 1650", "gpu_memory_gb": 4.0})
+    assert providers._best_installed({"qwen2.5:1.5b": gb, "qwen2.5:3b": 2 * gb, "big:13b": 8 * gb}) == "qwen2.5:3b"
+    assert providers._best_installed({"tiny:1b": gb, "mid:2b": 2 * gb, "big:13b": 8 * gb}) == "mid:2b"
+    assert providers._best_installed({"big:13b": 8 * gb, "bigger:30b": 20 * gb}) == "big:13b"

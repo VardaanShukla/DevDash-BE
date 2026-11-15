@@ -7,6 +7,8 @@ name = "devdash"
 version = "0.1.0"
 description = "Shows what changed in your code, readable by people who don't read diffs"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vardaan Shukla" }]
 dependencies = ["fastapi>=0.110", "uvicorn>=0.29", "psutil>=5.9"]
 
 [project.optional-dependencies]
@@ -19,7 +21,7 @@ devdash = "devdash.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-devdash = ["store/*.sql", "web/*", "web/**/*", "team/web/*"]
+devdash = ["store/*.sql", "web/*", "web/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -83,44 +83,6 @@ system_install() { # system_install what-for apt-names dnf-names pacman-names zy
   esac
 }
 
-# Caddy, which gives a team server on your own domain its HTTPS certificate. Some systems
-# (Ubuntu 22.04, Debian 12, Fedora) don't carry it: it then comes from Caddy's own package
-# source, as https://caddyserver.com/docs/install describes, after asking.
-install_caddy() {
-  if command -v brew >/dev/null || command -v pacman >/dev/null || command -v zypper >/dev/null ||
-     { command -v apt-get >/dev/null && apt-cache show caddy >/dev/null 2>&1; }; then
-    system_install "Caddy (it gives the team server its HTTPS)" caddy caddy caddy caddy caddy
-  elif command -v apt-get >/dev/null; then
-    say "Caddy (it gives the team server its HTTPS) isn't installed."
-    echo "This system's packages don't include it, so it comes from Caddy's own package source:"
-    echo "this adds Caddy's signing key and source to apt, then runs: sudo apt-get install caddy"
-    echo "Your password goes to sudo; this script never sees it."
-    yes_no "Install it now?" y || fail "Install Caddy (https://caddyserver.com/docs/install), then run this again."
-    sudo apt-get update && sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
-      sudo gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' |
-      sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-    sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
-    sudo apt-get update && sudo apt-get install -y caddy
-  elif command -v dnf >/dev/null; then
-    say "Caddy (it gives the team server its HTTPS) isn't installed."
-    echo "This runs: sudo dnf copr enable @caddy/caddy, then sudo dnf install caddy"
-    echo "Your password goes to sudo; this script never sees it."
-    yes_no "Install it now?" y || fail "Install Caddy (https://caddyserver.com/docs/install), then run this again."
-    sudo dnf install -y 'dnf-command(copr)' && sudo dnf copr enable -y @caddy/caddy && sudo dnf install -y caddy
-  else
-    fail "Install Caddy (https://caddyserver.com/docs/install), then run this again."
-  fi
-  command -v caddy >/dev/null || fail "Caddy didn't install. Install it from https://caddyserver.com/docs/install, then run this again."
-  # The package starts Caddy's own service on port 80; DevDash runs Caddy itself while hosting.
-  if command -v systemctl >/dev/null && systemctl is-active --quiet caddy 2>/dev/null; then
-    echo
-    echo "Caddy's own service started and holds ports 80 and 443, which DevDash needs while it hosts."
-    if yes_no "Turn that service off? (sudo systemctl disable --now caddy)" y; then sudo systemctl disable --now caddy; fi
-  fi
-}
-
 needs() {
   [ -f "$BE/pyproject.toml" ] || fail "This script belongs in DevDash-BE/scripts; there's no DevDash-BE in $BE."
   if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
@@ -214,8 +176,6 @@ after_install() {
     else echo "There's no folder $folder. Add projects later under Add project on the dashboard."
     fi
   fi
-  echo $'\nTo share explanations of changes with a team, choose 5 Team server in this menu any time,'
-  echo "or open Settings > Team server on the dashboard."
   if yes_no $'\nStart DevDash now?' y; then start; fi
 }
 
@@ -336,68 +296,6 @@ start() {
   fi
 }
 
-# Hosts a team server here (in this window, until Ctrl+C) that anyone can open over HTTPS,
-# or links this DevDash to one.
-team_server() {
-  command -v devdash >/dev/null || fail "DevDash isn't installed. Choose Install first."
-  say "Team server"
-  cat <<'TEAM'
-
-  1  Host         run a team server people open in their browser, sign up on and make teams
-  2  Link         link this DevDash to a team server (yours or your team's)
-  3  Back
-TEAM
-  local choice url domain addresses suggested
-  read -r -p $'\nChoose 1-3: ' choice
-  case "$choice" in
-    1)
-      cat <<'REACH'
-
-How people reach it:
-  1  Company network      a company server, by its IP or internal names, on office wifi or VPN
-  2  Cloudflare address   a public https address from this computer, new each start (good for a quick try)
-  3  Your domain          a public domain you own, pointed at this machine
-  4  This computer only   for trying it out
-REACH
-      read -r -p $'\nChoose 1-4: ' choice
-      case "$choice" in
-        1)
-          command -v caddy >/dev/null || install_caddy
-          suggested="$(hostname -I 2>/dev/null | awk '{print $1}')"
-          echo
-          echo "Give this server's IP and any names your company's DNS gives it, comma-separated."
-          read -r -p "Addresses [${suggested:-like 10.0.0.5,devdash.corp}]: " addresses
-          addresses="${addresses:-$suggested}"
-          [ -n "$addresses" ] || { echo "Nothing changed."; return; }
-          devdash host --tunnel network --address "$addresses" || true
-          ;;
-        2)
-          command -v cloudflared >/dev/null ||
-            fail "cloudflared isn't installed. Get it from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ and run this again."
-          devdash host --tunnel cloudflare || true
-          ;;
-        3)
-          echo
-          echo "This needs a domain you own, pointed (an A record) at this machine, and ports 80 and 443 open to"
-          echo "the internet. A laptop at home usually isn't reachable that way: use Cloudflare address there."
-          yes_no "Go on?" y || { echo "Nothing changed."; return; }
-          command -v caddy >/dev/null || install_caddy
-          read -r -p 'Domain (like teams.example.com): ' domain
-          [ -n "$domain" ] || { echo "Nothing changed."; return; }
-          devdash host --tunnel domain --domain "$domain" || true
-          ;;
-        4) devdash host --tunnel none || true ;;
-        *) echo "Nothing changed." ;;
-      esac
-      ;;
-    2)
-      read -r -p $'\nTeam server address (https://...): ' url
-      [ -n "$url" ] && devdash team connect "$url" || echo "Nothing changed."
-      ;;
-    *) echo "Nothing changed." ;;
-  esac
-}
-
 say "DevDash"
 if installed; then echo "Installed. Data in $DATA."; else echo "Not installed yet."; fi
 cat <<'MENU'
@@ -406,15 +304,13 @@ cat <<'MENU'
   2  Repair       reinstall over the current one; your data stays
   3  Uninstall    remove DevDash and delete its data
   4  Start        run DevDash and open it in the browser
-  5  Team server  host one for your team, or link to one
-  6  Quit
+  5  Quit
 MENU
-read -r -p $'\nChoose 1-6: ' choice
+read -r -p $'\nChoose 1-5: ' choice
 case "$choice" in
   1) do_install ;;
   2) repair ;;
   3) uninstall ;;
   4) start ;;
-  5) team_server ;;
   *) echo "Nothing changed." ;;
 esac
