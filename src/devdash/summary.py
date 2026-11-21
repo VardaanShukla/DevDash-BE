@@ -122,8 +122,10 @@ def kt_files(repo: Path, revision: str) -> list[dict]:
         if suffix in KT_SKIP_SUFFIXES or size > MAX_KT_BYTES or _ignored(path) or ".min." in path:
             continue
         if revision == WORKTREE:
-            # No blob to name the content by: its hash, so an edit is explained again.
-            sha = hashlib.sha1((repo / path).read_bytes()).hexdigest()
+            # No blob to name the content by: its hash, so an edit is explained again. Hashed
+            # the way git names a blob, so a file not changed since its commit keeps its notes.
+            data = (repo / path).read_bytes()
+            sha = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
         area = _area_for(path, areas)
         found.append({"path": path, "sha": sha, "bytes": size, "part": _name(area), "area": area,
                       "language": LANGUAGES.get(suffix) or "Other"})

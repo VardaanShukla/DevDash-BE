@@ -14,11 +14,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from devdash import agenda as agenda_module
 from devdash import auth
 from devdash import compare as compare_module
 from devdash import digest as digest_module
 from devdash import explain as explain_module
+from devdash import ktdoc
 from devdash import flow as flow_module
 from devdash import functions as functions_module
 from devdash import preferences as preferences_module
@@ -51,7 +51,8 @@ class Repo(BaseModel):
     id: int
     name: str
     path: str
-    exists: bool
+    exists: bool  # the folder is still there
+    git: bool  # it's a git repository; without git, branches, changes, PRs and AI recording are off
     branch: str | None
     claude: bool  # records an AI tool's changes (the one in `ai`)
     ai: Literal["claude", "codex", "antigravity"] | None
@@ -493,9 +494,133 @@ class KnowledgeTransfer(BaseModel):
     explained: int
 
 
+class KtDetailFile(BaseModel):
+    path: str
+    part: str  # the id of its part (see KtPart); tests are all in "checks"
+    language: str
+    lines: int
+    bytes: int
+    depends_on: list[str]  # project files this one imports
+    used_by: list[str]  # project files that import this one, tests left out
+    tests: list[str]  # test files that import this one
+    flow: str  # where it sits, from its imports: "Starts the app", "Used by 3 files", ...
+    role: str  # Starts the app, Screen, Logic, Data, Helper, Settings, Docs or Check
+    own_note: str | None  # what the file says about itself at its top, word for word
+    explanation: FileExplanation | None  # the AI's note, when one has been written
+
+
+class KtPart(BaseModel):
+    id: str  # its folder, "" for the main folder, "checks" for the tests
+    folder: str
+    name: str  # the AI's plain name once written, else the folder's
+    what: str
+    files: int
+    lines: int
+    languages: list[str]
+
+
+class KtPartLink(BaseModel):
+    source: str  # code in this part uses code in target
+    target: str
+    imports: int
+
+
+class KtReadingStep(BaseModel):
+    path: str
+    why: str
+    after: str | None  # "After this you will understand ...", once the AI has written it
+
+
+class KtFlowStep(BaseModel):
+    path: str
+    what: str
+    link: str | None  # how it joins the step before: "uses" or "used by", read from the imports
+
+
+class KtFlow(BaseModel):
+    name: str
+    steps: list[KtFlowStep]
+
+
+class KtTerm(BaseModel):
+    term: str
+    meaning: str
+
+
+class KtFound(BaseModel):
+    name: str
+    files: list[str]
+
+
+class KtRoute(BaseModel):
+    method: str
+    path: str
+    file: str
+
+
+class KtCommand(BaseModel):
+    name: str
+    does: str
+    file: str
+
+
+class KtCaution(BaseModel):
+    path: str
+    note: str
+
+
+class KtSource(BaseModel):
+    kind: str  # "branch" or "worktree" (the working folder, with changes not committed yet)
+    branch: str | None
+    commit: str | None
+
+
+class KtSize(BaseModel):
+    files: int
+    lines: int
+    languages: list[Language]
+
+
+class KtDetail(BaseModel):
+    """The detailed KT. Everything but the words is read from the code; the words are the AI's
+    (summary, part names, reading reasons, flows, glossary), kept only where the code bears them
+    out, and empty until written."""
+    source: KtSource
+    revision: str
+    worktree: bool
+    has_changes: bool  # the working folder differs from its last commit
+    complete: bool  # false when the project had too many files to read every import
+    written: bool  # the AI's words are written for the project as it is
+    summary: str
+    audience: str
+    problem: str
+    size: KtSize
+    parts: list[KtPart]
+    links: list[KtPartLink]
+    reading: list[KtReadingStep]
+    flows: list[KtFlow]
+    glossary: list[KtTerm]
+    tables: list[KtFound]
+    settings: list[KtFound]
+    storage: list[KtFound]
+    routes: list[KtRoute]
+    commands: list[KtCommand]
+    cautions: list[KtCaution]
+    files: list[KtDetailFile]
+    explained: int
+
+
+class KtDetailRequest(BaseModel):
+    head: str | None = None
+    worktree: bool | None = None  # read the working folder; by default when it has changes
+    fresh: bool = False
+
+
 class ExplainFileRequest(BaseModel):
     path: str
     head: str | None = None
+    fresh: bool = False  # ask again even when a note is saved; the old one stays if this fails
+    worktree: bool = False  # the file as it is in the working folder, not as committed
 
 
 class Summary(BaseModel):
@@ -701,6 +826,7 @@ class ProjectCard(BaseModel):
     name: str
     path: str
     exists: bool
+    git: bool = True
     branch: str | None
     base: str | None
     ahead: int | None  # the branch's own commits, since it was made; None on the base itself
@@ -970,26 +1096,6 @@ class NewPassword(BaseModel):
     current: str | None = None
 
 
-class Event(BaseModel):
-    title: str
-    start: str  # a date for all-day events, otherwise a time with its offset
-    end: str
-    all_day: bool
-    location: str | None
-
-
-class Agenda(BaseModel):
-    connected: bool
-    source: str | None  # the calendar's site, never its private address
-    events: list[Event]
-    fetched_at: str | None
-    error: str | None
-
-
-class CalendarAddress(BaseModel):
-    url: str
-
-
 def create_app() -> FastAPI:
     app = FastAPI(title="DevDash", version="0.1.0")
     sync_locks: dict[int, threading.Lock] = {}
@@ -1077,7 +1183,10 @@ def create_app() -> FastAPI:
         path = _folder(body.path)
         if not path.is_dir():
             raise HTTPException(400, f"No folder at {path}")
-        root = _install((lambda p: install.connect_tool(p, body.ai)) if body.ai else install.init, path)
+        # A folder without git is added without recording: that needs git's commit hook.
+        # The reply's `git: false` lets the page say so.
+        record = body.ai if git.toplevel(path) is not None else None
+        root = _install((lambda p: install.connect_tool(p, record)) if record else install.init, path)
         return _repo(_row_for(root))
 
     @app.get("/api/recording/health", response_model=RecordingHealth)
@@ -1111,7 +1220,7 @@ def create_app() -> FastAPI:
 
     @app.put("/api/repos/{repo_id}/ai", response_model=Repo)
     def set_ai(repo_id: int, body: AiChoice):
-        path = _repo_path(repo_id)
+        path = _git_path(repo_id, "Recording an AI tool") if body.ai else _repo_path(repo_id)
         _install((lambda p: install.connect_tool(p, body.ai)) if body.ai else install.disconnect, path)
         return _repo(_row_for(path))
 
@@ -1126,11 +1235,14 @@ def create_app() -> FastAPI:
 
     @app.get("/api/repos/{repo_id}/state", response_model=RepoState)
     def repo_state(repo_id: int, uncommitted: bool = Query(False, description="Also watch uncommitted edits")):
-        return RepoState(signature=compare_module.state(_repo_path(repo_id), uncommitted))
+        path = _repo_path(repo_id)
+        if git.toplevel(path) is None:
+            return RepoState(signature=projectmap.folder_state(path))
+        return RepoState(signature=compare_module.state(path, uncommitted))
 
     @app.get("/api/repos/{repo_id}/branches", response_model=Branches)
     def list_branches(repo_id: int):
-        path = _repo_path(repo_id)
+        path = _git_path(repo_id, "Branches")
         base = compare_module.default_base(path)
         current = git.branch(path)
         # Merged and deleted branches go after a while; see compare.retire.
@@ -1144,6 +1256,8 @@ def create_app() -> FastAPI:
         """Fetches from the remote so merges and deleted branches on GitHub show up.
         Several open tabs share one fetch per repo."""
         path = _repo_path(repo_id)
+        if git.toplevel(path) is None:
+            return Sync(synced_at=None, error=None)  # nothing to fetch without git
         lock = sync_locks.setdefault(repo_id, threading.Lock())
         if lock.acquire(blocking=False):
             try:
@@ -1163,7 +1277,7 @@ def create_app() -> FastAPI:
     @app.get("/api/repos/{repo_id}/flow", response_model=Flow)
     def flow(repo_id: int, limit: int = Query(flow_module.LIMIT, ge=1, le=300)):
         """Recent commits across all branches, for drawing how the branches fork and merge."""
-        path = _repo_path(repo_id)
+        path = _git_path(repo_id, "The branch flow")
         return Flow(current=git.branch(path), base=compare_module.default_base(path),
                     **flow_module.flow(path, limit))
 
@@ -1183,7 +1297,7 @@ def create_app() -> FastAPI:
         head: str | None = Query(None, description="Defaults to the checked-out branch"),
         uncommitted: bool = Query(False, description="Include edits not committed yet"),
     ):
-        path = _repo_path(repo_id)
+        path = _git_path(repo_id, "Comparing branches")
         try:
             return compare_module.compare(path, base, head, uncommitted)
         except compare_module.CompareError as error:
@@ -1200,7 +1314,7 @@ def create_app() -> FastAPI:
     ):
         """Each function the branch changed in one file, before and after, with the facts
         git can show and any explanation written earlier."""
-        repo = _repo_path(repo_id)
+        repo = _git_path(repo_id, "Changed functions")
         changes = _function_changes(repo, path, old_path, base, head, uncommitted)
         for item in changes:
             item["explanation"] = explain_module.cached("function", _function_subject(path, item))
@@ -1209,7 +1323,7 @@ def create_app() -> FastAPI:
     @app.post("/api/repos/{repo_id}/explain/function", response_model=FunctionExplanation)
     def explain_function(repo_id: int, request: ExplainFunctionRequest):
         """Asks Claude Code what a changed function does, what it improves and what it costs."""
-        repo = _repo_path(repo_id)
+        repo = _git_path(repo_id, "Explaining a changed function")
         changes = _function_changes(repo, request.path, request.old_path, request.base, request.head,
                                     request.uncommitted)
         item = next((c for c in changes if c["name"] == request.name), None)
@@ -1219,7 +1333,7 @@ def create_app() -> FastAPI:
         base_ref = compare_module.freshest(repo, request.base or compare_module.default_base(repo))
         start = compare_module.fork_point(repo, base_ref, head)
         context = {"commits": [c["subject"] for c in compare_module.commits(repo, f"{start}..{head}")],
-                   "used_by": item["used_by"]}
+                   "used_by": item["used_by"], "helpers": item.get("helpers") or []}
         try:
             return explain_module.explain("function", _function_subject(request.path, item), context)
         except explain_module.ExplainError as error:
@@ -1413,18 +1527,42 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(error))
         return KnowledgeTransfer(files=files, explained=sum(1 for f in files if f["explanation"]))
 
+    @app.get("/api/repos/{repo_id}/kt/detail", response_model=KtDetail)
+    def kt_detail(repo_id: int, head: str | None = Query(None, description="Defaults to the checked-out branch"),
+                  worktree: bool | None = Query(None, description="The working folder; by default when it has changes")):
+        """The detailed KT: the project's parts, files, reading path, data, routes and commands,
+        read from the code, with the AI's words where they've been written."""
+        repo = _repo_path(repo_id)
+        try:
+            return _kt_detail(repo, head, worktree)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+
+    @app.post("/api/repos/{repo_id}/kt/detail", response_model=KtDetail)
+    def write_kt_detail(repo_id: int, request: KtDetailRequest):
+        """Asks the AI for the detailed KT's words (from the file notes written so far), then
+        returns the KT with them, checked against the code."""
+        repo = _repo_path(repo_id)
+        try:
+            return _kt_detail(repo, request.head, request.worktree, write=True, fresh=request.fresh)
+        except git.GitError as error:
+            raise HTTPException(400, str(error))
+        except explain_module.ExplainError as error:
+            raise _explain_failed(error)
+
     @app.post("/api/repos/{repo_id}/explain/file", response_model=FileExplanation)
     def explain_file(repo_id: int, request: ExplainFileRequest):
         """Asks the AI what one file is for and what each function in it does, for the KT."""
         repo = _repo_path(repo_id)
         try:
-            file = summary_module.kt_file(repo, request.head or "HEAD", request.path)
+            revision = projectmap.WORKTREE if request.worktree else request.head or "HEAD"
+            file = summary_module.kt_file(repo, revision, request.path)
             if file is None:
                 raise HTTPException(404, f"{request.path} isn't one of the project's files the KT explains")
-            facts = summary_module.summary(repo, request.head or "HEAD")
+            facts = summary_module.summary(repo, revision)
             context = {"text": file["text"], "outline": file["outline"], "part": file["part"],
                        "project": {"name": facts["name"], "description": facts["description"]}}
-            return explain_module.explain("file", _file_subject(file), context)
+            return explain_module.explain("file", _file_subject(file), context, fresh=request.fresh)
         except git.GitError as error:
             raise HTTPException(400, str(error))
         except explain_module.ExplainError as error:
@@ -1708,25 +1846,6 @@ def create_app() -> FastAPI:
         """Home's widgets back to the default order and selection."""
         return preferences_module.reset_home()
 
-    @app.get("/api/calendar", response_model=Agenda)
-    def calendar(days: int = Query(7, ge=1, le=31), refresh: bool = Query(False, description="Fetch it now")):
-        """The connected calendar's events from today on. Fetched at most every 5 minutes."""
-        return agenda_module.agenda(days, refresh)
-
-    @app.put("/api/calendar", response_model=Agenda)
-    def connect_calendar(body: CalendarAddress):
-        """Keeps the calendar's private iCal address, after checking it answers."""
-        try:
-            agenda_module.connect_calendar(body.url)
-        except agenda_module.AgendaError as error:
-            raise HTTPException(400, str(error))
-        return agenda_module.agenda(7)
-
-    @app.delete("/api/calendar", status_code=204)
-    def disconnect_calendar():
-        """Forgets the calendar's address."""
-        agenda_module.disconnect()
-
     if (WEB / "index.html").is_file():
         # Last, so every /api route above comes first.
         app.mount("/", StaticFiles(directory=WEB, html=True), name="ui")
@@ -1784,6 +1903,32 @@ def _function_subject(path: str, item: dict) -> dict:
 def _file_subject(file: dict) -> dict:
     # The file's content, by its git blob: an edit to it gets a new note.
     return {"path": file["path"], "sha": file["sha"]}
+
+
+def _kt_detail(repo: Path, head: str | None, worktree: bool | None, write: bool = False, fresh: bool = False) -> dict:
+    changes = ktdoc.has_changes(repo)
+    doc = ktdoc.document(repo, head or "HEAD", worktree=changes if worktree is None else worktree)
+    for f in doc["files"]:
+        f["explanation"] = explain_module.cached("file", _file_subject(f))
+    subject = ktdoc.subject(doc)
+    if write:
+        facts = summary_module.summary(repo, doc["revision"])
+        context = {**ktdoc.context(doc), "project": {"name": facts["name"], "description": facts["description"]}}
+        explain_module.explain("ktdetail", subject, context, fresh=fresh)
+    ai = ktdoc.verify(explain_module.cached("ktdetail", subject), doc) or {}
+    names = {p["id"]: p for p in ai.get("parts", [])}
+    why = {r["path"]: r for r in ai.get("reading", [])}
+    return {
+        **doc, "worktree": doc["revision"] == projectmap.WORKTREE, "has_changes": changes, "written": bool(ai),
+        "summary": ai.get("summary", ""), "audience": ai.get("audience", ""), "problem": ai.get("problem", ""),
+        "parts": [{**p, **({"name": names[p["id"]]["name"], "what": names[p["id"]]["what"]} if p["id"] in names else {})}
+                  for p in doc["parts"]],
+        "reading": [{**r, "why": why[r["path"]]["why"] if r["path"] in why else r["why"],
+                     "after": why[r["path"]]["after"] if r["path"] in why else None} for r in doc["reading"]],
+        "flows": ai.get("flows", []), "glossary": ai.get("glossary", []),
+        **doc["data"], "cautions": ktdoc.cautions(doc["files"]),
+        "explained": sum(1 for f in doc["files"] if f["explanation"]),
+    }
 
 
 def _kt_files(repo: Path, head: str | None) -> list[dict]:
@@ -1860,9 +2005,10 @@ def _project_context(facts: dict) -> dict:
 
 def _repo(row) -> Repo:
     path = Path(row["path"])
-    exists = git.toplevel(path) is not None
-    return Repo(id=row["id"], name=row["name"], path=row["path"], exists=exists,
-                branch=git.branch(path) if exists else None, claude=bool(row["claude"]), ai=_ai(row))
+    exists = path.is_dir()
+    is_git = exists and git.toplevel(path) is not None
+    return Repo(id=row["id"], name=row["name"], path=row["path"], exists=exists, git=is_git,
+                branch=git.branch(path) if is_git else None, claude=bool(row["claude"]), ai=_ai(row))
 
 
 def _ai(row) -> str | None:
@@ -1893,6 +2039,15 @@ def _repo_path(repo_id: int) -> Path:
     if row is None:
         raise HTTPException(404, "repo not tracked; run devdash init in it")
     path = Path(row["path"])
-    if git.toplevel(path) is None:
+    if not path.is_dir():
         raise HTTPException(410, f"repo is no longer at {path}")
+    return path
+
+
+def _git_path(repo_id: int, feature: str) -> Path:
+    """The project's folder, for what only works in a git repository."""
+    path = _repo_path(repo_id)
+    if git.toplevel(path) is None:
+        raise HTTPException(409, f"{feature} needs git, and {path.name} isn't a git repository. "
+                                 "Run git init in it to turn this on.")
     return path

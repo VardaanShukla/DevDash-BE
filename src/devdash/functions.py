@@ -15,6 +15,11 @@ from devdash import git
 MAX_UNITS = 60
 MAX_CODE_LINES = 300
 MAX_USES = 8
+# The same file's functions that a changed one calls, shown to the AI so it reads what they
+# do instead of guessing from their names: at most this many, each cut to this many lines.
+MAX_HELPERS = 3
+MAX_HELPER_LINES = 60
+MAX_HELPER_CHARS = 4_000
 # The changed lines of a file read as a whole, for the AI and for its cache key.
 MAX_DIFF_LINES = 200
 
@@ -100,6 +105,7 @@ def function_changes(repo: Path, before_rev: str, after_rev: str | None, path: s
             "after": after,
             "facts": _facts(before, after),
             "used_by": [],
+            "helpers": helpers(after, before, new_units),
         })
         if len(changes) >= MAX_UNITS:
             break
@@ -112,6 +118,35 @@ def function_changes(repo: Path, before_rev: str, after_rev: str | None, path: s
         whole = _whole_file(path, old_text, new_text)
         return [whole] if whole else []
     return changes
+
+
+def helpers(after: dict | None, before: dict | None, file_units: dict[str, dict]) -> list[dict]:
+    """The code of the functions in the same file that `after` calls, the ones it newly
+    calls first: what a change's pros and cons often hang on."""
+    if not after or not after.get("calls"):
+        return []
+    by_name = {}
+    for name, unit in file_units.items():
+        by_name.setdefault(name.rsplit(".", 1)[-1], unit)
+    own = after["name"]
+    old_calls = set((before or {}).get("calls") or [])
+    calls = sorted(after["calls"], key=lambda c: c in old_calls)  # new calls first
+    found, seen, room = [], set(), MAX_HELPER_CHARS
+    for call in calls:
+        unit = by_name.get(call.rsplit(".", 1)[-1])
+        if not unit or unit["name"] == own or unit["name"] in seen or unit["kind"] in ("style", "section", "file"):
+            continue
+        lines = unit["code"].splitlines()
+        code = "\n".join(lines[:MAX_HELPER_LINES]) + (f"\n… ({len(lines) - MAX_HELPER_LINES} more lines)"
+                                                        if len(lines) > MAX_HELPER_LINES else "")
+        if len(code) > room:
+            continue
+        seen.add(unit["name"])
+        found.append({"name": unit["name"], "code": code, "new_call": call not in old_calls})
+        room -= len(code)
+        if len(found) >= MAX_HELPERS:
+            break
+    return found
 
 
 def _whole_file(path: str, old_text: str | None, new_text: str | None) -> dict | None:

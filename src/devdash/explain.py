@@ -14,6 +14,7 @@ Signing in to Claude Code can happen from the dashboard too: `start_login` runs
 `claude auth login`, which opens the browser, and `finish_login` passes it the code the
 sign-in page shows, for when the browser can't hand it back by itself."""
 
+import difflib
 import hashlib
 import json
 import os
@@ -33,14 +34,20 @@ from devdash.store.db import now
 
 TIMEOUT = 240
 # Bump when a prompt changes, so explanations written for the old one are asked again.
-PROMPT_VERSION = "1"
-VERSIONS = {"project": "2", "guide": "3"}
+PROMPT_VERSION = "2"
+# file 3: notes written for someone who has never coded, for the detailed KT (2 was the default before).
+VERSIONS = {"project": "2", "guide": "3", "file": "3", "ktdetail": "1"}
 MAX_PROMPT_CHARS = 30_000
 # Local and self-hosted models are often small, with a short memory (context): their
 # prompts are kept to this many characters, about 3,500 tokens.
 SMALL_PROMPT_CHARS = 12_000
 SMALL_PROVIDERS = {"ollama", "hosted"}
 MODEL = os.environ.get("DEVDASH_CLAUDE_MODEL", "haiku")
+# A function's explanation is checked by a second request before it is kept: about twice
+# the tokens, once per function (answers are saved). DEVDASH_EXPLAIN_REVIEW=0 turns it off.
+# Local and self-hosted models skip it: they are slow, and a small model's review of itself
+# hasn't been measured to help.
+REVIEW = os.environ.get("DEVDASH_EXPLAIN_REVIEW", "1") != "0"
 SYSTEM_PROMPT = ("You turn code and facts about software projects into plain-English explanations for people "
                  "who don't write code. Reply with only the JSON object you are asked for.")
 # What Claude Code says when its sign-in is missing or has run out.
@@ -201,7 +208,18 @@ def explain(kind: str, subject: dict, context: dict | None = None, fresh: bool =
         return found
     budget = prompt_budget()
     prompt = _fit(redact(PROMPTS[kind](subject, context or {}, budget)), budget)
-    result = _clean(kind, _parse(_run(prompt)))
+    data = _parse(_run(prompt))
+    if kind == "function" and REVIEW and preferences.ai_choice()[0] not in SMALL_PROVIDERS:
+        # A second pass cuts the wrong points and finds the missed risks (measured on real
+        # changes, it lifts Haiku's pros and cons from 6.7 to 7.4 out of 10). If it fails, the
+        # first answer stands.
+        try:
+            reviewed = _parse(_run(_review_prompt(prompt, data)))
+            if _complete(kind, {MAIN_FIELD[kind]: reviewed.get(MAIN_FIELD[kind])}):
+                data = reviewed
+        except ExplainError:
+            pass
+    result = _clean(kind, data, prompt)
     conn = connect()
     with conn:
         conn.execute("INSERT OR REPLACE INTO explanations (key, kind, result, created_at) VALUES (?, ?, ?, ?)",
@@ -235,6 +253,10 @@ UNIT_WORDS = {"style": "Style rule", "section": "Section", "file": "Whole file"}
 
 
 def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    """One changed function's explanation. Its pros and cons are what people act on, so the
+    AI gets the exact lines that changed (not two copies to compare by eye), the code of
+    what it calls, and rules that keep out guesses and points that fit any change; every
+    point then has to quote the code it rests on (see `_grounded`)."""
     if subject.get("scope") == "prompt":
         # One prompt's change, from the AI changes page, rather than a whole branch's.
         what = {"added": "One prompt to an AI coding tool added it.", "deleted": "One prompt to an AI coding tool removed it.",
@@ -244,7 +266,8 @@ def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHAR
                 "modified": "This branch changes it."}[subject["change"]]
     kind = subject["kind"]
     parts = [
-        "You explain code changes to people who don't write code: product managers, designers and testers.",
+        "You explain one code change to people who don't write code: product managers, designers and testers. "
+        "They act on the pros and cons you give, so a wrong, vague or guessed point is worse than none.",
         "",
         f"File: {subject['path']}",
         f"{UNIT_WORDS.get(kind, kind.capitalize())}: {subject['name']}. {what}",
@@ -253,35 +276,96 @@ def _function_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHAR
         parts.append("It is not split into functions (settings, styles, a page, data, docs or a script): "
                      "explain what the file is for and what its change does.")
     if context.get("prompt"):
-        parts += ["What the AI was asked:", _clip(context["prompt"], 1_500)]
+        parts += ["What the AI was asked (why the change was made; not proof of what the code does):",
+                  _clip(context["prompt"], 1_500)]
     if context.get("commits"):
-        parts += ["Commit titles on this branch:", *[f"- {c}" for c in context["commits"][:12]]]
+        parts += ["Commit titles on this branch (they cover the whole branch, not only this code: use them for why, "
+                  "never as proof of what this code does):", *[f"- {c}" for c in context["commits"][:12]]]
     if context.get("used_by"):
         parts += ["Used in:", *[f"- {u['path']}:{u['line']}: {u['text']}" for u in context["used_by"][:6]]]
-    # Room for the code: what's left after the rest of the prompt (about 2,000 characters).
-    room = max(2_000, budget - 2_500)
+    # Room for the code: what's left after the rest of the prompt (about 3,000 characters).
+    room = max(2_000, budget - 3_500)
+    helpers = context.get("helpers") or []
+    if helpers:
+        shown = []
+        for helper in helpers:
+            if len(helper["code"]) > room // 3:
+                continue
+            shown += [f"{helper['name']}" + (" (newly called)" if helper.get("new_call") else "") + ":",
+                      "```", helper["code"], "```"]
+            room -= len(helper["code"])
+        if shown:
+            parts += ["", "Functions from the same file that it calls, as they are now (read these rather than "
+                      "guess what they do from their names):", *shown]
+    before, after = subject.get("before"), subject.get("after")
     if subject.get("diff"):
-        parts += ["", "The lines that changed (- removed, + added):", "```", _clip(subject["diff"], room), "```"]
+        cut = " Only the changed lines and a few around them are shown, not the whole function." \
+            if subject.get("scope") == "prompt" else ""
+        parts += ["", f"The lines that changed (- removed, + added, others unchanged).{cut}", "```",
+                  _clip(subject["diff"], room), "```"]
+    elif before and after:
+        # Two whole copies to compare by eye is where a small model misreads what changed:
+        # it gets the exact changed lines, and the code as it is now for the rest.
+        diff = "\n".join(list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=3))[2:])
+        parts += ["", "The lines that changed (- removed, + added, others unchanged):", "```",
+                  _clip(diff, room // 2), "```", "", "The whole of it now:", "```", _clip(after, room // 2), "```"]
     else:
-        sides = [side for side in ("before", "after") if subject.get(side)]
-        for side in sides:
-            title = ("Before:" if side == "before" else "After:") if len(sides) == 2 else "The code:"
-            parts += ["", title, "```", _clip(subject[side], room // len(sides)), "```"]
+        code = after or before or ""
+        parts += ["", "The code:" + (" (all of it is new)" if after else " (all of it is removed)"), "```",
+                  _clip(code, room), "```"]
     parts += [
         "",
-        "Reply with only a JSON object and no other text, with these keys:",
+        "Reply with only a JSON object and no other text, with these keys, in this order:",
+        '"differences": a list of every concrete difference the changed lines make, in code terms, one short sentence '
+        "each (for something new or removed: what it does, step by step). Work these out first; everything after "
+        "rests on them.",
         '"summary": one sentence on what this does now (for a removed one, what it did).',
-        '"change": two or three sentences on what is different from before. For a new one: what it is for, '
-        "when it runs and what uses it. For a removed one: what stops happening.",
-        '"improves": up to 4 short phrases on what the change makes better or optimizes, such as speed, '
-        "safety, clarity, a fixed bug or a new ability. An empty list if nothing is clear.",
-        '"tradeoffs": up to 4 short phrases on what it costs or risks, such as more complexity, a slower case, '
-        "or a behaviour change someone may notice. An empty list if none.",
-        '"check": one sentence on what someone testing the app should try, or null.',
-        "Use plain words. When a technical term can't be avoided, explain it in brackets. Say only what the "
-        "code shows; write \"unclear\" rather than guess.",
+        '"change": two or three sentences on what is different from before, from your differences only. For a new '
+        "one: what it is for, when it runs and what uses it. For a removed one: what stops happening.",
+        '"improves": a list of objects {"point": one plain sentence, "evidence": code copied character for character '
+        "from the lines above that shows it}. Benefits this change really brings: a bug fixed (say which case went "
+        "wrong before), a case now handled, a new ability, something made safer or faster that the lines show.",
+        '"tradeoffs": a list of objects {"point": one plain sentence, "evidence": code copied character for character '
+        "from the lines above}. The costs and risks a careful reviewer would raise about this change: an input or "
+        "state that now fails, crashes or is refused; an error that isn't caught; something users will notice "
+        "working differently; data now dropped, overwritten or no longer kept; work that runs more often or slower; "
+        "something other code must now do. Name the exact case.",
+        '"check": one sentence on what someone testing the app should try to see the change, or null.',
+        "Rules for improves and tradeoffs:",
+        "- Most changes have one to three real benefits and zero to two real costs. An empty list is the right answer "
+        "when the code shows none; never pad.",
+        "- Never give a point that would fit almost any change, such as \"more complexity\", \"more code to "
+        "maintain\", \"callers must handle it\" or \"behaviour may change\".",
+        "- Never give a point about code you can't see. No \"unclear\", \"may\", \"might\" or \"depends on\": "
+        "leave the point out instead.",
+        "- Don't credit the change with what the old code already did, and don't blame it for what it doesn't touch. "
+        "When the old code didn't do something at all, there was no old behaviour: don't describe one.",
+        "- Look hardest at what reviewers catch: a missing or wrong value that now crashes (such as a key read "
+        "without a default), an error part way through that now stops or undoes the rest, a step that now acts on "
+        "more than it should (every session, user, file or project), and work that now runs every time.",
+        "Use plain words. When a technical term can't be avoided, explain it in brackets.",
     ]
     return "\n".join(parts)
+
+
+def _review_prompt(prompt: str, draft: dict) -> str:
+    """A second look at a function's explanation, as a strict reviewer: the same code, the
+    first answer, and the job of deleting what's wrong and adding what's missing."""
+    draft = {k: draft.get(k) for k in ("summary", "change", "improves", "tradeoffs", "check")}
+    return "\n".join([
+        prompt,
+        "",
+        "Another reviewer already wrote this answer:",
+        "```json",
+        json.dumps(draft, indent=1),
+        "```",
+        "Check it line by line against the code above, as a strict senior engineer. Delete every point that is "
+        "wrong, that guesses about code not shown, that describes an old behaviour the old code didn't have, or that "
+        "would fit any change. Fix wrong statements in summary and change. Then add any important benefit or risk it "
+        "missed, especially the reviewer cases listed above. Keep what is right as it is.",
+        "Reply with only the corrected JSON object, with the same keys and the same shape as asked above "
+        "(improves and tradeoffs as objects with point and evidence).",
+    ])
 
 
 def _project_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
@@ -336,7 +420,7 @@ def _file_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -
     project = context.get("project") or {}
     parts = [
         "You write the knowledge transfer (KT) for a software project, one file at a time, so a new team "
-        "member can take it over.",
+        "member can take it over. Many readers have never written code: write for them.",
         "",
         f"Project: {project.get('name') or 'unnamed'}" + (f". {project['description']}" if project.get("description") else ""),
         f"File: {subject['path']}" + (f" (in the part \"{context['part']}\")" if context.get("part") else ""),
@@ -346,17 +430,20 @@ def _file_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -
     parts += ["", "The file" + (" (cut to fit; the list above has all of it):" if len(context.get("text", "")) > room else ":"),
               "```", _clip(context.get("text", ""), room), "```", "",
               "Reply with only a JSON object and no other text, with these keys:",
-              '"purpose": two or three sentences on what this file is for, why the project needs it, and when it '
-              "is used.",
+              '"purpose": at most two short sentences on what this file does for the project, in everyday words. '
+              'Start with what it does (such as "Keeps the list of projects you added."), never with "This file". ',
+
               '"functions": a list of objects {"name": a name exactly as listed above, "what": one sentence on what '
               "it does, what it takes and what it gives back}, for every one listed, in order. An empty list when "
               "none are listed.",
               '"connects": one or two sentences on which other files or parts it uses, or that use it, from its '
               "imports and the names in it. \"unclear\" if the file doesn't show.",
-              '"notes": up to three short phrases on what to watch out for when changing it, such as settings it '
-              "reads, data it writes, or things that must stay in step elsewhere. An empty list if none.",
-              "Use plain words. When a technical term can't be avoided, explain it in brackets. Say only what the "
-              "code shows; write \"unclear\" rather than guess."]
+              '"notes": up to two short lines, each under 20 words, on what to be careful with when changing it, '
+              "such as settings it reads, data it writes, or things that must stay in step elsewhere. An empty list "
+              "if none.",
+              "Use short sentences and everyday words. When a technical term can't be avoided, explain it in brackets "
+              "once. Say only what the code shows; write \"unclear\" rather than guess. Never name a file that isn't "
+              "in the project."]
     return "\n".join(parts)
 
 
@@ -405,12 +492,56 @@ def _guide_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) 
     ])
 
 
+def _ktdetail_prompt(subject: dict, context: dict, budget: int = MAX_PROMPT_CHARS) -> str:
+    """The project-level words of the detailed KT: what it is, its parts, the reading path,
+    the main flows and a glossary, from the facts read from the code and each file's note."""
+    facts = {"project": context.get("project") or {}, "parts": context.get("parts") or [],
+             "reading_path": context.get("reading") or [], "routes": context.get("routes", 0),
+             "tables": context.get("tables") or []}
+    files = context.get("files") or []
+    head = json.dumps(facts, indent=1)
+    listed, room = [], max(3_000, budget - len(head) - 3_500)
+    for f in files:
+        line = f"- {f['path']} [{f['role']}] uses: {', '.join(f['uses']) or 'nothing'}. {f['note'][:240]}"
+        if room - len(line) < 0:
+            listed.append(f"- … and {len(files) - len(listed)} more files")
+            break
+        room -= len(line) + 1
+        listed.append(line)
+    return "\n".join([
+        "You write the detailed knowledge transfer (KT) for a software project, for someone who has never written "
+        "code. Here are facts read from the project's code:",
+        "```json", head, "```", "",
+        "Its files, with their role, the project files each one uses (read from the imports) and a note on each:",
+        *listed, "",
+        "Reply with only a JSON object and no other text, with these keys:",
+        '"summary": one or two short sentences on what the project is and what it does.',
+        '"audience": one short sentence on who uses it.',
+        '"problem": one short sentence on the problem it solves.',
+        '"parts": for every part in the facts, an object {"id": its id exactly as given, "name": a plain name of two '
+        'or three words, such as "Server" or "Screens", "what": one short sentence on what it does}.',
+        '"reading": for every path in "reading_path", in that order, an object {"path": the path exactly as given, '
+        '"why": one short sentence on why to read it at this point, "after": "After this you will understand ..." '
+        "in one short sentence}.",
+        '"flows": three to five objects {"name": "What happens when you ..." naming something a person does with the '
+        'project, "steps": three to eight objects {"path": a file path exactly as listed above, "what": one short '
+        "sentence on what that file does at this step}}. Follow the uses lists: each step's file must use, or be used "
+        "by, the file of the step before it. Steps that don't are removed.",
+        '"glossary": up to twelve objects {"term": a word from this project a beginner may not know, such as '
+        '"commit" or "API", "meaning": one short plain sentence}.',
+        "Use short sentences and everyday words. Say only what the facts and notes show; never name a file, part or "
+        "path that isn't listed above.",
+    ])
+
+
 MAX_OUTLINE = 60
 
 
 # The field an explanation can't be without.
-MAIN_FIELD = {"function": "summary", "project": "overview", "file": "purpose", "guide": "overview"}
-PROMPTS = {"function": _function_prompt, "project": _project_prompt, "file": _file_prompt, "guide": _guide_prompt}
+MAIN_FIELD = {"function": "summary", "project": "overview", "file": "purpose", "guide": "overview",
+              "ktdetail": "summary"}
+PROMPTS = {"function": _function_prompt, "project": _project_prompt, "file": _file_prompt, "guide": _guide_prompt,
+           "ktdetail": _ktdetail_prompt}
 
 FIELDS = {
     "function": {"summary": str, "change": str, "improves": list, "tradeoffs": list, "check": (str, type(None))},
@@ -419,10 +550,13 @@ FIELDS = {
     "file": {"purpose": str, "functions": list, "connects": str, "notes": list},
     "guide": {"overview": str, "needs": list, "setup": list, "run": list, "how_to_use": list, "settings": list,
               "start_here": list, "functions": list, "images": list},
+    "ktdetail": {"summary": str, "audience": str, "problem": str, "parts": list, "reading": list, "flows": list,
+                 "glossary": list},
 }
 # The most items kept in each list of an answer.
 LIST_LIMITS = {"functions": MAX_OUTLINE, "parts": 12, "how_it_works": 8, "needs": 8, "setup": 10, "run": 6,
-               "how_to_use": 6, "settings": 5, "start_here": 6, "images": 3}
+               "how_to_use": 6, "settings": 5, "start_here": 6, "images": 3, "reading": 10, "flows": 5,
+               "glossary": 12}
 
 
 def _run(prompt: str) -> str:
@@ -561,14 +695,17 @@ def _parse(text: str) -> dict:
         raise ExplainError("Claude's answer wasn't in the expected shape. Try again.")
 
 
-def _clean(kind: str, data: dict) -> dict:
-    """Only the expected keys, each of the expected type, so the page can trust them."""
+def _clean(kind: str, data: dict, prompt: str = "") -> dict:
+    """Only the expected keys, each of the expected type, so the page can trust them.
+    `prompt` is what the AI was shown: a function's pros and cons must quote it."""
     result = {}
     for name, expected in FIELDS[kind].items():
         value = data.get(name)
         if expected is str and isinstance(value, list) and all(isinstance(v, str) for v in value):
             value = " ".join(value)  # sentences given as a list
-        if expected is list:
+        if kind == "function" and name in ("improves", "tradeoffs"):
+            value = _grounded(value if isinstance(value, list) else [], prompt)
+        elif expected is list:
             limit = LIST_LIMITS.get(name, 8)
             value = [item for item in value if isinstance(item, (str, dict))][:limit] if isinstance(value, list) else []
         elif not isinstance(value, expected):
@@ -599,14 +736,63 @@ def _clean(kind: str, data: dict) -> dict:
                                for f in result["functions"] if isinstance(f, dict)][:12]
     elif kind == "file":
         result["functions"] = _pairs(result["functions"], "name", "what")
-        result["notes"] = [s for s in result["notes"] if isinstance(s, str)][:3]
-    else:
-        result["improves"] = [s for s in result["improves"] if isinstance(s, str)]
-        result["tradeoffs"] = [s for s in result["tradeoffs"] if isinstance(s, str)]
+        result["notes"] = [s for s in result["notes"] if isinstance(s, str)][:2]
+    elif kind == "ktdetail":
+        # Which parts, files and steps are real is checked against the code when it's shown (ktdoc.verify).
+        result["parts"] = [{"id": p["id"], "name": p["name"], "what": p["what"]} for p in result["parts"]
+                           if isinstance(p, dict) and all(isinstance(p.get(k), str) for k in ("id", "name", "what"))]
+        result["reading"] = [{"path": r["path"], "why": r["why"], "after": r["after"]} for r in result["reading"]
+                             if isinstance(r, dict) and all(isinstance(r.get(k), str) for k in ("path", "why", "after"))]
+        result["flows"] = [{"name": f["name"], "steps": _pairs(f["steps"], "path", "what")[:8]} for f in result["flows"]
+                           if isinstance(f, dict) and isinstance(f.get("name"), str) and isinstance(f.get("steps"), list)]
+        result["glossary"] = _pairs(result["glossary"], "term", "meaning")
     if not _complete(kind, result):
         # Never kept: the page would show an empty description, every time.
         raise ExplainError("The AI's answer left out the description. Try again, or pick another model in Settings.")
     return result
+
+
+# A pro or con that hedges is a guess about code the AI didn't see: left out, not shown.
+_HEDGE = re.compile(r"\b(?:unclear|not shown|isn't shown|not visible|can't tell|cannot tell|"
+                    r"depends on (?:how|what|whether|code|the code))\b", re.I)
+MAX_POINTS = 4
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _quoted(evidence: str, shown: str) -> bool:
+    """Whether the evidence is code from the prompt: all of it, or one of its lines, taken
+    without the diff's - and + marks."""
+    lines = [re.sub(r"^\s*[-+]\s?", "", line) for line in evidence.splitlines()]
+    whole = _squash(" ".join(lines)).strip("`")
+    if len(whole) >= 3 and whole in shown:
+        return True
+    return any(len(_squash(line)) >= 8 and _squash(line).strip("`") in shown for line in lines)
+
+
+def _grounded(items: list, prompt: str) -> list[str]:
+    """The pros or cons that rest on code: each object's evidence must be found in what the
+    AI was shown, and a point that hedges is a guess. Plain strings (from a model that left
+    the evidence out) only pass the hedge check. Repeats are dropped."""
+    shown = _squash("\n".join(re.sub(r"^\s*[-+]", "", line) for line in prompt.splitlines()))
+    kept, seen = [], set()
+    for item in items:
+        if isinstance(item, dict):
+            point, evidence = item.get("point"), item.get("evidence")
+            if not isinstance(point, str) or not isinstance(evidence, str) or not _quoted(evidence, shown):
+                continue
+        elif isinstance(item, str):
+            point = item
+        else:
+            continue
+        point = point.strip()
+        if not point or _HEDGE.search(point) or _squash(point) in seen:
+            continue
+        seen.add(_squash(point))
+        kept.append(point)
+    return kept[:MAX_POINTS]
 
 
 def _pairs(items: list, first: str, second: str) -> list[dict]:

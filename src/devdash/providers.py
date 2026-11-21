@@ -5,7 +5,8 @@ it is installed and ready, how to install it (the official commands for this com
 which models it offers and which is cheapest, and answers one prompt with text. Every run
 is in an empty folder, read-only where the tool allows it, so nothing touches a project.
 
-Recording changes is separate (capture/): only Claude Code's edits are recorded today."""
+Recording changes is separate (capture/): Claude Code's, Codex's and Antigravity's edits
+can be recorded, one tool per project."""
 
 import base64
 import functools
