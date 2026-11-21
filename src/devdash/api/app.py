@@ -119,7 +119,7 @@ class BranchInfo(BaseModel):
     name: str
     merged: bool
     gone: bool
-    # When DevDash stops listing a merged or deleted branch; None for an open one.
+    # When Looma stops listing a merged or deleted branch; None for an open one.
     removes_at: str | None = None
 
 
@@ -701,14 +701,14 @@ class ExplainProjectRequest(BaseModel):
 
 
 class GitHubStatus(BaseModel):
-    configured: bool  # DevDash's GitHub App is set up (its client ID is known)
+    configured: bool  # Looma's GitHub App is set up (its client ID is known)
     gh: bool  # GitHub's gh tool is installed, to sign in through
     connected: bool
     via: Literal["app", "gh", "token"] | None  # how the account was connected
     login: str | None
     name: str | None
     avatar: str | None
-    install_url: str | None  # where to pick the repositories DevDash may read
+    install_url: str | None  # where to pick the repositories Looma may read
     # While signing in: the code to enter at verify_url, and when it runs out (Unix time).
     code: str | None
     verify_url: str | None
@@ -723,7 +723,7 @@ class GitHubRepo(BaseModel):
     url: str | None
     clone_url: str | None
     updated_at: str | None
-    tracked: str | None  # the folder of the DevDash project cloned from it
+    tracked: str | None  # the folder of the Looma project cloned from it
 
 
 class GitHubConnect(BaseModel):
@@ -777,7 +777,7 @@ class CodeCommitRepo(BaseModel):
     url: str | None  # the repository in the AWS console
     clone_url: str | None
     updated_at: str | None
-    tracked: str | None  # the folder of the DevDash project cloned from it
+    tracked: str | None  # the folder of the Looma project cloned from it
 
 
 class CodeCommitClone(BaseModel):
@@ -972,8 +972,8 @@ class OllamaState(BaseModel):
     installed: bool
     running: bool
     version: str | None
-    host: str  # where DevDash looks for it (OLLAMA_HOST, or 127.0.0.1:11434)
-    started_here: bool  # started from DevDash
+    host: str  # where Looma looks for it (OLLAMA_HOST, or 127.0.0.1:11434)
+    started_here: bool  # started from Looma
     # What runs it, so Start and Stop go through the same thing: devdash, service (Linux's
     # systemd service: Linux asks for your password), app (macOS, Windows) or command.
     managed_by: Literal["devdash", "service", "app", "command"] | None
@@ -1005,7 +1005,7 @@ class MemoryUse(BaseModel):
 
 
 class OllamaUsage(BaseModel):
-    gpus: list[GpuUse]  # empty: no GPU DevDash can read, so the CPU is shown
+    gpus: list[GpuUse]  # empty: no GPU Looma can read, so the CPU is shown
     cpu: float | None  # busy, 0-100
     cores: int
     memory: MemoryUse | None
@@ -1024,7 +1024,7 @@ class OllamaAdvice(BaseModel):
     cpu: str | None
     threads: int
     memory_gb: float | None
-    gpu: str | None  # the biggest one DevDash can read
+    gpu: str | None  # the biggest one Looma can read
     gpu_memory_gb: float | None
     recommended: str  # the suggested model that suits this computer best
     reason: str
@@ -1032,7 +1032,7 @@ class OllamaAdvice(BaseModel):
 
 
 class OllamaSwitch(BaseModel):
-    # The person said yes, on the page, to DevDash asking for their password (pkexec) to run
+    # The person said yes, on the page, to Looma asking for their password (pkexec) to run
     # systemctl start or stop ollama. Without it, a service is never started or stopped.
     confirm: bool = False
 
@@ -1097,7 +1097,7 @@ class NewPassword(BaseModel):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="DevDash", version="0.1.0")
+    app = FastAPI(title="Looma", version="0.1.0")
     sync_locks: dict[int, threading.Lock] = {}
     sync_results: dict[int, dict] = {}
     app.add_middleware(CORSMiddleware, allow_origins=DEV_ORIGINS,
@@ -1108,9 +1108,9 @@ def create_app() -> FastAPI:
     async def local_only(request: Request, call_next):
         # The API can change git hooks and Claude settings, so it answers only requests
         # addressed to this machine (a rebound DNS name fails here) and, for changes,
-        # only JSON from no page or the DevDash UI.
+        # only JSON from no page or the Looma UI.
         if (request.url.hostname or "") not in LOCAL_HOSTS:
-            return JSONResponse({"detail": "DevDash only answers on localhost"}, status_code=403)
+            return JSONResponse({"detail": "Looma only answers on localhost"}, status_code=403)
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
             if origin and origin not in DEV_ORIGINS and origin != f"{request.url.scheme}://{request.url.netloc}":
@@ -1122,7 +1122,7 @@ def create_app() -> FastAPI:
         private = path == "/api" or path.startswith("/api/") or path in PRIVATE_PAGES
         if (private and path not in OPEN_PATHS and request.method != "OPTIONS" and auth.password_set()
                 and not auth.signed_in(request.cookies.get(auth.COOKIE))):
-            return JSONResponse({"detail": "sign in to DevDash"}, status_code=401)
+            return JSONResponse({"detail": "sign in to Looma"}, status_code=401)
         return await call_next(request)
 
     @app.get("/api/auth", response_model=AuthStatus, response_model_exclude_none=True)
@@ -1154,7 +1154,7 @@ def create_app() -> FastAPI:
         """Sets the first username and password, or changes them from a signed-in browser with
         the current password. Signs this browser in, and every other one out."""
         if auth.password_set() and not auth.signed_in(request.cookies.get(auth.COOKIE)):
-            raise HTTPException(401, "sign in to DevDash")
+            raise HTTPException(401, "sign in to Looma")
         try:
             auth.set_password(body.password, body.current, name=body.username)
         except auth.AuthError as error:
@@ -1198,7 +1198,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/recording/repair", response_model=RecordingHealth)
     def repair_recording():
-        """Reinstalls the hooks of every AI tool in use so they call this install of DevDash."""
+        """Reinstalls the hooks of every AI tool in use so they call this install of Looma."""
         from devdash.capture import install, record
 
         problems = install.refresh()
@@ -1620,7 +1620,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/github/connect", response_model=GitHubStatus)
     def github_connect(body: GitHubConnect | None = None):
-        """Starts signing in to GitHub, through DevDash's app or the gh tool: the answer has
+        """Starts signing in to GitHub, through Looma's app or the gh tool: the answer has
         the code to enter on GitHub, or the account when gh was already signed in."""
         try:
             return github.start(body.method if body else "app")
@@ -1649,7 +1649,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/github/repos", response_model=list[GitHubRepo])
     def github_repos():
-        """Your repositories that DevDash's GitHub App may read, with the project each is cloned as."""
+        """Your repositories that Looma's GitHub App may read, with the project each is cloned as."""
         conn = connect()
         rows = conn.execute("SELECT path FROM repos").fetchall()
         conn.close()
@@ -1871,7 +1871,7 @@ def _set_login(response: Response, token: str) -> None:
 
 
 def _explain_failed(error: "explain_module.ExplainError") -> HTTPException:
-    # 424 tells the page to offer signing in to Claude (401 is for DevDash's own sign-in);
+    # 424 tells the page to offer signing in to Claude (401 is for Looma's own sign-in);
     # anything else is Claude Code failing.
     return HTTPException(424 if error.signed_out else 502, str(error))
 
@@ -2029,7 +2029,7 @@ def _install(action, path: Path | None):
     except install.InitError as error:
         raise HTTPException(400, str(error))
     except json.JSONDecodeError:  # kept for callers outside install's own checks
-        raise HTTPException(400, "A settings file isn't valid JSON, so DevDash can't add its hooks")
+        raise HTTPException(400, "A settings file isn't valid JSON, so Looma can't add its hooks")
 
 
 def _repo_path(repo_id: int) -> Path:

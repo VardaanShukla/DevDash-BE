@@ -65,7 +65,7 @@ def _read(item: Path) -> dict:
 
 
 def _when(request: dict, item: Path) -> str:
-    """When the request was made: its "at", or when the note was written. Not when DevDash
+    """When the request was made: its "at", or when the note was written. Not when Looma
     read it, which can be hours later, on another day."""
     at = request.get("at")
     if isinstance(at, str):

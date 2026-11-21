@@ -1,4 +1,4 @@
-"""The AIs besides Claude Code (explain.py) that can write DevDash's explanations: ChatGPT's
+"""The AIs besides Claude Code (explain.py) that can write Looma's explanations: ChatGPT's
 Codex CLI, a local model served by Ollama, Google's Antigravity CLI, and a model on the
 person's own server, connected by pasting the curl command that reaches it. Each says whether
 it is installed and ready, how to install it (the official commands for this computer),
@@ -111,7 +111,7 @@ def _base(provider: str, available: bool, **fields) -> dict:
 
 
 def _env() -> dict:
-    # DevDash's own runs are never recorded as someone's prompt.
+    # Looma's own runs are never recorded as someone's prompt.
     return {**os.environ, INTERNAL_ENV: "1"}
 
 
@@ -303,7 +303,7 @@ def ollama_advice() -> dict:
     elif hardware["gpu"]:
         reason = f"Your {hardware['gpu']} is too small for these models, so this one runs on the CPU at a usable speed."
     else:
-        reason = "DevDash found no NVIDIA, AMD or Apple GPU, so this one runs on the CPU at a usable speed."
+        reason = "Looma found no NVIDIA, AMD or Apple GPU, so this one runs on the CPU at a usable speed."
     return {**hardware, "recommended": best[0], "reason": reason,
             "models": [{"name": name, "size_gb": size, "note": note, "fit": fit} for name, size, note, fit in fits]}
 
@@ -349,7 +349,7 @@ def _ollama_ask(model: str | None, system: str, prompt: str) -> str:
     return (reply.get("message") or {}).get("content") or ""
 
 
-# Running Ollama from the dashboard: starting and stopping its server (only one DevDash
+# Running Ollama from the dashboard: starting and stopping its server (only one Looma
 # started itself: a system service is stopped the system's way), and downloading, loading,
 # unloading and removing models. Downloads run in the background; their progress is read
 # from ollama_state().
@@ -387,7 +387,7 @@ def ollama_state() -> dict:
         if not state["installed"]:
             state["install"] = _ollama_status()["install"]
         return state
-    state["installed"] = True  # running, even if not where DevDash looks for it
+    state["installed"] = True  # running, even if not where Looma looks for it
     try:
         loaded = {m.get("name"): m for m in _ollama_get("/api/ps").get("models", []) if isinstance(m, dict)}
         tags = _ollama_get("/api/tags").get("models", [])
@@ -454,7 +454,7 @@ def needs_admin() -> bool:
 
 def _ask_first(command: list[str], confirmed: bool) -> None:
     if not confirmed:
-        raise NeedsPermission(f"DevDash needs your OK before it asks for your password to run {' '.join(command)}.")
+        raise NeedsPermission(f"Looma needs your OK before it asks for your password to run {' '.join(command)}.")
 
 
 def start_ollama(confirmed: bool = False) -> None:
@@ -495,7 +495,7 @@ def _serve() -> None:
 
 
 def stop_ollama(confirmed: bool = False) -> None:
-    """Stops Ollama however it was started: the one DevDash started, its Linux service (Linux
+    """Stops Ollama however it was started: the one Looma started, its Linux service (Linux
     asks for your password), its app, or an `ollama serve` run by hand."""
     if not _ollama_running() and not _started_here():
         return
@@ -536,7 +536,7 @@ def _service_active() -> bool:
 
 
 def _as_admin(command: list[str], verb: str) -> None:
-    """Runs a system command that needs an administrator: as is when DevDash already is one,
+    """Runs a system command that needs an administrator: as is when Looma already is one,
     otherwise through pkexec, which shows the desktop's own password window."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         result = _run(command)
@@ -666,7 +666,7 @@ def _ollama_post(path: str, body: dict, timeout: float, method: str = "POST") ->
 
 # What a local model costs the computer, for the chart on Settings → AI → Ollama: the
 # GPU's use and memory (NVIDIA through nvidia-smi, AMD through Linux's sysfs), or the CPU
-# and memory when there's no GPU DevDash can read; and how much of each loaded model sits
+# and memory when there's no GPU Looma can read; and how much of each loaded model sits
 # on the GPU, as `ollama ps` shows it.
 
 _cpu_last: dict = {"busy": None, "total": None}
@@ -685,7 +685,7 @@ def ollama_usage() -> dict:
     if not gpus and platform.system() == "Darwin":
         note = "macOS shares GPU use only with an administrator, so this shows the CPU."
     elif not gpus:
-        note = "No GPU DevDash can read (NVIDIA or AMD), so this shows the CPU."
+        note = "No GPU Looma can read (NVIDIA or AMD), so this shows the CPU."
     return {"gpus": gpus, "cpu": _cpu_percent(), "cores": os.cpu_count() or 1, "memory": _memory(),
             "models": models, "note": note}
 
@@ -843,8 +843,8 @@ def _agy_ask(model: str | None, system: str, prompt: str) -> str:
 #
 # Connected by pasting the curl command that reaches it (from Ollama's, vLLM's, llama.cpp's
 # or LM Studio's docs, or the person's own notes). The command is only read, never run:
-# DevDash keeps its address, its headers (the API key) and the model it names, and talks to
-# the server itself. The key stays in DevDash's database and never goes back to the page.
+# Looma keeps its address, its headers (the API key) and the model it names, and talks to
+# the server itself. The key stays in Looma's database and never goes back to the page.
 
 HOSTED_SETTING = "hosted_model"
 # What a pasted curl may carry besides its address and data; anything else is ignored.
@@ -853,7 +853,7 @@ CURL_VALUE_FLAGS = {"-H", "--header", "-u", "--user", "-d", "--data", "--data-ra
                     "--connect-timeout", "-A", "--user-agent", "-e", "--referer", "-x", "--proxy", "-w",
                     "--write-out", "--retry", "-b", "--cookie", "-c", "--cookie-jar", "--cacert", "--cert", "--key",
                     "--oauth2-bearer", "-F", "--form"}
-# Headers that describe the request itself; DevDash sets its own.
+# Headers that describe the request itself; Looma sets its own.
 SKIPPED_HEADERS = {"content-type", "content-length", "accept", "host", "connection", "user-agent", "accept-encoding"}
 MAX_CURL = 20_000
 MAX_HEADERS = 10
@@ -921,7 +921,7 @@ def parse_curl(text: str) -> dict:
             headers["Authorization"] = f"Bearer {value}"
         elif flag in ("-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--json"):
             data = value
-    # A value of a flag DevDash doesn't know looks like an address too; an http(s) one wins.
+    # A value of a flag Looma doesn't know looks like an address too; an http(s) one wins.
     urls = [url for url in urls if re.match(r"https?://", url, re.I)] or urls
     if len(urls) != 1:
         raise ProviderError("The curl command should have one address, like http://your-server:11434/api/chat."
@@ -972,7 +972,7 @@ def _hosted_endpoint(path: str, port: int | None) -> tuple[str, str]:
         return "openai", path
     if path in ("", "/api"):
         return ("ollama", "") if port == 11434 else ("openai", "/v1")
-    raise ProviderError(f"DevDash can't write explanations through {path}: it needs a chat address, like "
+    raise ProviderError(f"Looma can't write explanations through {path}: it needs a chat address, like "
                         "/v1/chat/completions or Ollama's /api/chat.")
 
 

@@ -467,18 +467,18 @@ def test_health_names_hooks_that_cannot_record_and_repair_fixes_them(repo):
 
     connect_claude(repo)
     assert record.health()["problems"] == []
-    # A reinstall moved Python: the hooks still name the old one, which fails before DevDash runs.
+    # A reinstall moved Python: the hooks still name the old one, which fails before Looma runs.
     settings = user_settings()
     settings["hooks"]["Stop"][0]["hooks"][0]["command"] = "/gone/python -I -m devdash record stop"
     del settings["hooks"]["SessionEnd"]
     claude_settings_path().write_text(json.dumps(settings))
     [problem] = record.health()["problems"]
-    assert "missing DevDash's SessionEnd hook" in problem
+    assert "missing Looma's SessionEnd hook" in problem
 
     settings["hooks"]["SessionEnd"] = [{"hooks": [{"type": "command", "command": record_command("session-end")}]}]
     claude_settings_path().write_text(json.dumps(settings))
     [problem] = record.health()["problems"]
-    assert "older DevDash" in problem and "Stop" in problem
+    assert "older Looma" in problem and "Stop" in problem
 
     api = TestClient(create_app(), base_url="http://127.0.0.1")
     repaired = api.post("/api/recording/repair", json={})

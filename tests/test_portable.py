@@ -1,4 +1,4 @@
-"""DevDash works wherever a project is and on any system: moved or re-cloned projects keep
+"""Looma works wherever a project is and on any system: moved or re-cloned projects keep
 their history, pasted paths are understood, and the page comes with `devdash serve`."""
 
 import shutil
@@ -115,14 +115,14 @@ def test_serving_refreshes_hooks_that_name_an_old_python(repo):
 def test_the_page_comes_with_the_api_and_signing_in_still_guards_the_data(tmp_path, monkeypatch):
     web = tmp_path / "web"
     (web / "assets").mkdir(parents=True)
-    (web / "index.html").write_text("<!doctype html><title>DevDash</title>")
+    (web / "index.html").write_text("<!doctype html><title>Looma</title>")
     (web / "assets" / "app.js").write_text("console.log(1)")
     monkeypatch.setattr(app_module, "WEB", web)
 
     me = client()
     assert me.put("/api/auth/password", json={"username": "me", "password": "correct horse"}).status_code == 200
     stranger = client()
-    assert "DevDash" in stranger.get("/").text
+    assert "Looma" in stranger.get("/").text
     assert stranger.get("/assets/app.js").status_code == 200
     assert stranger.get("/api/repos").status_code == 401
     assert stranger.get("/docs").status_code == 401

@@ -38,10 +38,10 @@ CODEX_EVENTS = {
 }
 # Antigravity has no hook that carries the prompt: the first model call of a request starts
 # it (the prompt comes from its transcript) and Stop ends it. Its PreToolUse hooks must say
-# whether a tool may run, so DevDash stays out of them; the files a request changed are
+# whether a tool may run, so Looma stays out of them; the files a request changed are
 # found by comparing the project at its start and end, as for edits Claude makes by shell.
 ANTIGRAVITY_EVENTS = {"PreInvocation": "user-prompt-submit", "Stop": "stop"}
-ANTIGRAVITY_HOOK = "devdash"  # the name of DevDash's entry in Antigravity's hooks.json
+ANTIGRAVITY_HOOK = "devdash"  # the name of Looma's entry in Antigravity's hooks.json
 
 
 class InitError(RuntimeError):
@@ -49,7 +49,7 @@ class InitError(RuntimeError):
 
 
 def init(path: Path) -> Path:
-    """Tracks the repo at path. A project DevDash already knows from another folder (it was
+    """Tracks the repo at path. A project Looma already knows from another folder (it was
     moved, renamed or cloned again, and the old folder is gone) keeps its history and its
     Claude setting instead of starting over."""
     root = _root(path)
@@ -75,7 +75,7 @@ def init(path: Path) -> Path:
 
 def find_moved(conn, root: Path):
     """The tracked repo that now lives at root, if it was moved there; its path is updated.
-    For hooks firing in a folder DevDash doesn't know yet."""
+    For hooks firing in a folder Looma doesn't know yet."""
     with conn:
         return _moved(conn, root, git.root_commit(root))
 
@@ -108,7 +108,7 @@ def _still_there(path: Path) -> bool:
 
 def refresh() -> list[str]:
     """Brings every tracked repo's setup up to date with this install: hooks name the
-    Python that runs DevDash, which changes when it's reinstalled or moved. Returns
+    Python that runs Looma, which changes when it's reinstalled or moved. Returns
     what couldn't be fixed, one line each."""
     conn = connect()
     rows = conn.execute("SELECT path, claude FROM repos").fetchall()
@@ -143,7 +143,7 @@ def tools_in_use() -> list[str]:
 def connect_tool(path: Path, tool: str) -> Path:
     """Records the AI tool's requests in the repo at path, in place of any other tool."""
     if tool not in TOOLS:
-        raise InitError(f"DevDash can't record {tool}; it can record {', '.join(TOOLS)}")
+        raise InitError(f"Looma can't record {tool}; it can record {', '.join(TOOLS)}")
     if git.toplevel(path) is None:
         raise InitError(f"Recording {TOOL_NAMES[tool]} needs git, and {path} isn't a git repository. "
                         "Run git init in it first.")
@@ -190,8 +190,8 @@ def _remove_unused_hooks() -> None:
 
 
 def remove_all_hooks() -> list[Path]:
-    """Takes DevDash out of every project and AI tool, before DevDash itself is uninstalled:
-    each project's git hook and each AI tool's hooks, which would otherwise call a DevDash
+    """Takes Looma out of every project and AI tool, before Looma itself is uninstalled:
+    each project's git hook and each AI tool's hooks, which would otherwise call a Looma
     that's gone. Returns the projects it took the git hook out of."""
     conn = connect()
     rows = conn.execute("SELECT path FROM repos WHERE claude = 1").fetchall()
@@ -210,8 +210,8 @@ def remove_all_hooks() -> list[Path]:
 
 
 def remove(repo_id: int) -> bool:
-    """Stops tracking a repo and forgets what DevDash recorded about it. The repo's own
-    files and git history are untouched; DevDash's git hook comes out if an AI tool was
+    """Stops tracking a repo and forgets what Looma recorded about it. The repo's own
+    files and git history are untouched; Looma's git hook comes out if an AI tool was
     connected. Works even when the folder has moved or been deleted."""
     conn = connect()
     row = conn.execute("SELECT path, claude FROM repos WHERE id = ?", (repo_id,)).fetchone()
@@ -265,7 +265,7 @@ def _root(path: Path) -> Path:
             raise InitError(f"{path} isn't a git project itself, but these inside it are: {names}. Add one of them.")
         if not path.is_dir():
             raise InitError(f"No folder at {path}")
-        # Not a git project: DevDash reads its files; branches, commits and AI recording stay off.
+        # Not a git project: Looma reads its files; branches, commits and AI recording stay off.
         return path.resolve()
     return root
 
@@ -392,9 +392,9 @@ def _load(path: Path) -> tuple[str, dict]:
     try:
         data = json.loads(text) if text.strip() else {}
     except json.JSONDecodeError:
-        raise InitError(f"{path} isn't valid JSON, so DevDash can't add its hooks")
+        raise InitError(f"{path} isn't valid JSON, so Looma can't add its hooks")
     if not isinstance(data, dict):
-        raise InitError(f"{path} isn't a JSON object, so DevDash can't add its hooks")
+        raise InitError(f"{path} isn't a JSON object, so Looma can't add its hooks")
     return text, data
 
 
@@ -471,10 +471,10 @@ def remove_codex_hooks() -> None:
 
 
 def install_antigravity_hooks() -> Path:
-    # Antigravity's hooks.json maps a name to its events; DevDash's entry is its own name.
+    # Antigravity's hooks.json maps a name to its events; Looma's entry is its own name.
     path = antigravity_hooks_path()
     text, config = _load(path)
-    # Antigravity wants JSON back from every hook, so `echo {}` answers for DevDash when it
+    # Antigravity wants JSON back from every hook, so `echo {}` answers for Looma when it
     # can't be reached (its container stopped, say); it reads the same in sh and cmd.
     config[ANTIGRAVITY_HOOK] = {
         event: [{"type": "command", "command": f"{record_command(ours, 'antigravity')} || echo {{}}", "timeout": 30}]
@@ -596,16 +596,16 @@ def antigravity_hooks_installed() -> bool:
 
 
 def setup_steps(root: Path, ai: str | None) -> list[dict]:
-    """What it takes to use DevDash in a repo that records `ai` (None: no AI tool), each
-    step with whether it is done. `done` is None where DevDash can't check (something
+    """What it takes to use Looma in a repo that records `ai` (None: no AI tool), each
+    step with whether it is done. `done` is None where Looma can't check (something
     the user does elsewhere)."""
     if git.toplevel(root) is None:
         return [
             {"id": "track", "title": "Track the project",
-             "detail": "DevDash reads the files in this folder. It isn't a git repository, so branches, "
+             "detail": "Looma reads the files in this folder. It isn't a git repository, so branches, "
                        "changes, pull requests and AI recording are off.",
              "command": f"devdash init {shlex.quote(str(root))}", "done": True},
-            {"id": "serve", "title": "Start DevDash",
+            {"id": "serve", "title": "Start Looma",
              "detail": "Run this in a terminal and leave it running, then open http://127.0.0.1:8765.",
              "command": "devdash serve", "done": None},
             {"id": "git", "title": "Optional: turn on git",
@@ -614,9 +614,9 @@ def setup_steps(root: Path, ai: str | None) -> list[dict]:
         ]
     steps = [
         {"id": "track", "title": "Track the project",
-         "detail": "DevDash reads your branches and commits straight from git. Nothing is added to the project.",
+         "detail": "Looma reads your branches and commits straight from git. Nothing is added to the project.",
          "command": f"devdash init {shlex.quote(str(root))}", "done": True},
-        {"id": "serve", "title": "Start DevDash",
+        {"id": "serve", "title": "Start Looma",
          "detail": "Run this in a terminal and leave it running, then open http://127.0.0.1:8765.",
          "command": "devdash serve", "done": None},
     ]
@@ -633,9 +633,9 @@ def setup_steps(root: Path, ai: str | None) -> list[dict]:
             {"id": "codex-hooks", "title": "Codex hooks installed",
              "detail": f"Records each request to Codex and the files it changed. Lives in {codex_hooks_path()}.",
              "command": None, "done": codex_hooks_installed()},
-            {"id": "codex-review", "title": "Trust DevDash's hooks in Codex",
+            {"id": "codex-review", "title": "Trust Looma's hooks in Codex",
              "detail": "Codex runs a new hook only after you review it: open Codex, type /hooks and trust "
-                       "DevDash's three hooks. Restart Codex sessions that were already open.",
+                       "Looma's three hooks. Restart Codex sessions that were already open.",
              "command": "/hooks", "done": None},
         ]
     if ai == "antigravity":
@@ -676,7 +676,7 @@ AI_TOOLS = [
 
 
 INSTRUCTIONS = """\
-This repo is tracked by DevDash, which records what AI changes and why.
+This repo is tracked by Looma, which records what AI changes and why.
 When you change files here:
 1. Before each commit, append the user's request that led to the change to
    .devdash/prompt.md at the repo root, word for word. Create the file if needed.
@@ -690,14 +690,14 @@ When you change files here:
     "at": "<UTC time the request was made>",
     "files": [{"path": "<path from the repo root>",
                "before": "<the whole file before your first edit, or null if you created it>"}]}
-   DevDash records it as the request's change, then removes the file.
+   Looma records it as the request's change, then removes the file.
 """
 
 
 def hooks_problem(tool: str) -> str | None:
     """What's wrong with the AI tool's hooks, in a sentence, or None when each one is there
-    and calls this install of DevDash. A hook naming a Python that was since removed fails
-    before DevDash runs, so nothing would be logged: this is the only way to see it."""
+    and calls this install of Looma. A hook naming a Python that was since removed fails
+    before Looma runs, so nothing would be logged: this is the only way to see it."""
     path = tool_hooks_path(tool)
     name = TOOL_NAMES[tool]
     if not path.exists():
@@ -719,10 +719,10 @@ def hooks_problem(tool: str) -> str | None:
         wanted = {event: record_command(ours, tool) for event, (ours, _) in events.items()}
     missing = [event for event, commands in found.items() if not commands]
     if missing:
-        return f"{name} is missing DevDash's {', '.join(missing)} hook{'s' if len(missing) > 1 else ''}."
+        return f"{name} is missing Looma's {', '.join(missing)} hook{'s' if len(missing) > 1 else ''}."
     stale = [event for event, commands in found.items() if wanted[event] not in commands]
     if stale:
-        return (f"{name}'s hooks call an older DevDash, so {', '.join(stale)} may not be recorded. "
+        return (f"{name}'s hooks call an older Looma, so {', '.join(stale)} may not be recorded. "
                 "Repair them, or restart `devdash serve`.")
     return None
 

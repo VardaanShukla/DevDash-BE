@@ -60,7 +60,7 @@ def test_home_widgets_can_be_placed_sized_styled_and_reset():
     api = client()
     home = api.get("/api/preferences").json()["home"]
     kinds = [widget["type"] for widget in home["widgets"]]
-    assert kinds == ["greeting", "project", "ai-today", "total-changes", "ai-prompts", "changed-files", "latest-commit"]
+    assert kinds == ["greeting", "project", "ai-today", "total-changes", "latest-commit", "ai-prompts", "changed-files", "branches", "activity"]
     dial = {"id": "dial", "type": "total-changes", "x": 6, "y": 0, "w": 6, "h": 4, "style": "outline",
             "accent": "teal", "title": "Size of this branch", "options": {"view": "number"}}
     note = {"id": "n1", "type": "commits", "x": 0, "y": 0, "w": 3, "h": 2, "options": {"text": "Ship Friday"}}

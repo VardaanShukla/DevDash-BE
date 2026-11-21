@@ -201,7 +201,7 @@ def test_merged_branch_is_marked_then_dropped_after_15_minutes(repo):
     listed = api.get(f"/api/repos/{repo_id}/branches").json()
     assert sorted(listed["branches"]) == ["main", "next"]
     assert "done" not in {b["name"] for b in listed["details"]}
-    assert "done" in git(repo, "branch", "--list", "done")  # still in git; only DevDash stops showing it
+    assert "done" in git(repo, "branch", "--list", "done")  # still in git; only Looma stops showing it
 
 
 def test_sync_reports_an_unreachable_remote(repo):

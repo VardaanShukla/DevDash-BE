@@ -1,4 +1,4 @@
-"""Where DevDash keeps its data. DEVDASH_HOME overrides the default ~/.devdash."""
+"""Where Looma keeps its data. DEVDASH_HOME overrides the default ~/.devdash."""
 
 import os
 from pathlib import Path
@@ -16,7 +16,7 @@ def home() -> Path:
 
 
 def _make_private(path: Path) -> None:
-    """Only you can read DevDash's data (prompts, diffs, explanations), not other accounts
+    """Only you can read Looma's data (prompts, diffs, explanations), not other accounts
     on this computer. Windows already keeps a user's profile folder to that user."""
     if os.name != "posix":
         return
