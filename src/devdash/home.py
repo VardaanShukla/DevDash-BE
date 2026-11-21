@@ -9,8 +9,9 @@ from devdash import compare, git
 
 def project(path: Path) -> dict:
     if not path.is_dir() or git.toplevel(path) is None:
-        return {"exists": False, "branch": None, "base": None, "ahead": None, "uncommitted": 0,
-                "last_commit": None, "commits_this_week": 0, "branches": 0}
+        # A folder without git is still a project; it just has no branches or commits.
+        return {"exists": path.is_dir(), "git": False, "branch": None, "base": None, "ahead": None,
+                "uncommitted": 0, "last_commit": None, "commits_this_week": 0, "branches": 0}
     branch = git.branch(path)
     base = compare.default_base(path)
     has_commits = bool(git.run(path, "rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)).strip())
@@ -30,6 +31,7 @@ def project(path: Path) -> dict:
     status = git.run(path, "status", "--porcelain", "--untracked-files=normal")
     return {
         "exists": True,
+        "git": True,
         "branch": branch,
         "base": base,
         "ahead": ahead,

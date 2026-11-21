@@ -48,11 +48,71 @@ def test_add_project_then_turn_claude_on_and_off(repo):
     assert not (repo / ".git" / "hooks" / "post-commit").exists()
 
 
-def test_adding_a_folder_that_is_not_a_project(tmp_path):
+def test_adding_a_folder_that_is_not_there(tmp_path):
     api = client()
     assert api.post("/api/repos", json={"path": str(tmp_path / "missing")}).status_code == 400
-    response = api.post("/api/repos", json={"path": str(tmp_path)})
-    assert response.status_code == 400 and "not inside a git repository" in response.json()["detail"]
+
+
+def test_a_folder_with_git_repos_inside_points_to_them(tmp_path, repo):
+    response = client().post("/api/repos", json={"path": str(tmp_path)})
+    assert response.status_code == 400 and "isn't a git project itself" in response.json()["detail"]
+
+
+def test_a_folder_without_git_is_added_with_git_features_off(tmp_path):
+    folder = tmp_path / "notes-app"
+    (folder / "src").mkdir(parents=True)
+    (folder / "README.md").write_text("# Notes app\n\nKeeps notes.\n")
+    (folder / "src" / "main.py").write_text("from src import util\n\ndef run():\n    return util.go()\n")
+    (folder / "src" / "util.py").write_text("def go():\n    return 1\n")
+    (folder / ".env").write_text("SECRET=1\n")
+    (folder / "node_modules").mkdir()
+    (folder / "node_modules" / "dep.js").write_text("x")
+    api = client()
+
+    # Asking to record an AI tool doesn't stop it being added; recording just stays off.
+    added = api.post("/api/repos", json={"path": str(folder), "ai": "claude"})
+    assert added.status_code == 201
+    project = added.json()
+    assert (project["exists"], project["git"], project["branch"], project["ai"]) == (True, False, None, None)
+    repo_id = project["id"]
+    assert api.get("/api/repos").json()[0]["git"] is False
+
+    [card] = api.get("/api/home").json()
+    assert (card["exists"], card["git"], card["last_commit"]) == (True, False, None)
+
+    # What reads files works.
+    project_map = api.get(f"/api/repos/{repo_id}/map").json()
+    listed = {f["path"] for area in project_map["areas"] for f in area["file_list"]}
+    assert listed == {"README.md", "src/main.py", "src/util.py"}  # no .env, no node_modules
+    summary = api.get(f"/api/repos/{repo_id}/summary")
+    assert summary.status_code == 200 and summary.json()["history"]["commits"] == 0
+    kt = api.get(f"/api/repos/{repo_id}/kt").json()
+    assert {f["path"] for f in kt["files"]} >= {"src/main.py", "src/util.py"}
+
+    # Polling for changes sees a saved file.
+    before = api.get(f"/api/repos/{repo_id}/state").json()["signature"]
+    (folder / "src" / "util.py").write_text("def go():\n    return 2  # changed\n")
+    assert api.get(f"/api/repos/{repo_id}/state").json()["signature"] != before
+
+    # What needs git says so instead of failing.
+    assert api.post(f"/api/repos/{repo_id}/sync", json={}).json() == {"synced_at": None, "error": None}
+    pulls = api.get(f"/api/repos/{repo_id}/pulls").json()
+    assert (pulls["host"], pulls["pulls"]) == (None, [])
+    for url in ("branches", "flow", "compare"):
+        response = api.get(f"/api/repos/{repo_id}/{url}")
+        assert response.status_code == 409 and "needs git" in response.json()["detail"], url
+    turned_on = api.put(f"/api/repos/{repo_id}/ai", json={"ai": "claude"})
+    assert turned_on.status_code == 409 and "needs git" in turned_on.json()["detail"]
+    steps = {step["id"]: step for step in api.get(f"/api/repos/{repo_id}/setup").json()["steps"]}
+    assert steps["git"]["done"] is False and "ai" not in steps
+
+    # Once it becomes a git repository, the same project gets its git features.
+    git(folder, "init", "-q", "-b", "main")
+    again = api.get("/api/repos").json()[0]
+    assert (again["id"], again["git"], again["branch"]) == (repo_id, True, "main")
+
+    assert api.request("DELETE", f"/api/repos/{repo_id}", json={}).status_code == 204
+    assert folder.is_dir() and api.get("/api/repos").json() == []
 
 
 def test_changes_only_from_this_machine_and_the_ui(repo):

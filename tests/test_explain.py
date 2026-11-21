@@ -135,7 +135,7 @@ def fake_claude(tmp_path, monkeypatch, answer: dict, is_error=False, error=None)
     return calls
 
 
-def test_explaining_a_function_asks_claude_once(repo, tmp_path, monkeypatch):
+def test_explaining_a_function_asks_claude_and_a_review_once(repo, tmp_path, monkeypatch):
     repo_id = branch_with_changes(repo)
     calls = fake_claude(tmp_path, monkeypatch, {
         "summary": "Says hello.", "change": "Now uses the name.", "improves": ["Friendlier"],
@@ -152,9 +152,11 @@ def test_explaining_a_function_asks_claude_once(repo, tmp_path, monkeypatch):
     second = client().post(f"/api/repos/{repo_id}/explain/function", json=request)
     assert first.status_code == 200 and first.json() == second.json()
     assert first.json()["improves"] == ["Friendlier"] and "extra" not in first.json()
-    # Run once, with tools off and marked so DevDash doesn't record it.
-    [call] = calls.read_text().splitlines()
-    assert call.startswith("1 -p") and "--tools" in call and "--model haiku" in call
+    # Run once, then once more to review the answer, both with tools off and marked so
+    # DevDash doesn't record them; the second click is answered from the saved one.
+    asked = calls.read_text().splitlines()
+    assert len(asked) == 2
+    assert all(call.startswith("1 -p") and "--tools" in call and "--model haiku" in call for call in asked)
 
     result = client().get(f"/api/repos/{repo_id}/functions", params={"path": "app.py"}).json()
     hello = next(item for item in result["functions"] if item["name"] == "hello")
@@ -312,7 +314,8 @@ def test_claude_runs_with_no_tools_and_an_old_one_is_asked_to_update(repo, tmp_p
     calls = fake_claude(tmp_path, monkeypatch, {"summary": "Says hi.", "change": "x", "improves": [],
                                                 "tradeoffs": [], "check": None})
     assert client().post(f"/api/repos/{repo_id}/explain/function", json={"path": "app.py", "name": "hello"}).status_code == 200
-    [call] = calls.read_text().splitlines()
+    call = calls.read_text().splitlines()[0]
+    assert all("--tools  --strict-mcp-config" in c for c in calls.read_text().splitlines())
     assert "--tools  --strict-mcp-config" in call and "dangerously" not in call and "bypass" not in call.lower()
 
     old = tmp_path / "old"
@@ -574,3 +577,57 @@ def test_the_short_kt_is_one_request_from_the_readme_and_setup_files(repo, monke
     assert image.status_code == 200 and image.headers["content-type"] == "image/png"
     assert client().get(f"{url}/image", params={"path": "app.py"}).status_code == 404
     assert client().get(f"{url}/image", params={"path": ".env"}).status_code == 404
+
+
+def test_a_function_prompt_shows_the_changed_lines_and_what_it_calls():
+    subject = {"path": "app.py", "name": "save", "kind": "function", "change": "modified",
+               "before": "def save(p):\n    write(p)\n", "after": "def save(p):\n    check(p)\n    write(p)\n"}
+    helpers = [{"name": "check", "code": "def check(p):\n    if not p:\n        raise ValueError", "new_call": True}]
+    prompt = explain_module._function_prompt(subject, {"helpers": helpers, "commits": ["Big refactor"]})
+    # The exact lines, not two copies to compare, and the helper's code rather than its name.
+    assert "+    check(p)" in prompt and " def save(p):" in prompt
+    assert "check (newly called):" in prompt and "raise ValueError" in prompt
+    # Branch-wide commit titles are background, never proof.
+    assert "never as proof" in prompt
+
+
+def test_pros_and_cons_must_quote_the_code_and_not_guess():
+    prompt = "```\n+    check(p)\n     write(p)\n```"
+    items = [
+        {"point": "Empty input is now refused.", "evidence": "+    check(p)"},       # quoted: kept
+        {"point": "Saves are faster.", "evidence": "cache.get(p)"},              # not in the code: dropped
+        {"point": "It is unclear what check does.", "evidence": "check(p)"},     # a guess: dropped
+        {"point": "Empty input is now refused.", "evidence": "check(p)"},        # a repeat: dropped
+        "Writes still happen once.",                                             # a small model's plain string: kept
+        {"point": "No evidence given."},                                         # dropped
+    ]
+    assert explain_module._grounded(items, prompt) == ["Empty input is now refused.", "Writes still happen once."]
+    result = explain_module._clean("function", {"summary": "Saves.", "change": "x", "improves": items, "tradeoffs": [],
+                                         "check": None, "differences": ["a"]}, prompt)
+    assert result["improves"] == ["Empty input is now refused.", "Writes still happen once."]
+    assert "differences" not in result
+
+
+def test_a_failed_review_keeps_the_first_answer(monkeypatch):
+    replies = iter(['{"summary": "Saves.", "change": "x", "improves": [], "tradeoffs": [], "check": null}'])
+
+    def run(prompt):
+        try:
+            return next(replies)
+        except StopIteration:
+            raise explain_module.ExplainError("Claude took too long to answer. Try again.")
+
+    monkeypatch.setattr(explain_module, "_run", run)
+    subject = {"path": "a.py", "name": "f", "kind": "function", "change": "added", "after": "def f():\n    pass\n"}
+    assert explain_module.explain("function", subject)["summary"] == "Saves."
+
+
+def test_a_changed_function_brings_the_code_of_what_it_newly_calls():
+    from devdash import functions
+    old = "def check(p):\n    return p\n\ndef log(p):\n    print(p)\n\ndef save(p):\n    log(p)\n"
+    new = "def check(p):\n    return p\n\ndef log(p):\n    print(p)\n\ndef save(p):\n    log(p)\n    check(p)\n"
+    before = {u["name"]: u for u in units("a.py", old)}
+    after = {u["name"]: u for u in units("a.py", new)}
+    found = functions.helpers(after["save"], before["save"], after)
+    assert [(h["name"], h["new_call"]) for h in found] == [("check", True), ("log", False)]
+    assert "return p" in found[0]["code"]

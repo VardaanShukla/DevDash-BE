@@ -83,7 +83,7 @@ def find_moved(conn, root: Path):
 def _moved(conn, root: Path, first: str | None):
     # Only repos whose folder is gone, so two clones side by side stay two projects.
     gone = [row for row in conn.execute("SELECT id, path, name, claude, root_commit FROM repos")
-            if git.toplevel(Path(row["path"])) != Path(row["path"])]
+            if not _still_there(Path(row["path"]))]
     matches = [row for row in gone if first and row["root_commit"] == first]
     if not matches:
         # Tracked before first commits were stored: the same folder name will do.
@@ -95,6 +95,15 @@ def _moved(conn, root: Path, first: str | None):
     conn.execute("UPDATE repos SET path = ?, name = ?, root_commit = COALESCE(?, root_commit) WHERE id = ?",
                  (str(root), root.name, first, row["id"]))
     return row
+
+
+def _still_there(path: Path) -> bool:
+    """The tracked folder is where it was: a git project at its own top, or a folder
+    without git that still exists."""
+    if not path.is_dir():
+        return False
+    top = git.toplevel(path)
+    return top is None or top == path
 
 
 def refresh() -> list[str]:
@@ -135,6 +144,9 @@ def connect_tool(path: Path, tool: str) -> Path:
     """Records the AI tool's requests in the repo at path, in place of any other tool."""
     if tool not in TOOLS:
         raise InitError(f"DevDash can't record {tool}; it can record {', '.join(TOOLS)}")
+    if git.toplevel(path) is None:
+        raise InitError(f"Recording {TOOL_NAMES[tool]} needs git, and {path} isn't a git repository. "
+                        "Run git init in it first.")
     root = init(path)
     install_git_hook(root)
     install_tool_hooks(tool)
@@ -156,7 +168,8 @@ def connect_claude(path: Path) -> Path:
 def disconnect(path: Path) -> Path:
     """Stops recording AI changes in a repo. Recorded history is kept."""
     root = _root(path)
-    remove_git_hook(root)
+    if git.toplevel(root) is not None:
+        remove_git_hook(root)
     conn = connect()
     with conn:
         conn.execute("UPDATE repos SET claude = 0, ai = NULL WHERE path = ?", (str(root),))
@@ -250,7 +263,10 @@ def _root(path: Path) -> Path:
         if found:
             names = ", ".join(str(p) for p in found[:6]) + (" …" if len(found) > 6 else "")
             raise InitError(f"{path} isn't a git project itself, but these inside it are: {names}. Add one of them.")
-        raise InitError(f"{path} is not inside a git repository")
+        if not path.is_dir():
+            raise InitError(f"No folder at {path}")
+        # Not a git project: DevDash reads its files; branches, commits and AI recording stay off.
+        return path.resolve()
     return root
 
 
@@ -369,11 +385,6 @@ def install_tool_hooks(tool: str) -> Path:
 
 def remove_tool_hooks(tool: str) -> None:
     {"claude": remove_claude_hooks, "codex": remove_codex_hooks, "antigravity": remove_antigravity_hooks}[tool]()
-
-
-def tool_hooks_installed(tool: str) -> bool:
-    return {"claude": claude_hooks_installed, "codex": codex_hooks_installed,
-            "antigravity": antigravity_hooks_installed}[tool]()
 
 
 def _load(path: Path) -> tuple[str, dict]:
@@ -588,6 +599,19 @@ def setup_steps(root: Path, ai: str | None) -> list[dict]:
     """What it takes to use DevDash in a repo that records `ai` (None: no AI tool), each
     step with whether it is done. `done` is None where DevDash can't check (something
     the user does elsewhere)."""
+    if git.toplevel(root) is None:
+        return [
+            {"id": "track", "title": "Track the project",
+             "detail": "DevDash reads the files in this folder. It isn't a git repository, so branches, "
+                       "changes, pull requests and AI recording are off.",
+             "command": f"devdash init {shlex.quote(str(root))}", "done": True},
+            {"id": "serve", "title": "Start DevDash",
+             "detail": "Run this in a terminal and leave it running, then open http://127.0.0.1:8765.",
+             "command": "devdash serve", "done": None},
+            {"id": "git", "title": "Optional: turn on git",
+             "detail": "Make the folder a git repository to see branches and changes, and to record your AI tool.",
+             "command": f"git -C {shlex.quote(str(root))} init", "done": False},
+        ]
     steps = [
         {"id": "track", "title": "Track the project",
          "detail": "DevDash reads your branches and commits straight from git. Nothing is added to the project.",

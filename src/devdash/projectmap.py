@@ -2,6 +2,8 @@
 each part is for, which languages it uses, and which parts use code from which. Read
 from a branch's committed files, so it works for any branch, checked out or not."""
 
+import hashlib
+import os
 import posixpath
 import re
 import subprocess
@@ -58,20 +60,59 @@ NOT_CODE = {"Docs", "Config", "Images", "CSS", "HTML"}
 JS_IMPORT = re.compile(
     r"""(?:import|export)\s[^'";]*?from\s*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]|import\s+['"]([^'"]+)['"]"""
 )
-PY_IMPORT = re.compile(r"^\s*(?:from\s+(\.*[\w.]*)\s+import\s+([\w*,\s()]+)|import\s+([\w.]+))", re.MULTILINE)
+# A name list stays on its line unless it is in brackets, so one import never takes in the next.
+PY_IMPORT = re.compile(r"^[ \t]*(?:from[ \t]+(\.*[\w.]*)[ \t]+import[ \t]+(\([^)]*\)|[\w*, \t]+)"
+                       r"|import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*))", re.MULTILINE)
 JS_EXTENSIONS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".css", ".scss",
                  "/index.ts", "/index.tsx", "/index.js", "/index.jsx"]
 
 
-# A project with no commit yet is read from its folder: the files git would add.
+# A project with no commit yet, or a folder that isn't a git repository at all, is read
+# from its folder: the files git would add, or every file in it.
 WORKTREE = "(not committed yet)"
+# A folder without git has no .gitignore to go by: hidden files (.env and the like, which
+# often hold keys) are left out, and a huge folder is read only this far.
+MAX_FOLDER_FILES = 20_000
 
 
 def readable(repo: Path, revision: str) -> str:
-    """The revision to read: as asked, or the working tree while HEAD has no commit yet."""
+    """The revision to read: as asked, or the working tree while HEAD has no commit yet or
+    the folder isn't a git repository."""
+    if git.toplevel(repo) is None:
+        return WORKTREE
     if revision == "HEAD" and not git.run(repo, "rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)).strip():
         return WORKTREE
     return revision
+
+
+def folder_files(repo: Path) -> list[str]:
+    """Every file in a folder that isn't a git repository, as paths relative to it, skipping
+    hidden files and folders, dependencies and build output. Sorted; at most MAX_FOLDER_FILES."""
+    found: list[str] = []
+    for current, dirs, names in os.walk(repo, onerror=lambda _: None):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS
+                         and not d.endswith(".egg-info"))
+        relative = Path(current).relative_to(repo).as_posix()
+        for name in sorted(names):
+            if name.startswith(".") or os.path.islink(os.path.join(current, name)):
+                continue
+            found.append(name if relative == "." else f"{relative}/{name}")
+            if len(found) >= MAX_FOLDER_FILES:
+                return sorted(found)
+    return sorted(found)
+
+
+def folder_state(repo: Path) -> str:
+    """A short fingerprint of a folder without git: each file's name, size and modification
+    time, so the page reloads when a file is added, removed or saved."""
+    digest = hashlib.sha1()
+    for path in folder_files(repo):
+        try:
+            stat = (repo / path).stat()
+        except OSError:
+            continue
+        digest.update(f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8", "replace"))
+    return digest.hexdigest()[:16]
 
 
 def project_map(repo: Path, revision: str) -> dict:
@@ -223,9 +264,13 @@ def _imports(repo: Path, files: list[tuple[str, str, int]]) -> tuple[list[tuple[
 
 
 def _worktree_files(repo: Path) -> list[tuple[str, str, int]]:
-    out = git.run(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if git.toplevel(repo) is None:
+        paths = folder_files(repo)
+    else:
+        out = git.run(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        paths = sorted(set(out.split("\x00")))
     result = []
-    for path in sorted(set(out.split("\x00"))):
+    for path in paths:
         folders = path.split("/")[:-1]
         file = repo / path
         if not path or SKIP_DIRS.intersection(folders) or any(f.endswith(".egg-info") for f in folders) \
@@ -279,32 +324,38 @@ def _python_roots(known: set[str]) -> list[str]:
 def _python_targets(path: str, text: str, known: set[str], roots: list[str]) -> list[str]:
     package = posixpath.dirname(path)
     targets = []
+
+    def find(relative: str, bases: list[str]) -> str | None:
+        for base in bases:
+            for option in (f"{base}{relative}.py", f"{base}{relative}/__init__.py"):
+                if option in known:
+                    return option
+        return None
+
     for match in PY_IMPORT.finditer(text):
         source, names, plain = match.groups()
-        modules = []
         if plain:
-            modules = [plain]
-        elif source is not None:
-            dots = len(source) - len(source.lstrip("."))
-            rest = source.lstrip(".")
-            if dots:
-                base = package
-                for _ in range(dots - 1):
-                    base = posixpath.dirname(base)
-                prefix = "/".join(filter(None, [base, rest.replace(".", "/")]))
-                candidates = [prefix] + [f"{prefix}/{name.strip()}" for name in re.split(r"[,\s()]+", names) if name.strip()]
-                for candidate in candidates:
-                    for option in (candidate + ".py", candidate + "/__init__.py"):
-                        if option in known:
-                            targets.append(option)
-                            break
-                continue
-            modules = [rest] + [f"{rest}.{name.strip()}" for name in re.split(r"[,\s()]+", names) if name.strip()]
-        for module in modules:
-            relative = module.replace(".", "/")
-            for root in roots:
-                for option in (f"{root}{relative}.py", f"{root}{relative}/__init__.py"):
-                    if option in known:
-                        targets.append(option)
-                        break
+            for module in re.split(r"[ \t]*,[ \t]*", plain):
+                found = find(module.replace(".", "/"), roots)
+                if found:
+                    targets.append(found)
+            continue
+        dots = len(source) - len(source.lstrip("."))
+        rest = source.lstrip(".").replace(".", "/")
+        if dots:
+            base = package
+            for _ in range(dots - 1):
+                base = posixpath.dirname(base)
+            prefix, bases = "/".join(filter(None, [base, rest])), [""]
+        else:
+            prefix, bases = rest, roots
+        # "from pkg import a as b": the names are a, never b.
+        listed = [n for n in re.split(r"[,\s()]+", re.sub(r"\s+as\s+\w+", "", names)) if n and n != "*"]
+        modules = [found for name in listed if (found := find(f"{prefix}/{name}" if prefix else name, bases))]
+        targets.extend(modules)
+        # The package itself counts when something is taken from it, not only its modules.
+        if len(modules) < len(listed) or not listed:
+            found = find(prefix, bases) if prefix else None
+            if found:
+                targets.append(found)
     return targets

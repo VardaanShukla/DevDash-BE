@@ -50,8 +50,8 @@ def test_number_keys_follow_the_menu_and_old_saved_defaults_move_with_them():
     prefs = client().get("/api/preferences").json()
     keys = prefs["shortcuts"]
     assert prefs["theme"] == "light" and prefs["uncommitted"] is True
-    assert keys["view:ask"] == "4"
-    assert keys["view:changes"] == "5" and keys["view:commits"] == "6" and keys["view:project"] == "7"
+    assert keys["view:kt"] == "4" and keys["view:ask"] == "5"
+    assert keys["view:changes"] == "6" and keys["view:commits"] == "7" and keys["view:project"] == "8"
     assert keys["view:overview"] == "" and keys["view:map"] == ""  # sections of Home now
     assert "view:constellation" not in keys and "view:planner" not in keys  # screens since removed
 
@@ -60,10 +60,10 @@ def test_home_widgets_can_be_placed_sized_styled_and_reset():
     api = client()
     home = api.get("/api/preferences").json()["home"]
     kinds = [widget["type"] for widget in home["widgets"]]
-    assert kinds == ["greeting", "project", "ai-today", "total-changes", "activity", "latest-commit", "branches"]
+    assert kinds == ["greeting", "project", "ai-today", "total-changes", "ai-prompts", "changed-files", "latest-commit"]
     dial = {"id": "dial", "type": "total-changes", "x": 6, "y": 0, "w": 6, "h": 4, "style": "outline",
             "accent": "teal", "title": "Size of this branch", "options": {"view": "number"}}
-    note = {"id": "n1", "type": "note", "x": 0, "y": 0, "w": 3, "h": 2, "options": {"text": "Ship Friday"}}
+    note = {"id": "n1", "type": "commits", "x": 0, "y": 0, "w": 3, "h": 2, "options": {"text": "Ship Friday"}}
     changed = api.put("/api/preferences", json={"home": {"widgets": [dial, note]}}).json()
     assert changed["home"]["widgets"][0] == dial
     # Left out: the usual style, no accent, the widget's own title.
@@ -74,7 +74,7 @@ def test_home_widgets_can_be_placed_sized_styled_and_reset():
 
 def test_home_widgets_that_dont_fit_are_refused():
     api = client()
-    good = {"id": "a", "type": "clock", "x": 0, "y": 0, "w": 2, "h": 2}
+    good = {"id": "a", "type": "branches", "x": 0, "y": 0, "w": 2, "h": 2}
     for bad in ({**good, "type": "sky"}, {**good, "x": 11, "w": 2}, {**good, "h": 0}, {**good, "style": "neon"},
                 {**good, "accent": "gold"}, {**good, "title": "x" * 61}, {**good, "options": {"text": "x" * 2001}}):
         assert api.put("/api/preferences", json={"home": {"widgets": [bad]}}).status_code == 400, bad
@@ -93,9 +93,11 @@ def test_a_home_layout_from_before_widgets_could_be_placed_goes_back_to_the_defa
 
     old = {"order": ["pulse", "ai", "branch", "flow"], "hidden": ["calendar"]}
     assert preferences._layout(old) == preferences._default_layout()
-    # A widget of a kind this version doesn't have is dropped; the rest stay where they were.
+    # A widget of a kind this version doesn't have (or no longer has, like the calendar) is
+    # dropped; the rest stay where they were.
     saved = {"widgets": [{"id": "x", "type": "gone", "x": 0, "y": 0, "w": 1, "h": 1},
-                         {"id": "c", "type": "clock", "x": 0, "y": 0, "w": 2, "h": 2}]}
+                         {"id": "cal", "type": "calendar", "x": 0, "y": 0, "w": 2, "h": 2},
+                         {"id": "c", "type": "branches", "x": 0, "y": 0, "w": 2, "h": 2}]}
     assert [widget["id"] for widget in preferences._layout(saved)["widgets"]] == ["c"]
 
 
@@ -111,8 +113,27 @@ def test_keys_saved_before_ask_joined_the_menu_move_down_one():
                      (json.dumps({"shortcuts": saved, "shortcuts_version": 3}),))
     conn.close()
     keys = client().get("/api/preferences").json()["shortcuts"]
-    assert (keys["view:ask"], keys["view:changes"], keys["view:project"]) == ("4", "5", "7")
+    assert (keys["view:ask"], keys["view:changes"], keys["view:project"]) == ("5", "6", "8")
     assert keys["sync"] == "r"  # picked by the person: kept
+
+
+def test_kt_has_a_key_and_keys_saved_before_it_move_down_one():
+    import json
+
+    from devdash.store import connect
+
+    saved = {"view:ask": "4", "view:changes": "5", "view:project": "7", "theme": "x"}
+    conn = connect()
+    with conn:
+        conn.execute("INSERT INTO settings (name, value) VALUES ('preferences', ?)",
+                     (json.dumps({"shortcuts": saved, "shortcuts_version": 4}),))
+    conn.close()
+    keys = client().get("/api/preferences").json()["shortcuts"]
+    assert (keys["view:kt"], keys["view:ask"], keys["view:changes"], keys["view:project"]) == ("4", "5", "6", "8")
+    assert keys["theme"] == "x"
+    # The Settings screen offers "Go to KT", so its key can be changed.
+    changed = client().put("/api/preferences", json={"shortcuts": {**keys, "view:kt": "q"}})
+    assert changed.status_code == 200 and changed.json()["shortcuts"]["view:kt"] == "q"
 
 
 def test_keep_diffs_days_defaults_to_ten_and_checks_its_value():

@@ -12,7 +12,7 @@ THEMES = ("dark", "light")
 # What a shortcut can do. Going to a screen is "view:<screen>".
 # The side menu's screens in order, numbered 1, 2, … by default; then the screens that are
 # sections of Home (This branch, Branch flow, Project map), which have no key unless set.
-MENU = ("home", "digest", "summary", "ask", "changes", "commits", "project")
+MENU = ("home", "digest", "summary", "kt", "ask", "changes", "commits", "project")
 VIEWS = (*MENU, "overview", "flow", "map", "help", "settings")
 ACTIONS = (*(f"view:{view}" for view in VIEWS), "theme", "uncommitted", "sync", "next-file", "previous-file")
 DEFAULT_SHORTCUTS = {
@@ -38,15 +38,19 @@ OLD_DEFAULTS = {
     3: {**{f"view:{view}": str(n) for n, view in enumerate(
         ("home", "digest", "summary", "changes", "commits", "project"), start=1)},
         "view:settings": ",", "theme": "t", "uncommitted": "u", "sync": "s", "next-file": "j", "previous-file": "k"},
+    # Before KT joined the menu, under Summary.
+    4: {**{f"view:{view}": str(n) for n, view in enumerate(
+        ("home", "digest", "summary", "ask", "changes", "commits", "project"), start=1)},
+        "view:settings": ",", "theme": "t", "uncommitted": "u", "sync": "s", "next-file": "j", "previous-file": "k"},
 }
-SHORTCUTS_VERSION = 4
+SHORTCUTS_VERSION = 5
 # The kinds of widget Home can show (each can be placed more than once), and how they're laid
 # out: on a grid COLUMNS wide, each at a column and row, so many columns wide and rows tall.
+# Only what tracks git and AI changes: branch flow, the project map, projects, recording and
+# pull requests have screens of their own, and saved widgets of other kinds are dropped.
 WIDGETS = (
     "greeting", "project", "ai-today", "total-changes", "activity", "latest-commit", "branches",
-    "changed-files", "commits", "branch-flow", "project-map", "languages", "ai-prompts", "needs-a-look",
-    "recording", "projects", "uncommitted", "commit-days", "jump-to", "calendar", "clock", "pull-requests",
-    "note", "number",
+    "changed-files", "commits", "ai-prompts",
 )
 COLUMNS = 12
 MAX_ROWS = 12  # the tallest a widget can be
@@ -60,14 +64,14 @@ MAX_ID = 40
 # Each widget's own options: a few short values, or a longer text (a note's).
 MAX_OPTIONS = 20
 MAX_OPTION = 2000
-# Home as it first opens: the greeting and the project on show, today's AI work, the branch's
-# size beside today's activity, then the latest commit beside the branches.
+# Home as it first opens: the greeting and the project on show, today's AI work, the
+# branch's size beside today's AI prompts, then the changed files beside the latest commit.
 # The greeting and the project's name sit on the page itself, with no panel.
 DEFAULT_WIDGETS = (
     ("greeting", 0, 0, 8, 2, "bare"), ("project", 8, 0, 4, 2, "bare"),
     ("ai-today", 0, 2, 12, 2, "glass"),
-    ("total-changes", 0, 4, 5, 8, "glass"), ("activity", 5, 4, 7, 8, "glass"),
-    ("latest-commit", 0, 12, 5, 6, "glass"), ("branches", 5, 12, 7, 6, "glass"),
+    ("total-changes", 0, 4, 5, 8, "glass"), ("ai-prompts", 5, 4, 7, 8, "glass"),
+    ("changed-files", 0, 12, 6, 6, "glass"), ("latest-commit", 6, 12, 6, 6, "glass"),
 )
 DEFAULTS = {
     "theme": "dark",
