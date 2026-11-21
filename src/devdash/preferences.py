@@ -64,14 +64,15 @@ MAX_ID = 40
 # Each widget's own options: a few short values, or a longer text (a note's).
 MAX_OPTIONS = 20
 MAX_OPTION = 2000
-# Home as it first opens: the greeting and the project on show, today's AI work, the
-# branch's size beside today's AI prompts, then the changed files beside the latest commit.
-# The greeting and the project's name sit on the page itself, with no panel.
+# Home as it first opens: the greeting and the project on show, today's AI work, then three
+# across: the branch's size, its latest commits and today's AI prompts; then the changed
+# files, the branches and who committed today. Each panel is a third or half of the width, so
+# none of them stands mostly empty. The greeting and the project's name sit on the page itself.
 DEFAULT_WIDGETS = (
     ("greeting", 0, 0, 8, 2, "bare"), ("project", 8, 0, 4, 2, "bare"),
     ("ai-today", 0, 2, 12, 2, "glass"),
-    ("total-changes", 0, 4, 5, 8, "glass"), ("ai-prompts", 5, 4, 7, 8, "glass"),
-    ("changed-files", 0, 12, 6, 6, "glass"), ("latest-commit", 6, 12, 6, 6, "glass"),
+    ("total-changes", 0, 4, 4, 7, "glass"), ("latest-commit", 4, 4, 4, 7, "glass"), ("ai-prompts", 8, 4, 4, 7, "glass"),
+    ("changed-files", 0, 11, 6, 6, "glass"), ("branches", 6, 11, 3, 6, "glass"), ("activity", 9, 11, 3, 6, "glass"),
 )
 DEFAULTS = {
     "theme": "dark",

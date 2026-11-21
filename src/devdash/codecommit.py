@@ -1,12 +1,12 @@
 """Your AWS CodeCommit repositories, read through the AWS CLI with one of your AWS profiles.
 
-DevDash keeps no AWS keys. It remembers only which profile and region you picked, and asks
+Looma keeps no AWS keys. It remembers only which profile and region you picked, and asks
 the `aws` tool to sign each request with that profile, the same way `aws codecommit ...`
 does in a terminal. So whatever the profile uses (access keys in ~/.aws/credentials, IAM
-Identity Center/SSO, a role to assume) works here too, and what DevDash can see is what
+Identity Center/SSO, a role to assume) works here too, and what Looma can see is what
 the profile's IAM permissions allow.
 
-With it DevDash lists the repositories in that region (to clone one as a project) and shows
+With it Looma lists the repositories in that region (to clone one as a project) and shows
 a project's open pull requests. A clone is set up to sign git with the same profile
 (`aws codecommit credential-helper`), so fetching it later works without a git password."""
 
@@ -115,7 +115,7 @@ def disconnect() -> dict:
 
 def repos(tracked: dict[str, str] | None = None) -> list[dict]:
     """Every repository in the connected region, newest change first. `tracked` maps a
-    repository's name to the folder of a DevDash project that is a clone of it."""
+    repository's name to the folder of a Looma project that is a clone of it."""
     saved = _need()
     tracked = {k.lower(): v for k, v in (tracked or {}).items()}
     names = [r["repositoryName"] for r in _aws("codecommit", "list-repositories", "--sort-by", "lastModifiedDate",

@@ -13,7 +13,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 "folder of projects to pick from when adding one")
     init_cmd.add_argument("path", nargs="?", default=".")
 
-    # The AI tools DevDash records (install.TOOLS), written out so `record` starts fast.
+    # The AI tools Looma records (install.TOOLS), written out so `record` starts fast.
     tools = ["claude", "codex", "antigravity"]
     for name, text in (("connect", "start recording an AI tool's changes in a repo"),
                        ("disconnect", "stop recording AI changes in a repo")):
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
 
     commands.add_parser("instructions", help="print the text to give Claude so app chats are recorded")
 
-    commands.add_parser("remove-hooks", help="take DevDash's hooks out of every project and AI tool (before uninstalling)")
+    commands.add_parser("remove-hooks", help="take Looma's hooks out of every project and AI tool (before uninstalling)")
 
     commands.add_parser("password", help="set the dashboard's username and password (also the way back in if it's forgotten)")
 
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Restart any open Claude Code session to pick up the hooks.")
                 print("For Claude app chats, add the text from `devdash instructions` to your project instructions.")
             elif args.tool == "codex":
-                print("Open Codex, type /hooks and trust DevDash's hooks; restart any Codex session already open.")
+                print("Open Codex, type /hooks and trust Looma's hooks; restart any Codex session already open.")
             else:
                 print("Restart agy or the Antigravity app if it's open, so it loads the hooks.")
         else:
@@ -101,8 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         from devdash.capture import install
 
         for root in install.remove_all_hooks():
-            print(f"Took DevDash's git hook out of {root}")
-        print("Took DevDash's hooks out of Claude Code, Codex and Antigravity.")
+            print(f"Took Looma's git hook out of {root}")
+        print("Took Looma's hooks out of Claude Code, Codex and Antigravity.")
         return 0
 
     if args.command == "serve":
@@ -117,14 +117,14 @@ def _serve(port: int) -> int:
     from devdash.api.app import WEB, create_app
     from devdash.capture import install
 
-    # Hooks name the Python that runs DevDash; this keeps them right after a reinstall.
+    # Hooks name the Python that runs Looma; this keeps them right after a reinstall.
     for problem in install.refresh():
         print(f"devdash: {problem}")
     # Loopback only: the API serves the contents of your repos.
     if (WEB / "index.html").is_file():
-        print(f"DevDash is running. Open http://127.0.0.1:{port} in your browser.")
+        print(f"Looma is running. Open http://127.0.0.1:{port} in your browser.")
     else:
-        print(f"DevDash API on http://127.0.0.1:{port} (docs at /docs). The page isn't built into "
+        print(f"Looma API on http://127.0.0.1:{port} (docs at /docs). The page isn't built into "
               "this copy: run scripts/build_ui.py, or the UI's dev server.")
     print("Leave this running; press Ctrl+C to stop.")
     uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="warning")
@@ -144,12 +144,12 @@ def _set_password() -> int:
 
     current = auth.username()
     name = input(f"Username{f' [{current}]' if current else ''}: ").strip() or current
-    password = getpass("New DevDash password: ")
+    password = getpass("New Looma password: ")
     if getpass("Type it again: ") != password:
         print("devdash: the two didn't match; nothing changed")
         return 1
     try:
-        # Whoever can run this can already read DevDash's files, so no current password.
+        # Whoever can run this can already read Looma's files, so no current password.
         auth.set_password(password, check_current=False, name=name)
     except auth.AuthError as error:
         print(f"devdash: {error}")

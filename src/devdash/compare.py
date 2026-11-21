@@ -13,7 +13,7 @@ from devdash.store import connect
 
 MAX_LINES_PER_FILE = 2000
 MAX_UNTRACKED = 200
-# How long a merged or deleted branch stays listed, marked as such, before DevDash drops it.
+# How long a merged or deleted branch stays listed, marked as such, before Looma drops it.
 RETIRE_AFTER = timedelta(minutes=15)
 
 # Git only knows where functions start for some languages. These attributes turn its
@@ -196,7 +196,7 @@ def branch_details(repo: Path, base: str | None) -> list[dict]:
 
 
 def retire(key: str, details: list[dict], current: str | None, now: datetime | None = None) -> list[dict]:
-    """Merged and deleted branches stay listed for RETIRE_AFTER from when DevDash first saw
+    """Merged and deleted branches stay listed for RETIRE_AFTER from when Looma first saw
     them so, each with the time it goes (`removes_at`); after that they are left out. The
     checked-out branch always stays. When each was first seen is kept in the database, so
     a restart doesn't start the clock again. `key` names the project."""

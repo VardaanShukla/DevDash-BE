@@ -153,7 +153,7 @@ def test_explaining_a_function_asks_claude_and_a_review_once(repo, tmp_path, mon
     assert first.status_code == 200 and first.json() == second.json()
     assert first.json()["improves"] == ["Friendlier"] and "extra" not in first.json()
     # Run once, then once more to review the answer, both with tools off and marked so
-    # DevDash doesn't record them; the second click is answered from the saved one.
+    # Looma doesn't record them; the second click is answered from the saved one.
     asked = calls.read_text().splitlines()
     assert len(asked) == 2
     assert all(call.startswith("1 -p") and "--tools" in call and "--model haiku" in call for call in asked)
@@ -217,7 +217,7 @@ def test_without_claude_the_status_gives_the_official_installers(tmp_path, monke
 
 
 def test_a_fresh_native_install_is_found_off_the_path_and_names_the_account(tmp_path, monkeypatch):
-    # The native installer puts claude in ~/.local/bin, which the PATH DevDash started with
+    # The native installer puts claude in ~/.local/bin, which the PATH Looma started with
     # may not have yet.
     native = tmp_path / "home" / ".local" / "bin"
     native.mkdir(parents=True)

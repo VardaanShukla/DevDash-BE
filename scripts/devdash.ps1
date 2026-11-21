@@ -1,8 +1,8 @@
-# Installs, repairs, uninstalls or starts DevDash on Windows, from this DevDash-BE clone (the
+# Installs, repairs, uninstalls or starts Looma on Windows, from this DevDash-BE clone (the
 # folder above scripts\) and a DevDash-FE clone next to it. Double-click devdash.bat to run it.
 # DEVDASH_FE set to a folder points it at a page clone somewhere else.
 #
-# Installing never touches your projects. Uninstalling deletes DevDash's data, after you
+# Installing never touches your projects. Uninstalling deletes Looma's data, after you
 # type DELETE to confirm. (ASCII only: Windows PowerShell 5 misreads other characters.)
 
 # Programs report failure by exit code, checked after each one that matters (Check); "Stop"
@@ -77,7 +77,7 @@ function Assert-Ready {
     }
     Pipx --version 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Say "Installing pipx, which installs DevDash in a place of its own..."
+        Say "Installing pipx, which installs Looma in a place of its own..."
         Py -m pip install --user pipx
         Check "Installing pipx"
         Pipx ensurepath | Out-Null
@@ -131,37 +131,37 @@ function Build-Page {
 function Stop-Running {
     $running = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*devdash*serve*" }
     if (-not $running) { return }
-    Write-Host "Stopping the DevDash that's running..."
+    Write-Host "Stopping the Looma that's running..."
     $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
 }
 
 function After-Install {
-    Say "DevDash is installed. Your data is in $Data."
+    Say "Looma is installed. Your data is in $Data."
     $default = Join-Path $HOME "Projects"
-    $folder = Read-Host "`nWhere are your projects? DevDash lists the git repos in that folder. [$default, or Enter to skip]"
+    $folder = Read-Host "`nWhere are your projects? Looma lists the git repos in that folder. [$default, or Enter to skip]"
     if (-not $folder -and (Test-Path $default)) { $folder = $default }
     if ($folder) {
         if (Test-Path $folder -PathType Container) { devdash init $folder }
         else { Write-Host "There's no folder $folder. Add projects later under Add project on the dashboard." }
     }
-    if (YesNo "`nStart DevDash now?" "y") { Start-DevDash }
+    if (YesNo "`nStart Looma now?" "y") { Start-DevDash }
 }
 
 function Install-DevDash {
-    if (Test-Installed) { Say "DevDash is already installed. Choose Repair to reinstall it."; return }
+    if (Test-Installed) { Say "Looma is already installed. Choose Repair to reinstall it."; return }
     Assert-Ready
     Assert-GitTools
     Build-Page
-    Say "Installing DevDash..."
+    Say "Installing Looma..."
     Clear-Build
     Pipx install $BE
-    Check "Installing DevDash"
+    Check "Installing Looma"
     Save-Stamp
     After-Install
 }
 
-# The newest change to the code DevDash is installed from: DevDash-BE's code (not its built
+# The newest change to the code Looma is installed from: DevDash-BE's code (not its built
 # page, which is made from DevDash-FE) and DevDash-FE's. Start reinstalls when it moves on.
 $Stamp = Join-Path $Data "installed-from"
 function Get-SourceStamp {
@@ -193,12 +193,12 @@ function Clear-Build {
 # Start runs the installed copy, so edits to the code show only after reinstalling it.
 function Update-IfChanged {
     if ((Test-Path $Stamp) -and ((Get-Content -LiteralPath $Stamp -Raw).Trim() -eq (Get-SourceStamp))) { return }
-    Say "DevDash's code changed since it was installed. Updating..."
+    Say "Looma's code changed since it was installed. Updating..."
     Build-Page
     Stop-Running
     Clear-Build
     Pipx install --force $BE
-    Check "Updating DevDash"
+    Check "Updating Looma"
     Save-Stamp
 }
 
@@ -207,21 +207,21 @@ function Repair-DevDash {
     Assert-Ready
     Assert-GitTools
     Build-Page
-    Say "Reinstalling DevDash..."
+    Say "Reinstalling Looma..."
     Stop-Running
     Clear-Build
     Pipx install --force $BE
-    Check "Reinstalling DevDash"
+    Check "Reinstalling Looma"
     Save-Stamp
     After-Install
 }
 
 function Uninstall-DevDash {
-    Say "Uninstall DevDash and delete its data?"
+    Say "Uninstall Looma and delete its data?"
     Write-Host "This deletes:"
     Write-Host "  - the devdash program"
-    Write-Host "  - everything in ${Data}: your DevDash account, the project list, recorded AI history and explanations"
-    Write-Host "  - DevDash's hooks in your projects and in Claude Code, Codex and Antigravity"
+    Write-Host "  - everything in ${Data}: your Looma account, the project list, recorded AI history and explanations"
+    Write-Host "  - Looma's hooks in your projects and in Claude Code, Codex and Antigravity"
     Write-Host "It doesn't touch your projects' files or git history, Ollama, or its models."
     $answer = Read-Host "`nType DELETE to continue, or press Enter to cancel"
     if ($answer -cne "DELETE") { Write-Host "Cancelled. Nothing was changed."; return }
@@ -231,38 +231,38 @@ function Uninstall-DevDash {
         devdash remove-hooks
         if ($LASTEXITCODE -ne 0) { Write-Host "Couldn't take every hook out; carrying on." }
     }
-    if (Test-Installed) { Pipx uninstall devdash; Check "Uninstalling DevDash" }
-    # Never anything but DevDash's own folder.
+    if (Test-Installed) { Pipx uninstall devdash; Check "Uninstalling Looma" }
+    # Never anything but Looma's own folder.
     if ($Data -and ($Data -ne $HOME) -and (Test-Path $Data)) { Remove-Item -Recurse -Force -LiteralPath $Data }
-    Say "DevDash is uninstalled and its data deleted."
+    Say "Looma is uninstalled and its data deleted."
 }
 
 function Start-DevDash {
     $exe = Get-Command devdash -ErrorAction SilentlyContinue
-    if (-not $exe) { Fail "DevDash isn't installed. Choose Install first." }
+    if (-not $exe) { Fail "Looma isn't installed. Choose Install first." }
     Update-IfChanged
     $exe = Get-Command devdash -ErrorAction SilentlyContinue
     if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*devdash*serve*" }) {
-        Write-Host "DevDash is already running."
+        Write-Host "Looma is already running."
         Start-Process $Url
         return
     }
     $server = Start-Process -FilePath $exe.Source -ArgumentList "serve" -NoNewWindow -PassThru
     Start-Sleep -Seconds 2
     Start-Process $Url
-    Write-Host "Opened $Url. Keep this window open while you use DevDash; close it or press Ctrl+C to stop."
+    Write-Host "Opened $Url. Keep this window open while you use Looma; close it or press Ctrl+C to stop."
     Wait-Process -Id $server.Id
 }
 
 $Python = Find-Python
-Say "DevDash"
+Say "Looma"
 if (Test-Installed) { Write-Host "Installed. Data in $Data." } else { Write-Host "Not installed yet." }
 Write-Host @"
 
   1  Install      first time on this computer
   2  Repair       reinstall over the current one; your data stays
-  3  Uninstall    remove DevDash and delete its data
-  4  Start        run DevDash and open it in the browser
+  3  Uninstall    remove Looma and delete its data
+  4  Start        run Looma and open it in the browser
   5  Quit
 "@
 switch (Read-Host "`nChoose 1-5") {

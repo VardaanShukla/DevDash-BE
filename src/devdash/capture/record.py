@@ -19,14 +19,14 @@ from devdash import git, paths
 from devdash.capture import install
 from devdash.store import connect, now
 
-# Set on Claude Code runs that DevDash starts itself (summaries), so they are not recorded.
+# Set on Claude Code runs that Looma starts itself (summaries), so they are not recorded.
 INTERNAL_ENV = "DEVDASH_INTERNAL"
 
 # Claude Code's file-editing tools, and Codex's (it edits files by patch).
 EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
 # The files a Codex patch adds, changes, deletes or moves to.
 PATCH_FILE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.MULTILINE)
-# What Antigravity needs on stdout from each hook DevDash adds, whatever happened: it
+# What Antigravity needs on stdout from each hook Looma adds, whatever happened: it
 # reads hook output as JSON, and a Stop answer of anything but "continue" lets it stop.
 ANTIGRAVITY_ANSWER = {"user-prompt-submit": "{}", "stop": '{"decision": "stop"}'}
 # Lines of an Antigravity transcript read back from its end to find the request.

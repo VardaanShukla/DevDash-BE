@@ -1,5 +1,5 @@
 """Plain-English explanations of a changed function or of the whole project, written by
-the user's own Claude Code (`claude -p`), so DevDash needs no API key of its own. Only
+the user's own Claude Code (`claude -p`), so Looma needs no API key of its own. Only
 asked for when someone clicks Explain, and saved, so the same code is explained once.
 
 A full knowledge transfer (KT) of a project is built a file at a time: each file is
@@ -7,7 +7,7 @@ explained on its own (its purpose and every function in it), so even a small loc
 only ever reads one file, and the project's overview is then written from those notes.
 
 Claude runs in an empty folder with its tools turned off and a short system prompt of
-DevDash's own: it sees only what the prompt holds, and DevDash's own recorder skips the
+Looma's own: it sees only what the prompt holds, and Looma's own recorder skips the
 run. It uses a small, cheap model (Haiku) unless DEVDASH_CLAUDE_MODEL names another.
 
 Signing in to Claude Code can happen from the dashboard too: `start_login` runs
@@ -124,7 +124,7 @@ def install_commands(system: str | None = None) -> list[dict]:
 
 def _find_claude() -> str | None:
     """Claude Code on the PATH, or where the native installer puts it: a fresh install's
-    folder may not be on the PATH that DevDash started with."""
+    folder may not be on the PATH that Looma started with."""
     found = shutil.which("claude")
     if found:
         return found
@@ -573,7 +573,7 @@ def _run(prompt: str) -> str:
 
 def _ask_claude(model: str, prompt: str) -> str:
     if not _find_claude():
-        raise ExplainError("Claude Code isn't installed on this computer, so DevDash can't write explanations.")
+        raise ExplainError("Claude Code isn't installed on this computer, so Looma can't write explanations.")
     flags = ["--output-format", "json", "--model", model, "--system-prompt", SYSTEM_PROMPT,
              "--tools", "", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
     # `--tools ""` leaves Claude none of its own tools (no reading files, no commands), and
@@ -587,7 +587,7 @@ def _ask_claude(model: str, prompt: str) -> str:
         except subprocess.TimeoutExpired:
             raise ExplainError("Claude took too long to answer. Try again.")
     if result.returncode != 0 and re.search(r"unknown option|unrecognized|unexpected argument", result.stderr, re.I):
-        raise ExplainError("This Claude Code is too old for DevDash's explanations. Update Claude Code "
+        raise ExplainError("This Claude Code is too old for Looma's explanations. Update Claude Code "
                            "(run `claude update`), then try again.")
     if not result.stdout.strip():
         lines = [line for line in result.stderr.strip().splitlines() if line.strip()]
@@ -806,7 +806,7 @@ def _complete(kind: str, result: dict) -> bool:
     return isinstance(main, str) and bool(main.strip())
 
 
-# Questions about the project, from the Ask screen. The answer is built from what DevDash
+# Questions about the project, from the Ask screen. The answer is built from what Looma
 # already knows (the project's description, the KT's file-by-file notes) plus the code of the
 # few files the question is about, and never saved: each question is asked as it comes.
 # It only explains: asked to write or change code, it says so and explains in words.

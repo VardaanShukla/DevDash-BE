@@ -1,5 +1,5 @@
 """Finds Claude's commits that no hook saw being made: a cloud session (claude.ai/code)
-that committed and pushed, or a commit made where DevDash's git hook isn't installed.
+that committed and pushed, or a commit made where Looma's git hook isn't installed.
 Any commit on a local or fetched remote branch with a Claude co-author trailer counts as
 Claude's work. Each is recorded once, under its commit message, since no prompt is known.
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Installs, repairs, uninstalls or starts DevDash on Linux and macOS, from this DevDash-BE
+# Installs, repairs, uninstalls or starts Looma on Linux and macOS, from this DevDash-BE
 # clone (the folder above scripts/) and a DevDash-FE clone next to it. Double-click it, or run:
 #
 #     bash scripts/devdash.sh
 #
 # DEVDASH_FE=/path/to/DevDash-FE points it at a page clone somewhere else.
 #
-# Installing never touches your projects. Uninstalling deletes DevDash's data, after you
+# Installing never touches your projects. Uninstalling deletes Looma's data, after you
 # type DELETE to confirm.
 set -euo pipefail
 
@@ -52,9 +52,9 @@ trap finish EXIT
 
 # `pipx list --short` is newer than the pipx some systems carry (Ubuntu 22.04's 1.0), so read the long form.
 installed() { command -v pipx >/dev/null && pipx list 2>/dev/null | grep -q 'package devdash '; }
-# Whether a DevDash answers on its address, rather than any process with "devdash serve" in its command line.
+# Whether a Looma answers on its address, rather than any process with "devdash serve" in its command line.
 running() { python3 -c "import urllib.request, sys; urllib.request.urlopen(sys.argv[1] + '/api/auth', timeout=2)" "$URL" >/dev/null 2>&1; }
-# The installed DevDash's own server process: its command line starts with the devdash command.
+# The installed Looma's own server process: its command line starts with the devdash command.
 serve_pids() { pgrep -f '(^|/)devdash serve( |$)' || true; }
 
 # Installs system packages with the computer's package manager, after asking: it takes
@@ -87,7 +87,7 @@ needs() {
   [ -f "$BE/pyproject.toml" ] || fail "This script belongs in DevDash-BE/scripts; there's no DevDash-BE in $BE."
   if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
     system_install "Python 3.10 or newer" "python3 python3-venv" python3 python python3 python
-    python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail "DevDash needs Python 3.10 or newer; this one is $(python3 --version)."
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail "Looma needs Python 3.10 or newer; this one is $(python3 --version)."
   fi
   if ! command -v pipx >/dev/null; then
     system_install "pipx" pipx pipx python-pipx python3-pipx pipx
@@ -166,9 +166,9 @@ build_page() {
 }
 
 after_install() {
-  say "DevDash is installed. Your data is in $DATA."
+  say "Looma is installed. Your data is in $DATA."
   local folder
-  read -r -p $'\nWhere are your projects? DevDash lists the git repos in that folder. [~/Projects, or Enter to skip] ' folder
+  read -r -p $'\nWhere are your projects? Looma lists the git repos in that folder. [~/Projects, or Enter to skip] ' folder
   folder="${folder/#\~/$HOME}"
   [ -z "$folder" ] && [ -d "$HOME/Projects" ] && folder="$HOME/Projects"
   if [ -n "$folder" ]; then
@@ -176,18 +176,18 @@ after_install() {
     else echo "There's no folder $folder. Add projects later under Add project on the dashboard."
     fi
   fi
-  if yes_no $'\nStart DevDash now?' y; then start; fi
+  if yes_no $'\nStart Looma now?' y; then start; fi
 }
 
 do_install() {
   if installed; then
-    say "DevDash is already installed. Choose Repair to reinstall it."
+    say "Looma is already installed. Choose Repair to reinstall it."
     return
   fi
   needs
   git_tools
   build_page
-  say "Installing DevDash…"
+  say "Installing Looma…"
   rm -rf "$BE/build"
   pipx install "$BE"
   mkdir -p "$DATA"
@@ -195,7 +195,7 @@ do_install() {
   after_install
 }
 
-# The newest change to the code DevDash is installed from: DevDash-BE's code (not its built
+# The newest change to the code Looma is installed from: DevDash-BE's code (not its built
 # page, which is made from DevDash-FE) and DevDash-FE's. Start reinstalls when it moves on.
 STAMP="$DATA/installed-from"
 source_stamp() {
@@ -228,7 +228,7 @@ reinstall() {
 # Start runs the installed copy, so edits to the code show only after reinstalling it.
 update_if_changed() {
   [ -f "$STAMP" ] && [ "$(source_stamp)" = "$(cat "$STAMP")" ] && return 0
-  say "DevDash's code changed since it was installed. Updating…"
+  say "Looma's code changed since it was installed. Updating…"
   build_page
   stop_running
   reinstall
@@ -239,7 +239,7 @@ repair() {
   needs
   git_tools
   build_page
-  say "Reinstalling DevDash…"
+  say "Reinstalling Looma…"
   stop_running
   reinstall
   after_install
@@ -249,18 +249,18 @@ stop_running() {
   local pids
   pids="$(serve_pids)"
   [ -z "$pids" ] && return
-  echo "Stopping the DevDash that's running…"
+  echo "Stopping the Looma that's running…"
   # shellcheck disable=SC2086
   kill $pids 2>/dev/null || true
   sleep 1
 }
 
 uninstall() {
-  say "Uninstall DevDash and delete its data?"
+  say "Uninstall Looma and delete its data?"
   echo "This deletes:"
   echo "  - the devdash program"
-  echo "  - everything in $DATA: your DevDash account, the project list, recorded AI history and explanations"
-  echo "  - DevDash's hooks in your projects and in Claude Code, Codex and Antigravity"
+  echo "  - everything in $DATA: your Looma account, the project list, recorded AI history and explanations"
+  echo "  - Looma's hooks in your projects and in Claude Code, Codex and Antigravity"
   echo "It doesn't touch your projects' files or git history, Ollama, or its models."
   local answer
   read -r -p $'\nType DELETE to continue, or press Enter to cancel: ' answer
@@ -269,41 +269,87 @@ uninstall() {
   stop_running
   if command -v devdash >/dev/null; then devdash remove-hooks || echo "Couldn't take every hook out; carrying on."; fi
   if installed; then pipx uninstall devdash; fi
-  # Never anything but DevDash's own folder.
+  # Never anything but Looma's own folder.
   if [ -n "$DATA" ] && [ "$DATA" != "$HOME" ] && [ "$DATA" != / ] && [ -d "$DATA" ]; then
     rm -rf -- "$DATA"
   fi
-  say "DevDash is uninstalled and its data deleted."
+  say "Looma is uninstalled and its data deleted."
+}
+
+# A Chromium-family browser, for Looma's own app window; empty when there's none.
+app_browser() {
+  local name
+  for name in google-chrome google-chrome-stable chromium chromium-browser brave-browser brave microsoft-edge microsoft-edge-stable; do
+    if command -v "$name" >/dev/null; then command -v "$name"; return; fi
+  done
+}
+
+# The app window's own profile. A snap browser may only write to folders in your home that
+# aren't hidden, so it gets one in its snap folder; any other uses Looma's data folder.
+window_profile() { # window_profile browser-path
+  case "$1" in
+    /snap/*) echo "$HOME/snap/$(basename "$1")/common/looma-window" ;;
+    *) echo "$DATA/window" ;;
+  esac
+}
+
+# Opens the page in a session of its own (setsid), so stopping Looma, or closing the terminal
+# it runs in, never takes the browser with it. With a Chromium-family browser the page gets its
+# own app window, a browser process apart from your usual one, which close_window shuts.
+WINDOW=""
+open_page() {
+  local browser
+  browser="$(app_browser)"
+  if [ -n "$browser" ] && [ "$(uname)" != Darwin ]; then
+    WINDOW="$(window_profile "$browser")"
+    mkdir -p "$WINDOW"
+    setsid -f "$browser" --app="$URL" --user-data-dir="$WINDOW" --no-first-run --no-default-browser-check \
+      </dev/null >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null; then
+    if command -v setsid >/dev/null; then setsid -f xdg-open "$URL" </dev/null >/dev/null 2>&1 || true
+    else nohup xdg-open "$URL" </dev/null >/dev/null 2>&1 & fi
+  elif command -v open >/dev/null; then open "$URL"
+  fi
+}
+
+# Closes Looma's app window, and only it: the one browser process using its own profile.
+close_window() {
+  [ -n "$WINDOW" ] || return 0
+  pkill -f -- "--user-data-dir=$WINDOW" 2>/dev/null || true
 }
 
 start() {
-  command -v devdash >/dev/null || fail "DevDash isn't installed. Choose Install first."
+  command -v devdash >/dev/null || fail "Looma isn't installed. Choose Install first."
   update_if_changed
   if running; then
-    echo "DevDash is already running."
+    echo "Looma is already running."
   else
     devdash serve &
     local server=$!
-    trap 'kill "$server" 2>/dev/null' INT TERM
+    trap 'kill "$server" 2>/dev/null; close_window' INT TERM HUP
     sleep 2
   fi
-  if command -v xdg-open >/dev/null; then xdg-open "$URL" >/dev/null 2>&1 || true
-  elif command -v open >/dev/null; then open "$URL"
-  fi
+  open_page
   if [ -n "${server:-}" ]; then
-    echo "Opened $URL. Keep this window open while you use DevDash; press Ctrl+C to stop it."
+    if [ -n "$WINDOW" ]; then
+      echo "Opened Looma in its own window. Keep this window open while you use Looma; press Ctrl+C to stop it,"
+      echo "which closes Looma's window and leaves your browser as it is."
+    else
+      echo "Opened $URL. Keep this window open while you use Looma; press Ctrl+C to stop it."
+    fi
     wait "$server" || true
+    close_window
   fi
 }
 
-say "DevDash"
+say "Looma"
 if installed; then echo "Installed. Data in $DATA."; else echo "Not installed yet."; fi
 cat <<'MENU'
 
   1  Install      first time on this computer
   2  Repair       reinstall over the current one; your data stays
-  3  Uninstall    remove DevDash and delete its data
-  4  Start        run DevDash and open it in the browser
+  3  Uninstall    remove Looma and delete its data
+  4  Start        run Looma and open it in the browser
   5  Quit
 MENU
 read -r -p $'\nChoose 1-5: ' choice

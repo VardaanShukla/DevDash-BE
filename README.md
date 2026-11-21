@@ -1,6 +1,8 @@
-# DevDash (backend)
+<img src="src/devdash/web/looma.svg" width="72" alt="Looma logo">
 
-DevDash shows what changed in your code in plain words, so people who don't read code can
+# Looma (backend)
+
+Looma shows what changed in your code in plain words, so people who don't read code can
 follow it. It runs on your own computer: it reads your projects' git history, explains changes
 with the AI you choose, writes knowledge-transfer guides for new team members, and can record
 what AI coding tools (Claude Code, Codex, Antigravity) changed and why.
@@ -8,7 +10,11 @@ what AI coding tools (Claude Code, Codex, Antigravity) changed and why.
 This repo is the backend: a Python command line tool and local web server (FastAPI) that also
 serves the dashboard page. The page's source is in its own repo,
 [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes with this
-package, so you don't need Node to use DevDash.
+package, so you don't need Node to use Looma.
+
+Looma was called DevDash until November 2026. Only the name changed: the command is still
+`devdash` (`looma` works too once installed from this version), your data stays in `~/.devdash`,
+the `DEVDASH_*` settings and the `/api` addresses are the same, and the repos keep their names.
 
 ## What it does
 
@@ -41,7 +47,7 @@ package, so you don't need Node to use DevDash.
   of the files the question is about. It explains; it never changes code.
 - **Your choice of AI**: Claude (the default, using your own Claude Code login), ChatGPT Codex,
   Antigravity, your own server (paste the curl command that reaches it), or a local model with
-  Ollama. For Ollama, DevDash reads your CPU, memory and GPU and suggests a model that fits.
+  Ollama. For Ollama, Looma reads your CPU, memory and GPU and suggests a model that fits.
 - **Projects without git** can be added too: Summary, KT, Ask and the project map work from the
   folder's files; branches, changes, commits, pull requests and AI recording need git and stay
   off until you run `git init` in the folder.
@@ -51,13 +57,13 @@ package, so you don't need Node to use DevDash.
 
 ## Install and run
 
-DevDash needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io) (which installs
+Looma needs Python 3.10 or newer, git, and [pipx](https://pipx.pypa.io) (which installs
 Python apps in their own space). Node is not needed: the dashboard page comes built in.
 
 ### The easy way: the installer script
 
 `scripts/devdash.sh` (Linux and macOS) and `scripts/devdash.bat` (Windows; it runs
-`devdash.ps1`) install, repair, uninstall or start DevDash from one menu. Clone DevDash-FE
+`devdash.ps1`) install, repair, uninstall or start Looma from one menu. Clone DevDash-FE
 next to this repo if you want the page built from its source; otherwise the page already
 built in here is used, and Node isn't needed:
 
@@ -77,9 +83,9 @@ build the page from a DevDash-FE somewhere else, set `DEVDASH_FE` to its folder 
 
 | Option | What it does |
 |---|---|
-| **1 Install** | Checks for Python 3.10+, pipx and (when DevDash-FE is there) Node 18+, and asks before installing any that are missing (`sudo apt`/`dnf`/`pacman`/`zypper` or `brew` on Linux and macOS, `winget` on Windows; your password goes to those, never to the script). Builds the page, installs DevDash with pipx, asks where your projects are and runs `devdash init` on that folder, then offers to start it. If DevDash is already installed, it says to use Repair. |
-| **2 Repair** | The same, but reinstalls over whatever is there (`pipx install --force`), stopping a running DevDash first. Your data in `~/.devdash` stays. Use it after pulling new code. |
-| **3 Uninstall** | After you type `DELETE`: takes DevDash's hooks out of every project and AI tool (`devdash remove-hooks`), uninstalls DevDash and **deletes `~/.devdash`** (your DevDash account, project list and recorded history). Your projects' files and git history, Ollama and its models are not touched. Back up `~/.devdash` first if you may want it again (see "Uninstall DevDash safely"). |
+| **1 Install** | Checks for Python 3.10+, pipx and (when DevDash-FE is there) Node 18+, and asks before installing any that are missing (`sudo apt`/`dnf`/`pacman`/`zypper` or `brew` on Linux and macOS, `winget` on Windows; your password goes to those, never to the script). Builds the page, installs Looma with pipx, asks where your projects are and runs `devdash init` on that folder, then offers to start it. If Looma is already installed, it says to use Repair. |
+| **2 Repair** | The same, but reinstalls over whatever is there (`pipx install --force`), stopping a running Looma first. Your data in `~/.devdash` stays. Use it after pulling new code. |
+| **3 Uninstall** | After you type `DELETE`: takes Looma's hooks out of every project and AI tool (`devdash remove-hooks`), uninstalls Looma and **deletes `~/.devdash`** (your Looma account, project list and recorded history). Your projects' files and git history, Ollama and its models are not touched. Back up `~/.devdash` first if you may want it again (see "Uninstall Looma safely"). |
 | **4 Start** | Runs `devdash serve` and opens http://127.0.0.1:8765. Keep the window open while you use it; Ctrl+C stops it. |
 
 The install is a regular one, not editable: after changing the code, run Repair. Projects
@@ -99,7 +105,7 @@ The steps below do the same by hand.
 
    If `py` isn't found or says older than 3.10, install [Python](https://www.python.org/downloads/)
    (tick "Add python.exe to PATH"). If `git` isn't found, install
-   [Git for Windows](https://git-scm.com/download/win): DevDash's git hook runs in its `sh`.
+   [Git for Windows](https://git-scm.com/download/win): Looma's git hook runs in its `sh`.
 2. **Install pipx** and put its folder on your PATH:
 
    ```bat
@@ -107,7 +113,7 @@ The steps below do the same by hand.
    py -m pipx ensurepath
    ```
 
-3. **Install DevDash**, from GitHub or from a folder you cloned it into:
+3. **Install Looma**, from GitHub or from a folder you cloned it into:
 
    ```bat
    py -m pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git
@@ -128,7 +134,7 @@ The steps below do the same by hand.
    Install what's missing with your package manager, e.g. `sudo apt install python3 python3-venv git pipx`.
 2. **Install pipx**, if your package manager didn't: `python3 -m pip install --user pipx`, then
    `python3 -m pipx ensurepath`.
-3. **Install DevDash:**
+3. **Install Looma:**
 
    ```sh
    pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git
@@ -145,7 +151,7 @@ The steps below do the same by hand.
    [python.org](https://www.python.org/downloads/) or `brew install python git`; running
    `git --version` the first time also offers Apple's command line tools, which include git.
 2. **Install pipx:** `brew install pipx` (or `python3 -m pip install --user pipx`), then `pipx ensurepath`.
-3. **Install DevDash:** `pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git`
+3. **Install Looma:** `pipx install --force git+https://github.com/VardaanShukla/DevDash-BE.git`
    (or `pipx install --force /path/to/DevDash-BE` from a clone).
 4. **Open a new terminal** and run `devdash serve`.
 5. Open http://127.0.0.1:8765.
@@ -155,7 +161,7 @@ The steps below do the same by hand.
 The first visit asks you to pick a username and password, then to add a project: the path of
 any git folder on your computer, typed or pasted any way (`C:\Users\me\App`, `"C:\Users\me\App"`
 from Windows' "Copy as path", `~/App`, `$HOME/App` or `%USERPROFILE%\App`). A project with no
-readme, or nothing committed yet, works too. To pick from a list instead, point DevDash at
+readme, or nothing committed yet, works too. To pick from a list instead, point Looma at
 the folder that holds your projects once: `devdash init ~/Projects` remembers it, adds nothing
 and changes nothing in them, and Add project then lists the projects inside.
 
@@ -179,20 +185,20 @@ again: it points the hooks at the new install by itself.
   the environment it's installed in.
 - **You'd rather use a virtual environment** (venv or conda) than pipx: activate it, run
   `pip install -e .` in the DevDash-BE folder, then `devdash serve`. The command then works
-  only while that environment is active, and the hooks DevDash adds call that environment's
+  only while that environment is active, and the hooks Looma adds call that environment's
   Python.
 - **Hooks point at a deleted environment.** If you delete that environment (or move the
-  install) without uninstalling DevDash first, git commits still work, but Claude Code reports
-  a failing hook. Install DevDash again and start `devdash serve` once: it points every hook at
-  the new install. Or remove them as in "Uninstall DevDash safely".
+  install) without uninstalling Looma first, git commits still work, but Claude Code reports
+  a failing hook. Install Looma again and start `devdash serve` once: it points every hook at
+  the new install. Or remove them as in "Uninstall Looma safely".
 - **A prompt is missing from AI changes.** Settings → Recording shows when each hook last ran
-  and any hook errors, with the log files' paths. Only tools that run DevDash's hooks are
+  and any hook errors, with the log files' paths. Only tools that run Looma's hooks are
   recorded: Claude Code (in a terminal, an editor extension or the desktop app's Code tab),
   Codex and Antigravity. Claude's Cowork mode and plain chats don't run them.
 
 Projects can live anywhere and can move. A project that is moved, renamed or cloned again
 somewhere else keeps its history: add the new folder (or just commit in it, if an AI tool is
-connected) and DevDash finds it is the same project, as long as the old folder is gone.
+connected) and Looma finds it is the same project, as long as the old folder is gone.
 
 ### Working on the page
 
@@ -237,10 +243,10 @@ Other endpoints:
 - `POST /api/repos` with `{"path": "~/Projects/App", "ai": "claude" | null}` adds a project,
   the same as `devdash init` (plus `devdash connect claude` when `ai` is `"claude"`)
 - `DELETE /api/repos/{id}` (with a `{}` JSON body) stops tracking a project: its files and
-  git history stay, DevDash's git hook comes out, and what it recorded for it is deleted
+  git history stay, Looma's git hook comes out, and what it recorded for it is deleted
 - `PUT /api/repos/{id}/ai` with `{"ai": "claude" | null}` connects or disconnects Claude
 - `GET /api/repos/{id}/setup` lists the setup steps and which are done
-- `GET /api/ai-tools` lists the AI tools DevDash can record
+- `GET /api/ai-tools` lists the AI tools Looma can record
 - `GET /api/repos/{id}/state` is a fingerprint of branches, commits and (with
   `?uncommitted=true`) edits; the UI polls it and reloads only when it changes
 - `GET /api/repos/{id}/flow` lists the newest commits across all branches with their
@@ -257,7 +263,7 @@ Other endpoints:
 - `POST /api/repos/{id}/explain/function` (`{"path", "name"}`) and
   `POST /api/repos/{id}/explain/project` ask Claude Code for a plain-English explanation:
   what a function does, what the change improves and what it costs, or what the project is
-  and how it works. DevDash runs your installed `claude -p` in an empty folder with tools
+  and how it works. Looma runs your installed `claude -p` in an empty folder with tools
   off, so it uses your Claude login and needs no API key. It asks Haiku, the small and
   cheap model, with a short system prompt of its own; set `DEVDASH_CLAUDE_MODEL` (such as
   `sonnet`) for another. Answers are saved and reused. A 424 means Claude Code isn't signed in.
@@ -300,7 +306,7 @@ Other endpoints:
   deleted on GitHub show up
 
 The API listens on 127.0.0.1 only, answers only requests addressed to localhost, and
-accepts changes only as JSON from no page or the DevDash UI. The full contract is at
+accepts changes only as JSON from no page or the Looma UI. The full contract is at
 `/openapi.json`.
 
 ### Username and password
@@ -345,7 +351,7 @@ nothing in one leaves no trace. Restart any Claude Code session that is already 
 ## Claude app chats
 
 Edits made from a Claude app chat reach your files without going through Claude Code,
-so the hooks can't see them. DevDash records them from git instead:
+so the hooks can't see them. Looma records them from git instead:
 
 1. Run `devdash instructions` and paste its text into the Claude project's instructions.
 2. Claude then writes your request to `.devdash/prompt.md` before each commit and adds
@@ -382,26 +388,26 @@ Every hook call is logged (tool and file, never the prompt) to `~/.devdash/hooks
 
 Lockfiles, `node_modules`, build output and files over 1 MB are skipped.
 
-## Uninstall DevDash safely
+## Uninstall Looma safely
 
-DevDash never changes your project files or their git history. What it adds, and takes out
+Looma never changes your project files or their git history. What it adds, and takes out
 again when a project stops recording:
 
 - In each project that records an AI tool: two lines at the end of `.git/hooks/post-commit`
   (a `# devdash: records commits` line and the command under it). Anything else in that
-  hook is yours and stays; the file is deleted only if DevDash made it. Also a
+  hook is yours and stays; the file is deleted only if Looma made it. Also a
   `/.devdash/` line in `.git/info/exclude`, so a Claude app chat's notes there stay out of
   git. That line is harmless and stays.
 - For the AI tool a project records, while any project records it:
   - Claude Code: five entries in `~/.claude/settings.json`, under `UserPromptSubmit`,
     `PreToolUse`, `PostToolUse`, `Stop` and `SessionEnd`, each running `… -m devdash record …`. Your other settings and
     hooks stay.
-  - Codex: `UserPromptSubmit`, `PreToolUse` and `Stop` in `~/.codex/hooks.json` (the file goes if only DevDash's were in it).
+  - Codex: `UserPromptSubmit`, `PreToolUse` and `Stop` in `~/.codex/hooks.json` (the file goes if only Looma's were in it).
   - Antigravity: a `devdash` entry in `~/.gemini/config/hooks.json`.
 - Its own data in `~/.devdash` (`%USERPROFILE%\.devdash` on Windows): the projects list,
   what was recorded, settings and the dashboard password.
 
-Nothing starts DevDash by itself: it runs only while `devdash serve` does.
+Nothing starts Looma by itself: it runs only while `devdash serve` does.
 
 **The quick way:** run `scripts/devdash.sh` (Windows: `scripts\devdash.bat`) and choose **3 Uninstall**. It does steps 1 to 3 below and deletes `~/.devdash`
 without a backup, so make one first (step 4) if you may want the history again.
@@ -414,18 +420,18 @@ By hand:
    devdash remove-hooks
    ```
 
-   It takes DevDash's lines out of every recording project's git hook and DevDash's hooks out
+   It takes Looma's lines out of every recording project's git hook and Looma's hooks out
    of Claude Code, Codex and Antigravity. Or, one project at a time: in the dashboard choose
-   "Remove project from DevDash" (or "Stop recording AI changes"), or run:
+   "Remove project from Looma" (or "Stop recording AI changes"), or run:
 
    ```sh
    devdash disconnect claude /path/to/project
    ```
 
-   This takes DevDash's lines out of that project's git hook, and once no project records
+   This takes Looma's lines out of that project's git hook, and once no project records
    an AI tool any more, its hooks out of `~/.claude`, `~/.codex` or `~/.gemini`. Do this
    first: after uninstalling, the `devdash` command isn't there to do it.
-2. **Stop DevDash:** Ctrl+C in the terminal running `devdash serve`.
+2. **Stop Looma:** Ctrl+C in the terminal running `devdash serve`.
 3. **Uninstall it:**
 
    ```sh
@@ -434,7 +440,7 @@ By hand:
 
    or, if you installed it into a virtual environment, activate it and run
    `pip uninstall devdash`. On Windows: `py -m pipx uninstall devdash`.
-4. **Optional, and permanent: delete DevDash's data.** Keep a copy first. Linux and macOS:
+4. **Optional, and permanent: delete Looma's data.** Keep a copy first. Linux and macOS:
 
    ```sh
    cd ~ && tar -czf devdash-backup.tar.gz .devdash
@@ -455,11 +461,11 @@ By hand:
    rmdir /s /q "%USERPROFILE%\.devdash"
    ```
 
-If you uninstalled before step 1, the hooks are left calling a DevDash that isn't there. Git
+If you uninstalled before step 1, the hooks are left calling a Looma that isn't there. Git
 commits still work (the hook ends in `|| true`), but Claude Code reports a failing hook. Take
-them out by hand: delete DevDash's two lines from each project's `.git/hooks/post-commit`,
+them out by hand: delete Looma's two lines from each project's `.git/hooks/post-commit`,
 and in `~/.claude/settings.json` (and `~/.codex/hooks.json`) delete each hook whose command
-contains `devdash record`, leaving the others. Or install DevDash again, do step 1, and
+contains `devdash record`, leaving the others. Or install Looma again, do step 1, and
 uninstall.
 
 ## Settings from the environment
@@ -468,7 +474,7 @@ All optional.
 
 | Variable | What it does |
 |---|---|
-| `DEVDASH_HOME` | Where DevDash keeps its data (default `~/.devdash`) |
+| `DEVDASH_HOME` | Where Looma keeps its data (default `~/.devdash`) |
 | `DEVDASH_CLAUDE_MODEL` | The Claude model for explanations when Settings doesn't pick one (default `haiku`) |
 | `DEVDASH_EXPLAIN_REVIEW` | `0` turns off the second pass that checks a function's pros and cons |
 | `OLLAMA_HOST` | Where Ollama runs (default `127.0.0.1:11434`) |
@@ -516,4 +522,4 @@ rebuilds `src/devdash/web`, which is committed so installs need no Node.
 
 ## License
 
-DevDash is created by [Vardaan Shukla](https://github.com/VardaanShukla) and released under the [Apache License 2.0](LICENSE). Copies and forks must keep the [NOTICE](NOTICE) file with that credit.
+Looma is created by [Vardaan Shukla](https://github.com/VardaanShukla) and released under the [Apache License 2.0](LICENSE). Copies and forks must keep the [NOTICE](NOTICE) file with that credit.

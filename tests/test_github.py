@@ -18,7 +18,7 @@ def client():
 
 
 class FakeGitHub:
-    """github.com's device sign-in and the parts of its API DevDash reads."""
+    """github.com's device sign-in and the parts of its API Looma reads."""
 
     def __init__(self):
         self.entered = False  # the person has typed the code on GitHub
@@ -96,7 +96,7 @@ def test_connecting_with_a_code_then_listing_repos_and_pull_requests(fake, repo)
     api = client()
     assert api.get("/api/github").json()["connected"] is False
     started = api.post("/api/github/connect", json={}).json()
-    # The page shows the code; the device code itself never leaves DevDash.
+    # The page shows the code; the device code itself never leaves Looma.
     assert started["code"] == "ABCD-1234" and started["verify_url"] == "https://github.com/login/device"
     assert "dev-123" not in json.dumps(started)
     assert api.post("/api/github/poll", json={}).json()["connected"] is False  # not entered yet
@@ -219,7 +219,7 @@ def test_signing_in_through_gh(fake, tmp_path, monkeypatch):
             break
         time.sleep(0.1)
     assert (done["connected"], done["via"], done["login"]) == (True, "gh", "vardaan")
-    # gh keeps the token; DevDash asks gh for it each time rather than keeping a copy.
+    # gh keeps the token; Looma asks gh for it each time rather than keeping a copy.
     assert "ghu_first" not in json.dumps(github._saved())
     assert api.get("/api/repos").status_code == 200 and github.token() == "ghu_first"
 

@@ -1,18 +1,18 @@
-"""Your GitHub account, connected through DevDash's GitHub App with GitHub's device flow:
-DevDash shows a short code, you enter it on github.com, and GitHub hands DevDash a token.
-No password or client secret passes through DevDash, so it works with no server of its own.
+"""Your GitHub account, connected through Looma's GitHub App with GitHub's device flow:
+Looma shows a short code, you enter it on github.com, and GitHub hands Looma a token.
+No password or client secret passes through Looma, so it works with no server of its own.
 
 The app asks for read-only access (contents, metadata, pull requests) and only to the
-repositories you install it on, so you choose what DevDash can see. Tokens last eight hours
+repositories you install it on, so you choose what Looma can see. Tokens last eight hours
 and are refreshed with the refresh token, which a device-flow token can do without a secret.
-The token is kept in DevDash's local database, never sent to the page.
+The token is kept in Looma's local database, never sent to the page.
 
-Until DevDash's app is registered (or for people who'd rather not use it), there are two other
-ways in: the sign-in of GitHub's own `gh` tool, which DevDash starts and then borrows the token
+Until Looma's app is registered (or for people who'd rather not use it), there are two other
+ways in: the sign-in of GitHub's own `gh` tool, which Looma starts and then borrows the token
 of, and a token pasted from github.com/settings/tokens. Both see every repository the account
 can, and gh's token can also write to them, which the screen says.
 
-With it DevDash lists your repositories (to clone one as a project) and shows a project's
+With it Looma lists your repositories (to clone one as a project) and shows a project's
 open pull requests. Fetching and everything else still use your own git login."""
 
 import base64
@@ -30,7 +30,7 @@ from pathlib import Path
 
 from devdash.store import connect
 
-# DevDash's GitHub App: its client ID (not a secret) and its name in github.com/apps/<name>.
+# Looma's GitHub App: its client ID (not a secret) and its name in github.com/apps/<name>.
 # Set them here once the app is registered, or with these environment variables.
 CLIENT_ID = os.environ.get("DEVDASH_GITHUB_CLIENT_ID", "")
 APP_NAME = os.environ.get("DEVDASH_GITHUB_APP", "")
@@ -62,7 +62,7 @@ def configured() -> bool:
 
 
 def status() -> dict:
-    """Whether DevDash's GitHub App is set up and an account connected, how and as whom,
+    """Whether Looma's GitHub App is set up and an account connected, how and as whom,
     and which ways of signing in this computer has."""
     saved = _saved()
     pending = _pending if _pending and _pending["expires_at"] > time.time() and _pending.get("user_code") else None
@@ -82,12 +82,12 @@ def status() -> dict:
 
 
 def start(method: str = "app") -> dict:
-    """Asks GitHub for a code to enter on github.com/login/device: through DevDash's app, or
+    """Asks GitHub for a code to enter on github.com/login/device: through Looma's app, or
     through gh, which is used straight away when it's already signed in."""
     if method == "gh":
         return _start_gh()
     if not configured():
-        raise GitHubError("DevDash's GitHub App isn't set up yet: set DEVDASH_GITHUB_CLIENT_ID.")
+        raise GitHubError("Looma's GitHub App isn't set up yet: set DEVDASH_GITHUB_CLIENT_ID.")
     found = _form(f"{WEB}/login/device/code", {"client_id": CLIENT_ID})
     if "device_code" not in found:
         raise GitHubError(f"GitHub didn't give a sign-in code: {found.get('error_description') or found.get('error') or 'no reason given'}")
@@ -253,7 +253,7 @@ def _who(user: dict) -> dict:
 
 
 def disconnect() -> dict:
-    """Forgets the token here. GitHub still lists DevDash under your authorized apps until
+    """Forgets the token here. GitHub still lists Looma under your authorized apps until
     you revoke it there (Settings → Applications); signing in through gh leaves gh signed in."""
     process = _pending.get("process")
     if process is not None and process.poll() is None:
@@ -268,7 +268,7 @@ def disconnect() -> dict:
 
 def repos(tracked: dict[str, str] | None = None) -> list[dict]:
     """Every repository the app is installed on for you, newest activity first. `tracked`
-    maps owner/name to the folder of a DevDash project that is a clone of it."""
+    maps owner/name to the folder of a Looma project that is a clone of it."""
     tracked = {k.lower(): v for k, v in (tracked or {}).items()}
     found = []
     if (_saved() or {}).get("source", "app") == "app":
@@ -434,7 +434,7 @@ def _form(url: str, fields: dict) -> dict:
 def _call(path: str, bearer: str | None = None, forget: bool = True):
     request = urllib.request.Request(API + path, headers={
         "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
-        "Authorization": f"Bearer {bearer or token()}", "User-Agent": "DevDash"})
+        "Authorization": f"Bearer {bearer or token()}", "User-Agent": "Looma"})
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -443,11 +443,11 @@ def _call(path: str, bearer: str | None = None, forget: bool = True):
             if not forget:
                 raise GitHubError("GitHub didn't accept the token.", signed_out=True)
             disconnect()
-            raise GitHubError("GitHub no longer accepts DevDash's sign-in. Connect again.", signed_out=True)
+            raise GitHubError("GitHub no longer accepts Looma's sign-in. Connect again.", signed_out=True)
         if error.code in (403, 404):
             if (_saved() or {}).get("source", "app") != "app":
                 raise GitHubError("GitHub says this account can't see that, or it doesn't exist.")
-            raise GitHubError("DevDash's GitHub App can't see this repository. Install it on the repository "
+            raise GitHubError("Looma's GitHub App can't see this repository. Install it on the repository "
                               "(Settings → GitHub → Pick repositories).")
         raise GitHubError(f"GitHub answered {error.code}.")
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
