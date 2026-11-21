@@ -1,34 +1,53 @@
-# devdash-be
+# DevDash (backend)
 
-Shows what changed in your repos, in a way people who don't read code can follow.
-The core works from your git history alone. Recording Claude's changes, with the
-request behind each one, is an optional add-on per repo.
+DevDash shows what changed in your code in plain words, so people who don't read code can
+follow it. It runs on your own computer: it reads your projects' git history, explains changes
+with the AI you choose, writes knowledge-transfer guides for new team members, and can record
+what AI coding tools (Claude Code, Codex, Antigravity) changed and why.
+
+This repo is the backend: a Python command line tool and local web server (FastAPI) that also
+serves the dashboard page. The page's source is in its own repo,
+[DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes with this
+package, so you don't need Node to use DevDash.
 
 ## What it does
 
-- **Home**: a dashboard of widgets you arrange: this branch, today's AI changes, commits,
-  branch flow, the project map and more.
-- **AI changes**: every change your AI coding tool (Claude Code, Codex, Antigravity) made,
-  grouped by the request behind it, with what to check.
-- **Summary**: the whole project on one page, read from its files and git history: what it is,
+- **Home**: a dashboard of widgets you arrange: the project and branch, today's AI work, the
+  size of this branch, the latest AI prompts, changed files, the latest commit, activity,
+  branches and commits.
+- **This branch, Branch flow and Project map**: what the checked-out branch changed compared
+  with its base (like a pull request), how branches split off and merge, and the project's
+  parts with which part uses which.
+- **AI changes**: every change your AI coding tool made, grouped by the request behind it,
+  with what to check, and a way to undo one change.
+- **Changes and Commits**: every changed file and function, before and after, explained in
+  plain words on request (what it does, what it improves, what it costs), and the project's
+  open pull requests on GitHub or AWS CodeCommit.
+- **Summary**: the whole project on one page, read from its files and history: what it is,
   what it's built with, its parts, how to run it and who works on it.
-- **KT**: a knowledge-transfer guide for a new developer, written by the AI in about half a
-  minute. It covers what to install and why, step-by-step setup with commands, how to run and
-  use it, the settings to fill in, and the major functions with their signatures. It includes
-  the project's own screenshots and downloads as a PDF.
-- **Ask**: questions about the project in plain words, answered from the KT, the file notes and
-  the code of the files the question is about. It explains; it never changes code.
-- **Changes and Commits**: every changed file and function, before and after, explained in plain
-  words on request.
-- **Your choice of AI**: Claude (the default, using your own Claude login), ChatGPT Codex,
-  Antigravity, your own server, or a local model with Ollama. For Ollama, DevDash reads your
-  CPU, memory and GPU and suggests the model that fits.
-- **A first-time walkthrough** that points at each screen, and a sign-in that keeps the
-  dashboard to you. Everything stays on your computer, in SQLite under `~/.devdash`.
-
-This repo is the backend, and it serves the dashboard page too. The page's source is in
-its own repo, [DevDash-FE](https://github.com/VardaanShukla/DevDash-FE); a built copy comes
-with this package.
+- **KT (knowledge transfer)**, in two kinds:
+  - **Brief KT**: a short guide written with one AI request in about a minute: what to install,
+    setup steps with commands, how to run and use it, settings to fill in, the major functions
+    and the project's own screenshots. Downloads as a PDF.
+  - **Detailed KT**: the project explained for someone who has never coded: a map of its parts,
+    the files to read in order, how things flow (step by step, file by file), where data lives
+    (database tables, settings, browser storage), its commands and web addresses, a glossary,
+    things to be careful with, and every file with what it does, what it uses and what uses it.
+    The facts are read from the code; the AI writes the words, and anything it names that the
+    code doesn't bear out (a file, a part, a step not linked by a real import) is left out.
+    Downloads as a PDF or as one interactive page (search, map, jump between files) that works
+    offline.
+- **Ask**: questions about the project in plain words, answered from the KT notes and the code
+  of the files the question is about. It explains; it never changes code.
+- **Your choice of AI**: Claude (the default, using your own Claude Code login), ChatGPT Codex,
+  Antigravity, your own server (paste the curl command that reaches it), or a local model with
+  Ollama. For Ollama, DevDash reads your CPU, memory and GPU and suggests a model that fits.
+- **Projects without git** can be added too: Summary, KT, Ask and the project map work from the
+  folder's files; branches, changes, commits, pull requests and AI recording need git and stay
+  off until you run `git init` in the folder.
+- **Private by design**: a username and password keep the dashboard to you, the server listens
+  on 127.0.0.1 only, and everything stays on your computer in SQLite under `~/.devdash`. The
+  only things sent anywhere are what you ask the AI you picked to explain.
 
 ## Install and run
 
@@ -247,6 +266,16 @@ Other endpoints:
   which opens the sign-in page in the browser, and returns that page's address.
   `POST /api/ai/sign-in/code` (`{"code"}`) passes on the code the page shows when it can't
   finish by itself; `GET /api/ai/sign-in` says whether it's waiting, signed in or failed
+- `GET /api/repos/{id}/kt/guide` and `POST /api/repos/{id}/kt/guide` read or write the Brief KT;
+  `GET /api/repos/{id}/kt/image?path=` serves one of the project's own pictures for it
+- `GET /api/repos/{id}/kt/detail?head=&worktree=` is the Detailed KT: parts, files with what
+  each uses and what uses it, a reading path, data, routes and commands read from the code,
+  with the AI's words once written. `worktree=true` reads the working folder, including
+  changes not committed yet (the default when there are some). `POST /api/repos/{id}/kt/detail`
+  (`{"head", "worktree", "fresh"}`) asks the AI for the words, from the notes on each file that
+  `POST /api/repos/{id}/explain/file` (`{"path", "head", "fresh", "worktree"}`) writes
+- `POST /api/repos/{id}/ask` (`{"question", "history", "head"}`) answers a question about the
+  project in plain words
 - `GET /api/home` lists every project at a glance: its branch, how many commits it is ahead
   of the base, files not committed, the latest commit, commits this week and branch count
 - `GET /api/digest?day=YYYY-MM-DD` (today when left out) is the daily digest: what Claude
@@ -267,11 +296,6 @@ Other endpoints:
 - `GET /api/recording/health` says whether recording works: when each hook last ran, recent
   errors, and `problems` in plain sentences (hooks missing or naming an old install, prompts
   whose end never arrived). `POST /api/recording/repair` reinstalls the hooks
-- `GET /api/calendar?days=7` lists events from the calendar connected with
-  `PUT /api/calendar` (`{"url"}`: its private iCal address, such as Google Calendar's
-  "Secret address in iCal format"); `DELETE /api/calendar` forgets it. Read-only, fetched at
-  most every 5 minutes; repeating events are expanded for daily, weekly, monthly-on-a-date
-  and yearly rules. The address stays in DevDash's database and is never sent to the page
 - `POST /api/repos/{id}/sync` runs `git fetch --all --prune` so merges and branches
   deleted on GitHub show up
 
@@ -299,14 +323,14 @@ one) without the old one.
 Function names come from git's own function detection, extended to JavaScript and
 TypeScript. Methods inside a class in JS or TS are reported under the class.
 
-## Optional: record Claude's changes
+## Optional: record your AI tool's changes
 
 ```sh
-devdash connect claude ~/Projects/SomeRepo      # start
+devdash connect claude ~/Projects/SomeRepo      # start (or codex, or antigravity)
 devdash disconnect claude ~/Projects/SomeRepo   # stop; recorded history is kept
 ```
 
-`connect claude` installs:
+A project records one tool at a time, and needs git. For Claude Code, `connect claude` installs:
 
 - a git `post-commit` hook in that repo (added to any existing shell hook, not replacing it)
 - Claude Code hooks in your user settings, `~/.claude/settings.json`
@@ -438,12 +462,57 @@ and in `~/.claude/settings.json` (and `~/.codex/hooks.json`) delete each hook wh
 contains `devdash record`, leaving the others. Or install DevDash again, do step 1, and
 uninstall.
 
-## Tests
+## Settings from the environment
+
+All optional.
+
+| Variable | What it does |
+|---|---|
+| `DEVDASH_HOME` | Where DevDash keeps its data (default `~/.devdash`) |
+| `DEVDASH_CLAUDE_MODEL` | The Claude model for explanations when Settings doesn't pick one (default `haiku`) |
+| `DEVDASH_EXPLAIN_REVIEW` | `0` turns off the second pass that checks a function's pros and cons |
+| `OLLAMA_HOST` | Where Ollama runs (default `127.0.0.1:11434`) |
+| `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DEVDASH_ANTIGRAVITY_CONFIG` | Where Claude Code, Codex and Antigravity keep their settings, for their hooks |
+| `DEVDASH_GITHUB_CLIENT_ID`, `DEVDASH_GITHUB_APP` | A GitHub App to sign in with for pull requests (you can also paste a token in Settings) |
+| `DEVDASH_GITHUB_API`, `DEVDASH_GITHUB_URL` | Another GitHub address, such as GitHub Enterprise |
+| `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` | Where the AWS profiles for CodeCommit are |
+| `DEVDASH_FE` | For the installer scripts: a DevDash-FE folder somewhere other than next to this repo |
+
+## Develop and test
 
 ```sh
-python3 -m pip install -e '.[dev]'
-python3 -m pytest
+python3 -m venv .venv
+. .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e '.[dev]'
+python -m pytest
+devdash serve                   # http://127.0.0.1:8765, API docs at /docs
 ```
+
+A few tests in `tests/test_providers.py` look at the computer they run on (they expect no GPU and
+no Ollama service running) and fail on a machine that has them.
+
+To change the page, see "Working on the page" above; `python scripts/build_ui.py ../DevDash-FE`
+rebuilds `src/devdash/web`, which is committed so installs need no Node.
+
+## How the code is laid out
+
+- `src/devdash/cli.py`: the `devdash` command (`init`, `connect`, `disconnect`, `serve`,
+  `turns`, `instructions`, `remove-hooks`, `password`, and `record`, which the hooks call).
+- `src/devdash/api/app.py`: the local web server and the shape of everything it sends.
+- `src/devdash/capture/`: recording AI tools' changes: the hooks (`install.py`), what each hook
+  event records (`record.py`), commits made outside the hooks (`scan.py`) and the Claude app
+  chats' prompt file (`inbox.py`).
+- `src/devdash/store/`: the SQLite database and its migrations.
+- Reading git: `git.py`, `compare.py` (what a branch changed), `functions.py` (which functions
+  changed), `flow.py` (branch flow), `home.py`.
+- Reading a project: `projectmap.py` (its parts and imports), `summary.py` (Summary and the KT's
+  files), `filegraph.py` and `ktdoc.py` (the Detailed KT's facts and checks).
+- The AI: `explain.py` (prompts, saved answers, Claude Code), `providers.py` (Codex, Ollama,
+  Antigravity, your own server), `prompts.py`.
+- `digest.py` and `undo.py`: AI changes by day, and undoing one. `github.py` and
+  `codecommit.py`: pull requests. `auth.py`, `preferences.py`, `retention.py`, `paths.py`:
+  sign-in, settings, cleaning up old data, where data lives.
+- `src/devdash/web/`: the built dashboard page. `scripts/`: the installers and `build_ui.py`.
 
 ## License
 
